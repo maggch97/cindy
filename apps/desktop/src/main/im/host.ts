@@ -16,6 +16,8 @@ import { app, ipcMain, BrowserWindow, net, shell } from 'electron';
 import {
   createIM,
   createDiscordIM,
+  createDingTalkChannelIM,
+  createDingTalkDwsIM,
   createDingTalkIM,
   createFeishuIM,
   createTelegramIM,
@@ -34,6 +36,7 @@ import {
 } from '../cindy-media/integrationCache';
 import { pinBlob } from '../cindy-media/ledger';
 import { t } from '../i18n';
+import { createDwsRunner } from './dingtalk/dwsRunner';
 import { discordUiText } from './discord/uiText';
 import { telegramUiText } from './telegram/uiText';
 import {
@@ -193,9 +196,17 @@ export const telegramIm = createTelegramIM(host, {
   // owner 私聊的 "/" 命令菜单(BotCommandScopeChat 只发 owner, 其他人不可见)。
   commandMenu: buildPersonalBotCommandMenu((key) => t(key)),
 });
-export const dingtalkIm = createDingTalkIM(host, {
-  fetcher: (input, init) => net.fetch(input instanceof URL ? input.toString() : input, init),
-});
+/**
+ * 钉钉渠道 = 机器人应用 / 钉钉账号（dws CLI）二选一的路由；编排层只看到
+ * 'dingtalk' 一个渠道。
+ */
+export const dingtalkIm = createDingTalkChannelIM(
+  host,
+  createDingTalkIM(host, {
+    fetcher: (input, init) => net.fetch(input instanceof URL ? input.toString() : input, init),
+  }),
+  createDingTalkDwsIM(host, createDwsRunner()),
+);
 export const wecomIm = createWecomIM(host);
 /**
  * Telegram 个人 bot 的行为/人格/群参与配置 IPC(设置卡数据通道)。

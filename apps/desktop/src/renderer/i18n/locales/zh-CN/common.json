@@ -3308,6 +3308,46 @@
         "step3": "从应用凭证页复制 Client ID 和 Client Secret，填入上方。",
         "step4": "连接成功后先私聊机器人完成主人绑定；群聊中需要 @ 机器人。",
         "openPortal": "打开钉钉开放平台 ↗"
+      },
+      "mode": {
+        "label": "连接方式",
+        "robot": "机器人应用",
+        "dws": "钉钉账号（CLI）"
+      },
+      "dws": {
+        "intro": "通过钉钉官方命令行工具 dws，以一个钉钉账号的身份收发消息，并能读取群聊上下文。只有绑定的主人私聊它或在群里 @ 它时才会触发任务；自己发给自己的消息不会触发，建议为 {{appName}} 准备一个专用钉钉账号。",
+        "recheck": "重新检测",
+        "openRepo": "查看 dws 安装说明 ↗",
+        "copyCommand": "复制命令",
+        "accountLabel": "钉钉账号",
+        "orgLabel": "所属组织",
+        "ownerLabel": "主人",
+        "pairingCodeLabel": "配对码",
+        "clearOwner": "解除主人绑定",
+        "errorHint": "连接失败，请确认 dws 已登录、组织已开通 CLI 访问权限，然后重试。",
+        "notInstalled": {
+          "title": "未检测到 dws",
+          "description": "在终端运行下面的命令安装 dws，装好后点「重新检测」。"
+        },
+        "notLoggedIn": {
+          "title": "dws 尚未登录",
+          "description": "在终端运行下面的命令，用要给 {{appName}} 使用的钉钉账号完成授权，然后点「重新检测」。"
+        },
+        "ready": {
+          "title": "已检测到登录的钉钉账号",
+          "description": "连接后，{{appName}} 会以这个账号的身份接收私聊和群里 @ 它的消息并回复。"
+        },
+        "connected": {
+          "heading": "已通过钉钉账号连接",
+          "ownerBound": "主人已绑定；只有主人私聊这个账号，或在群里 @ 它时才会触发任务。",
+          "waitingOwner": "请用你本人的钉钉账号私聊这个账号，发送下方配对码完成主人绑定。在此之前收到的消息都会被忽略。"
+        },
+        "disconnectConfirm": {
+          "title": "断开钉钉账号连接？",
+          "description": "断开后不再接收和回复钉钉消息。dws 的登录状态和主人绑定会保留，之后可直接重新连接。",
+          "confirm": "断开",
+          "cancel": "取消"
+        }
       }
     },
     "logout": {
@@ -13091,7 +13131,13 @@
       "dingtalkBotNetworkFailed": "无法访问钉钉开放平台，请检查网络或 Proxy 后重试",
       "dingtalkBotStreamFailed": "凭证有效，但 Stream 连接未建立；请确认已启用机器人、选择 Stream 模式并发布应用版本",
       "dingtalkBotDisconnected": "已解绑钉钉机器人",
-      "dingtalkBotDisconnectFailed": "钉钉机器人解绑失败"
+      "dingtalkBotDisconnectFailed": "钉钉机器人解绑失败",
+      "dingtalkDwsConnected": "已通过钉钉账号连接",
+      "dingtalkDwsConnectFailed": "钉钉账号连接失败，请确认 dws 已登录且组织已开通 CLI 访问权限",
+      "dingtalkDwsNotInstalled": "未找到 dws，请先安装后重新检测",
+      "dingtalkDwsNotLoggedIn": "dws 尚未登录或登录已失效，请在终端运行 dws auth login",
+      "dingtalkDwsDisconnected": "已断开钉钉账号连接",
+      "dingtalkModeSwitchFailed": "切换钉钉连接方式失败"
     },
     "errors": {
       "openFileFailed": "无法在系统中打开文件",

@@ -3308,6 +3308,46 @@
         "step3": "從應用憑證頁複製 Client ID 和 Client Secret，填入上方。",
         "step4": "連線成功後先私聊機器人完成主人繫結；群聊中需要 @ 機器人。",
         "openPortal": "開啟釘釘開放平臺 ↗"
+      },
+      "mode": {
+        "label": "連線方式",
+        "robot": "機器人應用",
+        "dws": "釘釘帳號（CLI）"
+      },
+      "dws": {
+        "intro": "透過釘釘官方命令列工具 dws，以一個釘釘帳號的身分收發訊息，並能讀取群聊上下文。只有綁定的主人私聊它或在群組裡 @ 它時才會觸發任務；自己傳給自己的訊息不會觸發，建議為 {{appName}} 準備一個專用釘釘帳號。",
+        "recheck": "重新偵測",
+        "openRepo": "查看 dws 安裝說明 ↗",
+        "copyCommand": "複製指令",
+        "accountLabel": "釘釘帳號",
+        "orgLabel": "所屬組織",
+        "ownerLabel": "主人",
+        "pairingCodeLabel": "配對碼",
+        "clearOwner": "解除主人綁定",
+        "errorHint": "連線失敗，請確認 dws 已登入、組織已開通 CLI 存取權限，然後重試。",
+        "notInstalled": {
+          "title": "未偵測到 dws",
+          "description": "在終端機執行下面的指令安裝 dws，裝好後點「重新偵測」。"
+        },
+        "notLoggedIn": {
+          "title": "dws 尚未登入",
+          "description": "在終端機執行下面的指令，用要給 {{appName}} 使用的釘釘帳號完成授權，然後點「重新偵測」。"
+        },
+        "ready": {
+          "title": "已偵測到登入的釘釘帳號",
+          "description": "連線後，{{appName}} 會以這個帳號的身分接收私聊和群組裡 @ 它的訊息並回覆。"
+        },
+        "connected": {
+          "heading": "已透過釘釘帳號連線",
+          "ownerBound": "主人已綁定；只有主人私聊這個帳號，或在群組裡 @ 它時才會觸發任務。",
+          "waitingOwner": "請用你本人的釘釘帳號私聊這個帳號，傳送下方配對碼完成主人綁定。在此之前收到的訊息都會被忽略。"
+        },
+        "disconnectConfirm": {
+          "title": "中斷釘釘帳號連線？",
+          "description": "中斷後不再接收和回覆釘釘訊息。dws 的登入狀態和主人綁定會保留，之後可直接重新連線。",
+          "confirm": "中斷",
+          "cancel": "取消"
+        }
       }
     },
     "logout": {
@@ -13091,7 +13131,13 @@
       "dingtalkBotNetworkFailed": "無法訪問釘釘開放平臺，請檢查網路或 Proxy 後重試",
       "dingtalkBotStreamFailed": "憑證有效，但 Stream 連線未建立；請確認已啟用機器人、選擇 Stream 模式併發布應用版本",
       "dingtalkBotDisconnected": "已解綁釘釘機器人",
-      "dingtalkBotDisconnectFailed": "釘釘機器人解綁失敗"
+      "dingtalkBotDisconnectFailed": "釘釘機器人解綁失敗",
+      "dingtalkDwsConnected": "已透過釘釘帳號連線",
+      "dingtalkDwsConnectFailed": "釘釘帳號連線失敗，請確認 dws 已登入且組織已開通 CLI 存取權限",
+      "dingtalkDwsNotInstalled": "找不到 dws，請先安裝後重新偵測",
+      "dingtalkDwsNotLoggedIn": "dws 尚未登入或登入已失效，請在終端機執行 dws auth login",
+      "dingtalkDwsDisconnected": "已中斷釘釘帳號連線",
+      "dingtalkModeSwitchFailed": "切換釘釘連線方式失敗"
     },
     "errors": {
       "openFileFailed": "無法在系統中開啟檔案",

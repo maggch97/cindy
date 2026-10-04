@@ -523,6 +523,15 @@ type TelegramBotTransportStatus =
 type TelegramBotErrorCode = 'invalid-token' | 'provider-api' | 'network' | 'secret-unavailable';
 
 type DingTalkBotTransportStatus = DiscordBotTransportStatus;
+/** 钉钉「钉钉账号（dws CLI）」方式的状态快照；不含任何凭证。 */
+interface DingTalkDwsStateSnapshot {
+  status: DingTalkBotTransportStatus;
+  enabled: boolean;
+  installed: boolean;
+  identity: { corpName: string; userName: string } | null;
+  ownerName: string | null;
+  pairingCode: string | null;
+}
 type WecomBotTransportStatus =
   | { kind: 'idle' }
   | { kind: 'connecting' }
@@ -2377,6 +2386,15 @@ interface ElectronAPI {
       callback: (update: { status: DingTalkBotTransportStatus }) => void,
     ) => () => void;
     onOwnerChange: (callback: (update: { ownerUserId: string }) => void) => () => void;
+    getMode: () => Promise<{ mode: 'robot' | 'dws' }>;
+    setMode: (mode: 'robot' | 'dws') => Promise<{ mode: 'robot' | 'dws' }>;
+    getDwsState: () => Promise<DingTalkDwsStateSnapshot>;
+    connectDws: () => Promise<DingTalkDwsStateSnapshot>;
+    disconnectDws: () => Promise<DingTalkDwsStateSnapshot>;
+    clearDwsOwner: () => Promise<DingTalkDwsStateSnapshot>;
+    onDwsStateChange: (
+      callback: (update: { state: DingTalkDwsStateSnapshot }) => void,
+    ) => () => void;
   };
 
   wecomBot: {

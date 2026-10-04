@@ -3308,6 +3308,46 @@
         "step3": "앱 자격 증명에서 Client ID와 Client Secret을 복사해 입력합니다.",
         "step4": "연결 후 봇에게 먼저 DM을 보내 소유자를 연결합니다. 그룹에서는 멘션하세요.",
         "openPortal": "DingTalk 개발자 포털 열기 ↗"
+      },
+      "mode": {
+        "label": "연결 방식",
+        "robot": "봇 앱",
+        "dws": "DingTalk 계정(CLI)"
+      },
+      "dws": {
+        "intro": "DingTalk 공식 명령줄 도구 dws를 사용해 DingTalk 계정으로 메시지를 주고받고 그룹 채팅 맥락도 읽습니다. 연결된 소유자가 이 계정에 DM을 보내거나 그룹에서 @멘션할 때만 작업이 시작됩니다. 자기 자신에게 보낸 메시지는 전달되지 않으므로 {{appName}} 전용 DingTalk 계정을 준비하세요.",
+        "recheck": "다시 확인",
+        "openRepo": "dws 설치 안내 ↗",
+        "copyCommand": "명령 복사",
+        "accountLabel": "DingTalk 계정",
+        "orgLabel": "조직",
+        "ownerLabel": "소유자",
+        "pairingCodeLabel": "페어링 코드",
+        "clearOwner": "소유자 연결 해제",
+        "errorHint": "연결하지 못했습니다. dws에 로그인되어 있고 조직에서 CLI 액세스가 활성화되어 있는지 확인한 후 다시 시도하세요.",
+        "notInstalled": {
+          "title": "dws를 찾을 수 없음",
+          "description": "터미널에서 아래 명령을 실행해 dws를 설치한 후 「다시 확인」을 선택하세요."
+        },
+        "notLoggedIn": {
+          "title": "dws에 로그인되어 있지 않음",
+          "description": "터미널에서 아래 명령을 실행하고 {{appName}}에서 사용할 DingTalk 계정으로 승인한 후 「다시 확인」을 선택하세요."
+        },
+        "ready": {
+          "title": "로그인된 DingTalk 계정을 찾았습니다",
+          "description": "연결하면 {{appName}}이 이 계정으로 DM과 그룹의 @멘션을 받고 답장합니다."
+        },
+        "connected": {
+          "heading": "DingTalk 계정으로 연결됨",
+          "ownerBound": "소유자가 연결되었습니다. 소유자가 이 계정에 DM을 보내거나 그룹에서 @멘션할 때만 작업이 시작됩니다.",
+          "waitingOwner": "본인 DingTalk 계정에서 이 계정으로 DM을 보내 아래 페어링 코드를 전송하면 소유자로 연결됩니다. 그 전에 받은 메시지는 무시됩니다."
+        },
+        "disconnectConfirm": {
+          "title": "DingTalk 계정 연결을 해제할까요?",
+          "description": "해제하면 DingTalk 메시지 수신과 답장이 중지됩니다. dws 로그인과 소유자 연결은 유지되므로 나중에 다시 연결할 수 있습니다.",
+          "confirm": "연결 해제",
+          "cancel": "취소"
+        }
       }
     },
     "logout": {
@@ -13096,7 +13136,13 @@
       "dingtalkBotNetworkFailed": "DingTalk 오픈 플랫폼에 연결할 수 없습니다. 네트워크 또는 프록시를 확인한 후 다시 시도하세요",
       "dingtalkBotStreamFailed": "자격 증명은 유효하지만 Stream 연결이 설정되지 않았습니다. 봇을 활성화하고 Stream 모드를 선택한 뒤 앱 버전을 게시하세요",
       "dingtalkBotDisconnected": "DingTalk 봇 연동이 해제됨",
-      "dingtalkBotDisconnectFailed": "DingTalk 봇 연동 해제 실패"
+      "dingtalkBotDisconnectFailed": "DingTalk 봇 연동 해제 실패",
+      "dingtalkDwsConnected": "DingTalk 계정으로 연결했습니다",
+      "dingtalkDwsConnectFailed": "DingTalk 계정 연결에 실패했습니다. dws 로그인과 조직의 CLI 액세스 활성화를 확인하세요",
+      "dingtalkDwsNotInstalled": "dws를 찾을 수 없습니다. 설치한 후 다시 확인하세요",
+      "dingtalkDwsNotLoggedIn": "dws에 로그인되어 있지 않거나 로그인이 만료되었습니다. 터미널에서 dws auth login을 실행하세요",
+      "dingtalkDwsDisconnected": "DingTalk 계정 연결을 해제했습니다",
+      "dingtalkModeSwitchFailed": "DingTalk 연결 방식을 전환하지 못했습니다"
     },
     "errors": {
       "openFileFailed": "시스템에서 파일을 열 수 없습니다",

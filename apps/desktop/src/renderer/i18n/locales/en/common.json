@@ -3309,6 +3309,46 @@
         "step3": "Copy the Client ID and Client Secret from App Credentials and enter them above.",
         "step4": "After connecting, DM the bot once to link the owner. @mention it in group chats.",
         "openPortal": "Open DingTalk developer portal ↗"
+      },
+      "mode": {
+        "label": "Connection method",
+        "robot": "Bot app",
+        "dws": "DingTalk account (CLI)"
+      },
+      "dws": {
+        "intro": "Uses the official DingTalk command-line tool dws to send and receive messages as a DingTalk account, with access to group chat context. Only the linked owner can start tasks, by DMing the account or @mentioning it in a group. Messages you send to yourself are not delivered, so set up a dedicated DingTalk account for {{appName}}.",
+        "recheck": "Check again",
+        "openRepo": "dws installation guide ↗",
+        "copyCommand": "Copy command",
+        "accountLabel": "DingTalk account",
+        "orgLabel": "Organization",
+        "ownerLabel": "Owner",
+        "pairingCodeLabel": "Pairing code",
+        "clearOwner": "Unlink owner",
+        "errorHint": "Connection failed. Make sure dws is signed in and CLI access is enabled for the organization, then retry.",
+        "notInstalled": {
+          "title": "dws not found",
+          "description": "Run the command below in a terminal to install dws, then select Check again."
+        },
+        "notLoggedIn": {
+          "title": "dws is not signed in",
+          "description": "Run the command below in a terminal and authorize the DingTalk account {{appName}} should use, then select Check again."
+        },
+        "ready": {
+          "title": "Signed-in DingTalk account found",
+          "description": "Once connected, {{appName}} receives DMs and group @mentions as this account and replies to them."
+        },
+        "connected": {
+          "heading": "Connected through DingTalk account",
+          "ownerBound": "The owner is linked. Tasks start only when the owner DMs this account or @mentions it in a group.",
+          "waitingOwner": "DM this account from your own DingTalk account and send the pairing code below to link yourself as the owner. Messages received before that are ignored."
+        },
+        "disconnectConfirm": {
+          "title": "Disconnect DingTalk account?",
+          "description": "{{appName}} will stop receiving and replying to DingTalk messages. The dws sign-in and owner link are kept, so you can reconnect later.",
+          "confirm": "Disconnect",
+          "cancel": "Cancel"
+        }
       }
     },
     "logout": {
@@ -13123,7 +13163,13 @@
       "dingtalkBotNetworkFailed": "Cannot reach DingTalk Open Platform. Check your network or proxy and try again",
       "dingtalkBotStreamFailed": "Credentials are valid, but the Stream connection was not established. Enable the bot, select Stream mode, and publish the app version",
       "dingtalkBotDisconnected": "DingTalk bot unbound",
-      "dingtalkBotDisconnectFailed": "Failed to unbind DingTalk bot"
+      "dingtalkBotDisconnectFailed": "Failed to unbind DingTalk bot",
+      "dingtalkDwsConnected": "Connected through DingTalk account",
+      "dingtalkDwsConnectFailed": "DingTalk account connection failed. Make sure dws is signed in and CLI access is enabled for the organization",
+      "dingtalkDwsNotInstalled": "dws not found. Install it, then check again",
+      "dingtalkDwsNotLoggedIn": "dws is not signed in or the sign-in expired. Run dws auth login in a terminal",
+      "dingtalkDwsDisconnected": "DingTalk account disconnected",
+      "dingtalkModeSwitchFailed": "Failed to switch the DingTalk connection method"
     },
     "errors": {
       "openFileFailed": "Cannot open file in system",

@@ -1,14 +1,23 @@
 import fs from 'node:fs';
 import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
-import type { DingTalkIM, RichChannelIM } from '@cindy/im';
+import type { DingTalkChannelIM, RichChannelIM } from '@cindy/im';
 import { decodeDingTalkLaneUserId } from '@cindy/im';
 
+import { captureImContext } from '../../../shared/imMessageSource';
+import { createLogger } from '../../logger';
 import type { ImChannelAdapter, ImOrchestratorConfig } from '../shared/types';
 import { ownerScopedImUserDataPath } from '../ownerScopedStorage';
+import {
+  buildDingTalkGroupContextPrefix,
+  buildDingTalkReplyContextBlock,
+  DINGTALK_GROUP_CONTEXT_LIMIT,
+} from './groupContext';
 import { handleDingTalkTextInteraction } from './interaction';
 import { createDingTalkTurnPermissionPolicy } from './permissionPolicy';
 import { ui } from './uiText';
+
+const log = createLogger('im:dingtalk');
 
 function ensureWorkingDir(appKey: string): string {
   const dir = ownerScopedImUserDataPath('im-working-dir', dingtalkManagedWorkingDirName(appKey));
@@ -38,7 +47,7 @@ function sanitizeSpeaker(value: string): string {
 }
 
 export function buildDingTalkAdapter(
-  dingtalkIm: DingTalkIM,
+  dingtalkIm: DingTalkChannelIM,
   config: ImOrchestratorConfig,
 ): ImChannelAdapter {
   return {
@@ -79,10 +88,51 @@ export function buildDingTalkAdapter(
     turnPermissionPolicyFor: (event) =>
       event.speaker ? createDingTalkTurnPermissionPolicy(event.messageId, event.speaker.isOwner) : undefined,
     prepareAgentTurnText: async (event) => {
-      if (!event.speaker) return null;
+      // 引用回复（仅「钉钉账号」方式会带 replyContext）：私聊与群聊都注入。
+      const replyPrefix = event.replyContext
+        ? buildDingTalkReplyContextBlock(event.replyContext)
+        : '';
+      if (!event.speaker) {
+        if (!replyPrefix) return null;
+        return {
+          agentText: `${replyPrefix}${event.text}`,
+          contextSnapshot: captureImContext({ replyPrefix, replyMessageCount: 1 }),
+        };
+      }
       const speaker = sanitizeSpeaker(event.speaker.name);
+      const speakerLine = `[发言人] ${speaker} · id:${event.speaker.id}${event.speaker.isOwner ? ' · 主人' : ''}\n`;
+      // 群上下文：仅「钉钉账号（dws）」方式能以账号身份读取群历史；机器人方式没有该能力。
+      let groupPrefix = '';
+      let groupMessageCount = 0;
+      const lane = decodeDingTalkLaneUserId(event.senderId);
+      if (lane && dingtalkIm.supportsGroupHistory()) {
+        try {
+          const history = await dingtalkIm.fetchRecentGroupMessages(
+            lane.conversationId,
+            DINGTALK_GROUP_CONTEXT_LIMIT,
+          );
+          const built = buildDingTalkGroupContextPrefix(history, event.messageId);
+          if (built) {
+            groupPrefix = built.prefix;
+            groupMessageCount = built.messageCount;
+          }
+        } catch (error) {
+          // 拉取失败不阻断本轮：按无群上下文继续。
+          log.warn(
+            `dingtalk group context fetch failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      if (!groupPrefix && !replyPrefix) {
+        return { agentText: `${speakerLine}${event.text}` };
+      }
+      // 顺序：群上下文（较远背景）→ 引用块（直接相关）→ 发言人 → 正文。
       return {
-        agentText: `[发言人] ${speaker} · id:${event.speaker.id}${event.speaker.isOwner ? ' · 主人' : ''}\n${event.text}`,
+        agentText: `${groupPrefix}${replyPrefix}${speakerLine}${event.text}`,
+        contextSnapshot: captureImContext({
+          ...(groupPrefix ? { groupPrefix, groupMessageCount } : {}),
+          ...(replyPrefix ? { replyPrefix, replyMessageCount: 1 } : {}),
+        }),
       };
     },
   };
