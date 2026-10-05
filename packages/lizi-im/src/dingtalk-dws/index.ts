@@ -7,8 +7,9 @@
  *     stderr 出现 `[event] ready` 才算连上；进程退出按指数退避重连。
  *   - 出站：`dws chat +messages-send`（单聊 open-dingtalk-id / 群 group）。
  *   - 身份：dws 当前登录账号（`dws auth status`）；Cindy 不读取、不保存其凭证。
- *   - 主人：私聊发送设置页一次性配对码的人；只有主人能驱动任务（单聊与群 @）。
- *     dws 登录的是真实账号，不能沿用机器人「第一个私聊者即主人」的规则。
+ *   - 主人：私聊发送设置页一次性配对码的人。dws 登录的是真实账号，不能沿用
+ *     机器人「第一个私聊者即主人」的规则。单聊只认主人；群里任何人 @ 都能
+ *     触发，但非主人轮次受逐轮强确认约束（动手要主人拍板）。
  */
 
 import { randomInt } from 'node:crypto';
@@ -517,12 +518,15 @@ export class DingTalkDwsIM extends BaseIM {
       return;
     }
     const isOwner = message.senderOpenId === owner.openId;
-    // 真实账号身处大量群聊：只有主人能驱动任务（单聊与群 @ 同口径）。
-    if (!isOwner) return;
+    // 单聊只认主人。群里任何人 @ 都能触发（与机器人方式、Telegram 同口径：
+    // 「谁都能问，动手要主人拍板」）——非主人轮次带 speaker.isOwner=false，
+    // 由 adapter 挂逐轮强确认策略，「完全访问」也不扩给他们。
+    if (!isGroup && !isOwner) return;
 
     const text = isGroup
       ? stripSelfMention(message.text, this.identity?.userName ?? '')
       : message.text.trim();
+    // 等待回复期间，群里非主人的回答被吞掉（只有主人能确认），不落成普通消息。
     if (text && this.pendingReplies.tryResolve(userId, text, isOwner)) return;
 
     const event: IMMessageEvent = {

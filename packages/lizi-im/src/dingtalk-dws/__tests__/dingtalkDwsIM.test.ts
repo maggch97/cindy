@@ -322,7 +322,7 @@ describe('DingTalkDwsIM inbound', () => {
     await im.dispose();
   });
 
-  it('ignores group mentions from anyone but the owner', async () => {
+  it('lets anyone in a group trigger a turn, marked as non-owner', async () => {
     const { im, streams, messages } = await connected();
     await bindOwner(im, streams[0]);
     streams[0].emit({
@@ -332,7 +332,39 @@ describe('DingTalkDwsIM inbound', () => {
       conversation_id: 'cid-group',
       sender: '同事',
       sender_open_dingtalk_id: 'colleague',
-      content: '@Cindy 助手 帮我删库',
+      content: '@Cindy 助手 这个方案的预算是多少',
+    });
+    await flush();
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      senderId: encodeLaneUserId('cid-group'),
+      text: '这个方案的预算是多少',
+      speaker: { id: 'colleague', name: '同事', isOwner: false },
+    });
+    await im.dispose();
+  });
+
+  it('still ignores direct messages from anyone but the owner', async () => {
+    const { im, streams, messages } = await connected();
+    await bindOwner(im, streams[0]);
+    streams[0].emit(
+      directEvent({ message_id: 'msg-s', sender: '同事', sender_open_dingtalk_id: 'colleague' }),
+    );
+    await flush();
+    expect(messages).toHaveLength(0);
+    await im.dispose();
+  });
+
+  it('does not let group members trigger before an owner is paired', async () => {
+    const { im, streams, messages } = await connected();
+    streams[0].emit({
+      type: DWS_EVENT_MENTION,
+      event_id: 'evt-early',
+      message_id: 'msg-early',
+      conversation_id: 'cid-group',
+      sender: '同事',
+      sender_open_dingtalk_id: 'colleague',
+      content: '@Cindy 助手 你好',
     });
     await flush();
     expect(messages).toHaveLength(0);
