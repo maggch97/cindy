@@ -17,7 +17,8 @@ export interface DwsInboundMessage {
   senderOpenId: string;
   senderName: string;
   text: string;
-  quoted?: { author: string; text: string };
+  /** 引用回复的原消息；messageId 用于连同原消息里的图片一起下载。 */
+  quoted?: { author: string; text: string; messageId?: string };
 }
 
 const MAX_TEXT_CHARS = 20_000;
@@ -40,6 +41,7 @@ export function parseDwsEventLine(line: string): DwsInboundMessage | null {
   if (!messageId || !conversationId || !senderOpenId) return null;
   const quoted = isRecord(raw.quoted_message) ? raw.quoted_message : null;
   const quotedText = quoted ? str(quoted.content) : '';
+  const quotedMessageId = quoted ? str(quoted.message_id) : '';
   return {
     kind,
     dedupeKey: str(raw.event_id) || messageId,
@@ -48,11 +50,12 @@ export function parseDwsEventLine(line: string): DwsInboundMessage | null {
     senderOpenId,
     senderName: displayName(str(raw.sender)),
     text: str(raw.content).slice(0, MAX_TEXT_CHARS),
-    ...(quoted && quotedText
+    ...(quoted && (quotedText || quotedMessageId)
       ? {
           quoted: {
             author: displayName(str(quoted.sender)),
             text: quotedText.slice(0, MAX_TEXT_CHARS),
+            ...(quotedMessageId ? { messageId: quotedMessageId } : {}),
           },
         }
       : {}),

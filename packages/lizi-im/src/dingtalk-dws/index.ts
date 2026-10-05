@@ -13,13 +13,23 @@
  */
 
 import { randomInt } from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 import { BaseIM } from '../BaseIM.js';
 import type { ImFinalOutput } from '../channelIM.js';
 import { decodeLaneUserId, encodeLaneUserId } from '../dingtalk/codec.js';
+import { imageAttachment } from '../dingtalk/inbound.js';
 import { PendingReplies, type SharedReplyDecision } from '../dingtalk/pendingReplies.js';
-import type { IMHost, IMMessageEvent, IMStatus, SendFileResult } from '../types.js';
+import type {
+  IMAttachment,
+  IMHost,
+  IMMessageEvent,
+  IMStatus,
+  IMUnsupportedEntry,
+  SendFileResult,
+} from '../types.js';
 import {
   DWS_EVENT_DIRECT,
   DWS_EVENT_MENTION,
@@ -47,6 +57,8 @@ const OUTBOUND_CHUNK_SIZE = 3_500;
 const MAX_OUTBOUND_FILES = 4;
 const MAX_LINE_CHARS = 1_000_000;
 const SEND_TIMEOUT_MS = 60_000;
+const MAX_INBOUND_IMAGES = 6;
+const MAX_INBOUND_IMAGE_BYTES = 20 * 1024 * 1024;
 
 export const DINGTALK_DWS_ERROR = {
   notInstalled: 'DINGTALK_DWS_NOT_INSTALLED',
@@ -529,6 +541,13 @@ export class DingTalkDwsIM extends BaseIM {
     // 等待回复期间，群里非主人的回答被吞掉（只有主人能确认），不落成普通消息。
     if (text && this.pendingReplies.tryResolve(userId, text, isOwner)) return;
 
+    // 截图等图片：连同被引用的原消息一起，经 dws 下载后入 Cindy 媒体缓存。
+    const media = await this.collectImages([
+      message.messageId,
+      ...(message.quoted?.messageId ? [message.quoted.messageId] : []),
+    ]);
+    if (generation !== this.generation) return;
+
     const event: IMMessageEvent = {
       channelName: 'dingtalk',
       interactionSource: { senderName: message.senderName },
@@ -544,10 +563,11 @@ export class DingTalkDwsIM extends BaseIM {
       ...(message.quoted
         ? { replyContext: { author: message.quoted.author, text: message.quoted.text } }
         : {}),
-      attachments: [],
-      unsupported: [],
+      attachments: media.attachments,
+      unsupported: media.unsupported,
     };
-    if (!event.text) return;
+    // 只发图片、没有文字的私聊照常处理；真正的空消息才丢弃。
+    if (!event.text && event.attachments.length === 0 && event.unsupported.length === 0) return;
     for (const handler of this.messageHandlers) {
       try {
         handler(event);
@@ -555,6 +575,76 @@ export class DingTalkDwsIM extends BaseIM {
         // 单个订阅者异常不影响其他订阅者。
       }
     }
+  }
+
+  /**
+   * 用 `chat +messages-mget --download-resources` 把消息里的资源下到临时目录，
+   * 图片（png/jpg/gif/webp，≤20MB）存进宿主媒体缓存作为附件；非图片资源与
+   * 下载失败只记 unsupported 提示，不阻断本条消息。临时目录用完即删。
+   */
+  private async collectImages(
+    messageIds: string[],
+  ): Promise<{ attachments: IMAttachment[]; unsupported: IMUnsupportedEntry[] }> {
+    const attachments: IMAttachment[] = [];
+    const unsupported: IMUnsupportedEntry[] = [];
+    const media = this.host.media;
+    const ids = Array.from(new Set(messageIds.filter(Boolean)));
+    if (!media || ids.length === 0) return { attachments, unsupported };
+    let dir: string | null = null;
+    try {
+      dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'cindy-dws-'));
+      const result = await this.runner.runJson(
+        [
+          'chat',
+          '+messages-mget',
+          '--msg-ids',
+          ids.join(','),
+          '--download-resources',
+          '--output-dir',
+          'downloads',
+          '--no-reactions',
+          '--no-threads',
+          '-f',
+          'json',
+        ],
+        { cwd: dir, timeoutMs: 60_000 },
+      );
+      const ledger = isRecord(result) && isRecord(result.resourceDownloads) ? result.resourceDownloads : null;
+      if (!ledger) return { attachments, unsupported };
+      const failedCount = typeof ledger.failedCount === 'number' ? ledger.failedCount : 0;
+      for (let i = 0; i < failedCount && i < MAX_INBOUND_IMAGES; i += 1) {
+        unsupported.push({ type: 'picture', label: '图片（下载失败）' });
+      }
+      const downloads = Array.isArray(ledger.downloads) ? ledger.downloads.filter(isRecord) : [];
+      for (const entry of downloads) {
+        if (attachments.length >= MAX_INBOUND_IMAGES) break;
+        const localPath = str(entry.localPath);
+        const absPath = path.resolve(dir, localPath);
+        // 只信任落在临时目录内的文件（防御异常的相对路径）。
+        if (!localPath || !absPath.startsWith(dir + path.sep)) continue;
+        const stat = await fs.promises.stat(absPath).catch(() => null);
+        if (!stat?.isFile() || stat.size === 0 || stat.size > MAX_INBOUND_IMAGE_BYTES) continue;
+        const buffer = await fs.promises.readFile(absPath);
+        const mimeType = detectImageMime(buffer);
+        if (!mimeType) {
+          unsupported.push({ type: 'file', label: '文件' });
+          continue;
+        }
+        const stored = await media.cacheImage({
+          integration: 'dingtalk',
+          token: `dws:${str(entry.resourceId) || `${str(entry.messageId)}:${localPath}`}`,
+          buffer,
+          mimeType,
+        });
+        attachments.push(imageAttachment(stored.absPath, stored.url, mimeType));
+      }
+    } catch {
+      // 整次查询失败时无法判断消息里是否真有图片，不臆造提示；正文照常进入本轮。
+      this.log.warn('dingtalk dws resource download failed');
+    } finally {
+      if (dir) await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    }
+    return { attachments, unsupported };
   }
 
   private claimOwner(message: DwsInboundMessage): OwnerRecord | null {
@@ -736,6 +826,18 @@ function safeErrorCode(error: unknown): string {
     if (message.startsWith(`[${code}]`)) return code;
   }
   return 'DINGTALK_DWS_CONNECTION_ERROR';
+}
+
+/** 按文件头识别图片类型；非图片返回 null（与机器人方式同一组格式）。 */
+function detectImageMime(bytes: Uint8Array): string | null {
+  if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+    return 'image/png';
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+  const head = String.fromCharCode(...bytes.slice(0, 12));
+  if (head.startsWith('GIF87a') || head.startsWith('GIF89a')) return 'image/gif';
+  if (head.startsWith('RIFF') && head.slice(8, 12) === 'WEBP') return 'image/webp';
+  return null;
 }
 
 function str(value: unknown): string {
