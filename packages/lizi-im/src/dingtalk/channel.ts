@@ -179,9 +179,13 @@ export class DingTalkChannelIM extends BaseIM implements ChannelIM {
     return this.active().requestTextReply(userId, prompt, parse, timeoutMs, shared);
   }
 
-  fetchRecentGroupMessages(conversationId: string, limit: number): Promise<GroupHistoryMessage[]> {
+  fetchRecentGroupMessages(
+    conversationId: string,
+    limit: number,
+    options?: { withResources?: number; excludeMessageId?: string },
+  ): Promise<GroupHistoryMessage[]> {
     if (this.mode !== 'dws') return Promise.resolve([]);
-    return this.dws.fetchRecentGroupMessages(conversationId, limit);
+    return this.dws.fetchRecentGroupMessages(conversationId, limit, options);
   }
 
   // 两种方式都没有卡片 / 流式能力；编排层按 chunked-text 输出，不会调用这些。

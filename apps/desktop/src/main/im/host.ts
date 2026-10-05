@@ -78,6 +78,8 @@ const host: IMHost = {
     discordMediaDir: path.join(app.getPath('userData'), 'cc-agent', 'discord-media'),
     telegramMediaDir: path.join(app.getPath('userData'), 'cc-agent', 'telegram-media'),
     wecomMediaDir: path.join(app.getPath('userData'), 'cc-agent', 'wecom-media'),
+    // 钉钉账号（dws）方式收到的非媒体文件（PDF/docx/zip…）；图片走媒体总仓。
+    dingtalkMediaDir: path.join(app.getPath('userData'), 'cc-agent', 'dingtalk-media'),
   },
   // cindy-media 媒体总仓回调(规则 25):IM 入站图片按平台 token
   // 免重下、内容寻址去重、isCache=true 吃缓存回收策略;包侧只摸字节和字符串。

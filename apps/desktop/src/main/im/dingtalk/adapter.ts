@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
-import type { DingTalkChannelIM, RichChannelIM } from '@cindy/im';
+import type { DingTalkChannelIM, IMAttachment, RichChannelIM } from '@cindy/im';
 import { decodeDingTalkLaneUserId } from '@cindy/im';
 
 import { captureImContext } from '../../../shared/imMessageSource';
@@ -12,6 +12,7 @@ import {
   buildDingTalkGroupContextPrefix,
   buildDingTalkReplyContextBlock,
   DINGTALK_GROUP_CONTEXT_LIMIT,
+  DINGTALK_GROUP_CONTEXT_RESOURCE_MESSAGES,
 } from './groupContext';
 import { handleDingTalkTextInteraction } from './interaction';
 import {
@@ -133,17 +134,21 @@ export function buildDingTalkAdapter(
       // 群上下文：仅「钉钉账号（dws）」方式能以账号身份读取群历史；机器人方式没有该能力。
       let groupPrefix = '';
       let groupMessageCount = 0;
+      let contextAttachments: IMAttachment[] = [];
       const lane = decodeDingTalkLaneUserId(event.senderId);
       if (lane && dingtalkIm.supportsGroupHistory()) {
         try {
           const history = await dingtalkIm.fetchRecentGroupMessages(
             lane.conversationId,
             DINGTALK_GROUP_CONTEXT_LIMIT,
+            // 最近几条里的截图 / 文件一并带上；触发消息自身的附件已随入站下载。
+            { withResources: DINGTALK_GROUP_CONTEXT_RESOURCE_MESSAGES, excludeMessageId: event.messageId },
           );
           const built = buildDingTalkGroupContextPrefix(history, event.messageId);
           if (built) {
             groupPrefix = built.prefix;
             groupMessageCount = built.messageCount;
+            contextAttachments = built.contextAttachments;
           }
         } catch (error) {
           // 拉取失败不阻断本轮：按无群上下文继续。
@@ -162,6 +167,8 @@ export function buildDingTalkAdapter(
           ...(groupPrefix ? { groupPrefix, groupMessageCount } : {}),
           ...(replyPrefix ? { replyPrefix, replyMessageCount: 1 } : {}),
         }),
+        // 群历史里的图片 / 文件只进模型消息，不落库（与飞书同口径）。
+        ...(contextAttachments.length > 0 ? { contextAttachments } : {}),
       };
     },
   };

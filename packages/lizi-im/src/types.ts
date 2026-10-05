@@ -76,6 +76,12 @@ export interface IMHost {
     telegramMediaDir?: string;
     /** Root for downloaded WeCom files and legacy image fallback. */
     wecomMediaDir?: string;
+    /**
+     * Root for non-media files (PDF / docx / zip …) received through the DingTalk
+     * account (dws) channel. Images go to the host media cache instead. Optional —
+     * without it inbound files degrade to an unsupported notice.
+     */
+    dingtalkMediaDir?: string;
   };
 
   /**

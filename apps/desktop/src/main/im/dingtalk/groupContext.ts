@@ -6,7 +6,7 @@
  * captureImContext 能原样解析出快照）。拉取失败返回 null，调用方按不改写降级。
  */
 
-import type { GroupHistoryMessage, IMMessageEvent } from '@cindy/im';
+import type { GroupHistoryMessage, IMAttachment, IMMessageEvent } from '@cindy/im';
 
 import {
   createFenceNeutralizer,
@@ -19,6 +19,8 @@ import {
 
 /** 每次 @ 回看的最近消息条数（含触发消息本身，组装时剔除）。 */
 export const DINGTALK_GROUP_CONTEXT_LIMIT = 30;
+/** 其中最近多少条消息的图片 / 文件会一并下载（不含触发消息）。 */
+export const DINGTALK_GROUP_CONTEXT_RESOURCE_MESSAGES = 10;
 /** 上下文正文总字符预算（从最新往前收，超出即停）。 */
 const GROUP_CONTEXT_CHAR_BUDGET = 16_000;
 
@@ -27,6 +29,17 @@ const neutralizeFenceTags = createFenceNeutralizer(['group_chat_context', 'reply
 export interface DingTalkGroupContext {
   prefix: string;
   messageCount: number;
+  /** 历史里的图片 / 文件：只进模型消息（contextAttachments），不落库、不进 transcript。 */
+  contextAttachments: IMAttachment[];
+}
+
+/** 渲染一条消息的附件占位（与飞书同口径：[图片] / [文件: 名称]）。 */
+function attachmentMarkers(attachments: readonly IMAttachment[]): string {
+  return attachments
+    .map((att) =>
+      att.kind === 'image' ? '[图片]' : `[文件: ${sanitizeDisplayText(att.originalName) || '附件'}]`,
+    )
+    .join(' ');
 }
 
 function sanitizeDisplayText(value: string): string {
@@ -45,6 +58,7 @@ export function buildDingTalkGroupContextPrefix(
   triggerMessageId: string,
 ): DingTalkGroupContext | null {
   const picked: string[] = [];
+  const contextAttachments: IMAttachment[] = [];
   let budget = GROUP_CONTEXT_CHAR_BUDGET;
   let filtered = 0;
   // 输入是时间正序；从最新往前收，保证预算优先给离当前最近的消息。
@@ -52,18 +66,23 @@ export function buildDingTalkGroupContextPrefix(
     const message = messages[i];
     if (message.messageId === triggerMessageId) continue;
     const text = message.text.trim();
-    if (!text) continue;
-    const injected = looksLikePromptInjection(text);
+    const attachments = message.attachments ?? [];
+    if (!text && attachments.length === 0) continue;
+    const injected = text ? looksLikePromptInjection(text) : false;
     if (injected) filtered += 1;
     const body = injected
       ? FILTERED_HISTORY_PLACEHOLDER
       : text.slice(0, GROUP_WINDOW_ENTRY_TEXT_MAX_CHARS);
+    // 疑似注入的消息连同其附件一起不带给模型，只留占位。
+    const markers = injected ? '' : attachmentMarkers(attachments);
     const line = neutralizeFenceTags(
-      `[${sanitizeDisplayText(message.senderName) || '钉钉用户'}] ${body}`,
+      `[${sanitizeDisplayText(message.senderName) || '钉钉用户'}] ${[body, markers].filter(Boolean).join(' ')}`,
     );
     if (line.length > budget) break;
     budget -= line.length;
     picked.push(line);
+    // 从新到旧收集、unshift 保持时间正序；数量上限已由传输层按最近消息收紧。
+    if (!injected) contextAttachments.unshift(...attachments);
   }
   if (picked.length === 0) return null;
   picked.reverse();
@@ -78,7 +97,7 @@ export function buildDingTalkGroupContextPrefix(
     '只回应当前消息本身的请求。' +
     filteredNote +
     '\n\n';
-  return { prefix, messageCount: picked.length };
+  return { prefix, messageCount: picked.length, contextAttachments };
 }
 
 /** 引用回复（quoted_message）→ reply_context 块，与飞书 / Telegram 同一栅栏语义。 */

@@ -540,7 +540,9 @@ describe('DingTalkDwsIM group history', () => {
       ],
     });
     const result = await im.fetchRecentGroupMessages('cid-group', 30);
-    expect(result.map((m) => m.text)).toEqual(['first', 'second']);
+    // 无文字的消息也保留（可能是纯图片，附件随后挂上）；未要求资源时不下载。
+    expect(result.map((m) => m.text)).toEqual(['first', 'second', '']);
+    expect(result.every((m) => m.attachments.length === 0)).toBe(true);
     expect(calls.at(-1)?.args).toEqual([
       'chat',
       '+chat-messages',

@@ -21,6 +21,7 @@ import { BaseIM } from '../BaseIM.js';
 import type { ImFinalOutput } from '../channelIM.js';
 import { decodeLaneUserId, encodeLaneUserId } from '../dingtalk/codec.js';
 import { imageAttachment } from '../dingtalk/inbound.js';
+import { persistWecomDownload } from '../wecom/media.js';
 import { PendingReplies, type SharedReplyDecision } from '../dingtalk/pendingReplies.js';
 import type {
   IMAttachment,
@@ -58,6 +59,9 @@ const MAX_OUTBOUND_FILES = 4;
 const MAX_LINE_CHARS = 1_000_000;
 const SEND_TIMEOUT_MS = 60_000;
 const MAX_INBOUND_IMAGES = 6;
+const MAX_INBOUND_FILES = 4;
+const MAX_CONTEXT_IMAGES = 6;
+const MAX_CONTEXT_FILES = 4;
 const MAX_INBOUND_IMAGE_BYTES = 20 * 1024 * 1024;
 
 export const DINGTALK_DWS_ERROR = {
@@ -89,6 +93,8 @@ export interface GroupHistoryMessage {
   senderId: string;
   text: string;
   createTime: string;
+  /** 仅在 fetchRecentGroupMessages 指定 withResources 时填充。 */
+  attachments: IMAttachment[];
 }
 
 interface OwnerRecord {
@@ -285,10 +291,15 @@ export class DingTalkDwsIM extends BaseIM {
     );
   }
 
-  /** 以当前账号身份读取群最近消息（时间正序），供群上下文注入。 */
+  /**
+   * 以当前账号身份读取群最近消息（时间正序），供群上下文注入。
+   * withResources 指定时，最近 N 条（不含 excludeMessageId，即本轮触发消息——它的
+   * 附件已随入站事件下载）里的图片与文件一并下载，挂在对应消息的 attachments 上。
+   */
   async fetchRecentGroupMessages(
     conversationId: string,
     limit: number,
+    options: { withResources?: number; excludeMessageId?: string } = {},
   ): Promise<GroupHistoryMessage[]> {
     const result = await this.runner.runJson(
       [
@@ -305,17 +316,31 @@ export class DingTalkDwsIM extends BaseIM {
       { timeoutMs: 30_000 },
     );
     const messages = isRecord(result) && Array.isArray(result.messages) ? result.messages : [];
-    return messages
+    const history = messages
       .filter(isRecord)
-      .map((m) => ({
-        messageId: str(m.messageId),
-        senderName: str(m.sender) || '钉钉用户',
-        senderId: str(m.senderId),
-        text: str(m.text),
-        createTime: str(m.createTime),
-      }))
-      .filter((m) => m.messageId && m.text)
+      .map(
+        (m): GroupHistoryMessage => ({
+          messageId: str(m.messageId),
+          senderName: str(m.sender) || '钉钉用户',
+          senderId: str(m.senderId),
+          text: str(m.text),
+          createTime: str(m.createTime),
+          attachments: [],
+        }),
+      )
+      // 只有图片、没有文字的消息也保留，附件下载后才挂得上。
+      .filter((m) => m.messageId)
       .sort((a, b) => a.createTime.localeCompare(b.createTime));
+    const take = Math.max(0, Math.floor(options.withResources ?? 0));
+    if (take > 0) {
+      const recent = history.filter((m) => m.messageId !== options.excludeMessageId).slice(-take);
+      const downloaded = await this.downloadResources(
+        recent.map((m) => m.messageId),
+        { maxImages: MAX_CONTEXT_IMAGES, maxFiles: MAX_CONTEXT_FILES },
+      );
+      for (const m of recent) m.attachments = downloaded.byMessage.get(m.messageId) ?? [];
+    }
+    return history;
   }
 
   // ── 连接 ────────────────────────────────────────────────────────────────
@@ -542,10 +567,10 @@ export class DingTalkDwsIM extends BaseIM {
     if (text && this.pendingReplies.tryResolve(userId, text, isOwner)) return;
 
     // 截图等图片：连同被引用的原消息一起，经 dws 下载后入 Cindy 媒体缓存。
-    const media = await this.collectImages([
-      message.messageId,
-      ...(message.quoted?.messageId ? [message.quoted.messageId] : []),
-    ]);
+    const media = await this.downloadResources(
+      [message.messageId, ...(message.quoted?.messageId ? [message.quoted.messageId] : [])],
+      { maxImages: MAX_INBOUND_IMAGES, maxFiles: MAX_INBOUND_FILES },
+    );
     if (generation !== this.generation) return;
 
     const event: IMMessageEvent = {
@@ -578,18 +603,30 @@ export class DingTalkDwsIM extends BaseIM {
   }
 
   /**
-   * 用 `chat +messages-mget --download-resources` 把消息里的资源下到临时目录，
-   * 图片（png/jpg/gif/webp，≤20MB）存进宿主媒体缓存作为附件；非图片资源与
-   * 下载失败只记 unsupported 提示，不阻断本条消息。临时目录用完即删。
+   * 用 `chat +messages-mget --download-resources` 把消息里的资源下到临时目录：
+   * - 图片（png/jpg/gif/webp）存进宿主媒体缓存，作为 image 附件；
+   * - 其他文件（PDF/docx/zip…）按媒体规范不进媒体总仓，落到宿主注入的
+   *   `paths.dingtalkMediaDir`（与企业微信同一套落盘规则），作为 file 附件；
+   * - 单个资源 ≤20MB，超额、超数量或逐项下载失败记 unsupported 提示。
+   * 整次查询失败不臆造提示（无法判断是否真有资源）。临时目录用完即删。
    */
-  private async collectImages(
+  private async downloadResources(
     messageIds: string[],
-  ): Promise<{ attachments: IMAttachment[]; unsupported: IMUnsupportedEntry[] }> {
+    limits: { maxImages: number; maxFiles: number },
+  ): Promise<{
+    attachments: IMAttachment[];
+    unsupported: IMUnsupportedEntry[];
+    byMessage: Map<string, IMAttachment[]>;
+  }> {
     const attachments: IMAttachment[] = [];
     const unsupported: IMUnsupportedEntry[] = [];
+    const byMessage = new Map<string, IMAttachment[]>();
     const media = this.host.media;
-    const ids = Array.from(new Set(messageIds.filter(Boolean)));
-    if (!media || ids.length === 0) return { attachments, unsupported };
+    const filesDir = this.host.paths.dingtalkMediaDir;
+    const ids = Array.from(new Set(messageIds.filter(Boolean))).slice(0, 50);
+    if (!media || ids.length === 0) return { attachments, unsupported, byMessage };
+    let images = 0;
+    let files = 0;
     let dir: string | null = null;
     try {
       dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'cindy-dws-'));
@@ -607,44 +644,76 @@ export class DingTalkDwsIM extends BaseIM {
           '-f',
           'json',
         ],
-        { cwd: dir, timeoutMs: 60_000 },
+        { cwd: dir, timeoutMs: 120_000 },
       );
-      const ledger = isRecord(result) && isRecord(result.resourceDownloads) ? result.resourceDownloads : null;
-      if (!ledger) return { attachments, unsupported };
+      const ledger =
+        isRecord(result) && isRecord(result.resourceDownloads) ? result.resourceDownloads : null;
+      if (!ledger) return { attachments, unsupported, byMessage };
       const failedCount = typeof ledger.failedCount === 'number' ? ledger.failedCount : 0;
-      for (let i = 0; i < failedCount && i < MAX_INBOUND_IMAGES; i += 1) {
+      for (let i = 0; i < failedCount && i < limits.maxImages; i += 1) {
         unsupported.push({ type: 'picture', label: '图片（下载失败）' });
       }
       const downloads = Array.isArray(ledger.downloads) ? ledger.downloads.filter(isRecord) : [];
       for (const entry of downloads) {
-        if (attachments.length >= MAX_INBOUND_IMAGES) break;
         const localPath = str(entry.localPath);
         const absPath = path.resolve(dir, localPath);
         // 只信任落在临时目录内的文件（防御异常的相对路径）。
         if (!localPath || !absPath.startsWith(dir + path.sep)) continue;
         const stat = await fs.promises.stat(absPath).catch(() => null);
-        if (!stat?.isFile() || stat.size === 0 || stat.size > MAX_INBOUND_IMAGE_BYTES) continue;
-        const buffer = await fs.promises.readFile(absPath);
-        const mimeType = detectImageMime(buffer);
-        if (!mimeType) {
-          unsupported.push({ type: 'file', label: '文件' });
+        if (!stat?.isFile() || stat.size === 0) continue;
+        if (stat.size > MAX_INBOUND_IMAGE_BYTES) {
+          unsupported.push({ type: 'oversize', label: '附件过大（超过 20MB）' });
           continue;
         }
-        const stored = await media.cacheImage({
-          integration: 'dingtalk',
-          token: `dws:${str(entry.resourceId) || `${str(entry.messageId)}:${localPath}`}`,
-          buffer,
-          mimeType,
-        });
-        attachments.push(imageAttachment(stored.absPath, stored.url, mimeType));
+        const buffer = await fs.promises.readFile(absPath);
+        const mimeType = detectImageMime(buffer);
+        let attachment: IMAttachment;
+        if (mimeType) {
+          if (images >= limits.maxImages) continue;
+          const resourceId = str(entry.resourceId);
+          const stored = await media
+            .cacheImage({
+              integration: 'dingtalk',
+              token: 'dws:' + (resourceId || str(entry.messageId) + ':' + localPath),
+              buffer,
+              mimeType,
+            })
+            .catch(() => null);
+          if (!stored) {
+            unsupported.push({ type: 'picture', label: '图片（保存失败）' });
+            continue;
+          }
+          attachment = imageAttachment(stored.absPath, stored.url, mimeType);
+          images += 1;
+        } else {
+          if (files >= limits.maxFiles) continue;
+          if (!filesDir) {
+            unsupported.push({ type: 'file', label: '文件' });
+            continue;
+          }
+          // 单个文件落盘失败只影响它自己，不中断其余资源。
+          const persisted = await persistWecomDownload({
+            mediaDir: filesDir,
+            buffer,
+            filename: path.basename(localPath),
+          }).catch(() => null);
+          if (!persisted) {
+            unsupported.push({ type: 'file', label: '文件（保存失败）' });
+            continue;
+          }
+          attachment = { kind: 'file', ...persisted };
+          files += 1;
+        }
+        attachments.push(attachment);
+        const messageId = str(entry.messageId);
+        if (messageId) byMessage.set(messageId, [...(byMessage.get(messageId) ?? []), attachment]);
       }
     } catch {
-      // 整次查询失败时无法判断消息里是否真有图片，不臆造提示；正文照常进入本轮。
       this.log.warn('dingtalk dws resource download failed');
     } finally {
       if (dir) await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => undefined);
     }
-    return { attachments, unsupported };
+    return { attachments, unsupported, byMessage };
   }
 
   private claimOwner(message: DwsInboundMessage): OwnerRecord | null {

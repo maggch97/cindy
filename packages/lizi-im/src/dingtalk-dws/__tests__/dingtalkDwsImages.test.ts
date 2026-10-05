@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
@@ -36,7 +37,15 @@ class FakeStream implements DwsStreamProcess {
 
 type Download = { localPath: string; bytes: Uint8Array; resourceId: string; messageId: string };
 
-function setup(options: { downloads?: Download[]; failedCount?: number; mgetError?: boolean } = {}) {
+function setup(
+  options: {
+    downloads?: Download[];
+    failedCount?: number;
+    mgetError?: boolean;
+    filesDir?: string;
+    history?: Array<Record<string, unknown>>;
+  } = {},
+) {
   const secrets = new Map<string, string>([['dingtalk-dws-enabled', '1']]);
   const cached: Array<{ token: string; mimeType: string; size: number }> = [];
   const host: IMHost = {
@@ -56,7 +65,10 @@ function setup(options: { downloads?: Download[]; failedCount?: number; mgetErro
       handle: () => undefined,
       broadcast: () => undefined,
     },
-    paths: { feishuMediaDir: '/unused' },
+    paths: {
+      feishuMediaDir: '/unused',
+      ...(options.filesDir ? { dingtalkMediaDir: options.filesDir } : {}),
+    },
     httpPostForm: async () => ({ status: 200, body: {} }),
     media: {
       cacheImage: vi.fn(async (params) => {
@@ -105,6 +117,7 @@ function setup(options: { downloads?: Download[]; failedCount?: number; mgetErro
           },
         };
       }
+      if (args[1] === '+chat-messages') return { messages: options.history ?? [] };
       return { success: true };
     }),
     spawnStream: vi.fn(() => {
@@ -239,6 +252,62 @@ describe('DingTalkDwsIM inbound images', () => {
     expect(ctx.messages[0].attachments).toEqual([]);
     const escaped = path.join(path.dirname(ctx.mgetCalls[0].cwd!), 'escape.png');
     fs.rmSync(escaped, { force: true });
+    await ctx.im.dispose();
+  });
+});
+
+describe('DingTalkDwsIM inbound files', () => {
+  it('saves non-image files into the injected DingTalk files directory', async () => {
+    const filesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dws-files-test-'));
+    const PDF = Uint8Array.from([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31]);
+    const ctx = setup({
+      filesDir,
+      downloads: [{ localPath: 'downloads/report.pdf', bytes: PDF, resourceId: 'f1', messageId: 'msg-img' }],
+    });
+    await connectAndPair(ctx);
+    ctx.streams[0].emit(ownerMessage({ content: '帮我看下这份报告' }));
+    await flush();
+    const [attachment] = ctx.messages[0].attachments;
+    expect(attachment).toMatchObject({ kind: 'file', originalName: 'report.pdf', mimeType: 'application/pdf' });
+    expect(path.dirname(attachment.absPath)).toBe(filesDir);
+    expect(fs.readFileSync(attachment.absPath)).toEqual(Buffer.from(PDF));
+    expect(ctx.messages[0].unsupported).toEqual([]);
+    fs.rmSync(filesDir, { recursive: true, force: true });
+    await ctx.im.dispose();
+  });
+});
+
+describe('DingTalkDwsIM group history resources', () => {
+  const history = [
+    { messageId: 'h1', sender: '甲', senderId: 'a', text: '这是报错截图', createTime: '2026-10-05 10:01:00' },
+    { messageId: 'h2', sender: '乙', senderId: 'b', text: '', createTime: '2026-10-05 10:02:00' },
+    { messageId: 'trigger', sender: '丙', senderId: 'c', text: '@Cindy 看下', createTime: '2026-10-05 10:03:00' },
+  ];
+
+  it('downloads resources of recent messages, excluding the trigger, and hangs them per message', async () => {
+    const ctx = setup({
+      history,
+      downloads: [{ localPath: 'downloads/err.png', bytes: PNG, resourceId: 'm-err', messageId: 'h2' }],
+    });
+    await ctx.im.init();
+    const result = await ctx.im.fetchRecentGroupMessages('cid-group', 30, {
+      withResources: 10,
+      excludeMessageId: 'trigger',
+    });
+    const idsArg = ctx.mgetCalls[0].args[ctx.mgetCalls[0].args.indexOf('--msg-ids') + 1];
+    expect(idsArg).toBe('h1,h2');
+    expect(result.find((m) => m.messageId === 'h2')?.attachments).toEqual([
+      expect.objectContaining({ kind: 'image', mimeType: 'image/png' }),
+    ]);
+    expect(result.find((m) => m.messageId === 'h1')?.attachments).toEqual([]);
+    await ctx.im.dispose();
+  });
+
+  it('does not download anything unless resources are requested', async () => {
+    const ctx = setup({ history });
+    await ctx.im.init();
+    await ctx.im.fetchRecentGroupMessages('cid-group', 30);
+    expect(ctx.mgetCalls).toHaveLength(0);
     await ctx.im.dispose();
   });
 });
