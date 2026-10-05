@@ -14,6 +14,11 @@ import {
   DINGTALK_GROUP_CONTEXT_LIMIT,
 } from './groupContext';
 import { handleDingTalkTextInteraction } from './interaction';
+import {
+  buildDingTalkPersonaBlock,
+  readDingTalkPersona,
+  type DingTalkPersonaConfig,
+} from './personaStore';
 import { createDingTalkTurnPermissionPolicy } from './permissionPolicy';
 import { ui } from './uiText';
 
@@ -46,10 +51,21 @@ function sanitizeSpeaker(value: string): string {
     .slice(0, 64);
 }
 
+export interface DingTalkAdapterDeps {
+  /** 每轮现读人格，设置卡改动即生效；测试注入。 */
+  readPersona(): DingTalkPersonaConfig;
+}
+
+const defaultDeps: DingTalkAdapterDeps = { readPersona: readDingTalkPersona };
+
 export function buildDingTalkAdapter(
   dingtalkIm: DingTalkChannelIM,
   config: ImOrchestratorConfig,
+  deps: DingTalkAdapterDeps = defaultDeps,
 ): ImChannelAdapter {
+  // 同一条群任务里只有主人触发的轮次可以凭「完全访问」取缔逐轮强确认；用对象
+  // 身份记下这批 policy，非主人轮次（机器人方式的群成员）仍 fail-closed。
+  const ownerGroupTurnPolicies = new WeakSet<object>();
   return {
     channel: 'dingtalk',
     // The shared card-action subscription still expects the rich interface.
@@ -84,19 +100,32 @@ export function buildDingTalkAdapter(
       handleDingTalkTextInteraction(dingtalkIm, userId, request, options),
     // 对齐 Telegram / 飞书的边界：主人私聊完全遵循 session.permissionMode，
     // 因而可以显式选择 bypassPermissions（完全访问）；群聊携带成员可控上下文，
-    // 无论谁 @ bot 都附加强确认策略，危险操作仍须主人在群里确认。
-    turnPermissionPolicyFor: (event) =>
-      event.speaker ? createDingTalkTurnPermissionPolicy(event.messageId, event.speaker.isOwner) : undefined,
+    // 群轮次附加强确认策略，危险操作须主人在群里确认——只有主人触发且任务处于
+    // 「完全访问」时才取缔（见 turnPolicyOptionalForMode）。
+    turnPermissionPolicyFor: (event) => {
+      if (!event.speaker) return undefined;
+      const policy = createDingTalkTurnPermissionPolicy(event.messageId, event.speaker.isOwner);
+      if (event.speaker.isOwner) ownerGroupTurnPolicies.add(policy);
+      return policy;
+    },
+    // 「完全访问」是主人对这条任务的明确授权：该档下 Agent 的工具调用不会冒泡到
+    // 宿主，逐轮强确认无法兑现，因此主人触发的群轮次取缔策略（对齐 Telegram）。
+    turnPolicyOptionalForMode: (mode, policy) =>
+      mode === 'bypassPermissions' && ownerGroupTurnPolicies.has(policy),
     prepareAgentTurnText: async (event) => {
+      // 人格块（设置卡「人格」）：每轮现读，私聊与群聊都在最前面注入。
+      const persona = buildDingTalkPersonaBlock(deps.readPersona());
       // 引用回复（仅「钉钉账号」方式会带 replyContext）：私聊与群聊都注入。
       const replyPrefix = event.replyContext
         ? buildDingTalkReplyContextBlock(event.replyContext)
         : '';
       if (!event.speaker) {
-        if (!replyPrefix) return null;
+        if (!replyPrefix && !persona) return null;
         return {
-          agentText: `${replyPrefix}${event.text}`,
-          contextSnapshot: captureImContext({ replyPrefix, replyMessageCount: 1 }),
+          agentText: `${persona}${replyPrefix}${event.text}`,
+          ...(replyPrefix
+            ? { contextSnapshot: captureImContext({ replyPrefix, replyMessageCount: 1 }) }
+            : {}),
         };
       }
       const speaker = sanitizeSpeaker(event.speaker.name);
@@ -124,11 +153,11 @@ export function buildDingTalkAdapter(
         }
       }
       if (!groupPrefix && !replyPrefix) {
-        return { agentText: `${speakerLine}${event.text}` };
+        return { agentText: `${persona}${speakerLine}${event.text}` };
       }
-      // 顺序：群上下文（较远背景）→ 引用块（直接相关）→ 发言人 → 正文。
+      // 顺序：人格 → 群上下文（较远背景）→ 引用块（直接相关）→ 发言人 → 正文。
       return {
-        agentText: `${groupPrefix}${replyPrefix}${speakerLine}${event.text}`,
+        agentText: `${persona}${groupPrefix}${replyPrefix}${speakerLine}${event.text}`,
         contextSnapshot: captureImContext({
           ...(groupPrefix ? { groupPrefix, groupMessageCount } : {}),
           ...(replyPrefix ? { replyPrefix, replyMessageCount: 1 } : {}),

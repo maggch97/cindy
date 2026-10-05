@@ -37,6 +37,7 @@ import {
 import { pinBlob } from '../cindy-media/ledger';
 import { t } from '../i18n';
 import { createDwsRunner } from './dingtalk/dwsRunner';
+import { patchDingTalkPersona, readDingTalkPersona } from './dingtalk/personaStore';
 import { discordUiText } from './discord/uiText';
 import { telegramUiText } from './telegram/uiText';
 import {
@@ -264,6 +265,21 @@ export function registerTelegramBotConfigIpc(): void {
       profileSynced = await telegramIm.syncBotProfileName(persona.botName);
     }
     return { persona, ...(profileSynced !== undefined ? { profileSynced } : {}) };
+  });
+}
+
+/**
+ * 钉钉渠道「人格」配置 IPC（设置卡数据面）。与 registerTelegramBotConfigIpc 同期由
+ * bootstrap 显式调用，不放模块顶层；payload 在 store 内白名单校验、截断。
+ */
+export function registerDingTalkBotConfigIpc(): void {
+  ipcMain.handle('dingtalkBot:get-persona', (e) => {
+    assertTrustedAppRendererEvent(e);
+    return readDingTalkPersona();
+  });
+  ipcMain.handle('dingtalkBot:set-persona', (e, payload) => {
+    assertTrustedAppRendererEvent(e);
+    return patchDingTalkPersona(payload);
   });
 }
 

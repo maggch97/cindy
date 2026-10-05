@@ -9,6 +9,7 @@ import { useDingTalkBot } from '@/hooks/useDingTalkBot';
 import { useDingTalkDws, type DingTalkTransportMode } from '@/hooks/useDingTalkDws';
 import { cn } from '@/lib/utils';
 import { DingTalkDwsPanel } from './DingTalkDwsPanel';
+import { DingTalkPersonaSettings } from './DingTalkPersonaSettings';
 import { ImChannelSettingsCard, useImChannelSettingsSummary } from './ImChannelSettingsCard';
 import { ImDefaultSettingsSection } from './ImDefaultSettingsSection';
 
@@ -98,6 +99,8 @@ export function DingTalkBotSection({
       }
     >
       <ImDefaultSettingsSection channel="dingtalk" embedded onSummaryChange={setRouteSummary} />
+      <div className="h-px w-full bg-[var(--border-default)]" />
+      <DingTalkPersonaSettings />
       <div className="h-px w-full bg-[var(--border-default)]" />
 
       <div className="flex flex-col gap-2">

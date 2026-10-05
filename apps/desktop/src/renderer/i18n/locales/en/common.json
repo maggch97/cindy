@@ -3310,6 +3310,14 @@
         "step4": "After connecting, DM the bot once to link the owner. @mention it in group chats.",
         "openPortal": "Open DingTalk developer portal ↗"
       },
+      "persona": {
+        "title": "Persona",
+        "description": "Define who it is, how it talks, and what it should and should not do. Shared by both the bot app and DingTalk account connection methods, and applied to every reply.",
+        "nameLabel": "Name",
+        "namePlaceholder": "Give it a name",
+        "soulLabel": "Soul (base persona)",
+        "soulPlaceholder": "Describe its role, duties, tone, catchphrases, boundaries… For example: You are the team project assistant. Keep answers brief, rely only on team materials, and say so when unsure."
+      },
       "mode": {
         "label": "Connection method",
         "robot": "Bot app",
@@ -4543,7 +4551,9 @@
           "pi": "Pi"
         },
         "groupPermissionLabel": "Permission mode for new group tasks",
-        "groupPermissionDescription": "Permission mode used for every task created in a group chat — @bot opening a topic, /new, and /ctr all use it; the permission mode above applies to direct messages only. Defaults to Auto approval. Group context can contain member-controlled content — choosing Full access executes actions without per-step confirmation, so only pick it for groups you trust. Changes apply to tasks created afterwards; switch an existing task with /permission in the group."
+        "groupPermissionDescription": "Permission mode used for every task created in a group chat — @bot opening a topic, /new, and /ctr all use it; the permission mode above applies to direct messages only. Defaults to Auto approval. Group context can contain member-controlled content — choosing Full access executes actions without per-step confirmation, so only pick it for groups you trust. Changes apply to tasks created afterwards; switch an existing task with /permission in the group.",
+        "dingtalkPermissionLabel": "Permission mode for new tasks",
+        "dingtalkPermissionDescription": "Used for new DingTalk tasks in both DMs and groups. Default: Auto-review. With Full access, tasks started by the owner run without per-action confirmation. Changes apply only to tasks created afterward; switch existing tasks in Cindy desktop."
       }
     },
     "shortcuts": {

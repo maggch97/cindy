@@ -82,8 +82,13 @@ describe('dingtalk adapter prepareAgentTurnText', () => {
     speaker: { id: 'owner-open', name: '张三', isOwner: true },
   };
 
-  function adapterWith(im: Partial<DingTalkChannelIM>) {
-    return buildDingTalkAdapter(im as unknown as DingTalkChannelIM, CONFIG);
+  function adapterWith(
+    im: Partial<DingTalkChannelIM>,
+    persona: { botName: string; soul: string } = { botName: '', soul: '' },
+  ) {
+    return buildDingTalkAdapter(im as unknown as DingTalkChannelIM, CONFIG, {
+      readPersona: () => persona,
+    });
   }
 
   it('injects group history only when the account mode supports it', async () => {
@@ -139,5 +144,56 @@ describe('dingtalk adapter prepareAgentTurnText', () => {
     await expect(
       adapterWith({ supportsGroupHistory: () => true }).prepareAgentTurnText?.(baseEvent),
     ).resolves.toBeNull();
+  });
+
+  it('prepends the persona block to direct and group turns', async () => {
+    const persona = { botName: '小钉', soul: '你是团队助手，回答简洁。' };
+    const direct = await adapterWith(
+      { supportsGroupHistory: () => true },
+      persona,
+    ).prepareAgentTurnText?.(baseEvent);
+    expect(direct?.agentText).toBe(
+      '<bot_persona>\n你的名字: 小钉\n你是团队助手，回答简洁。\n</bot_persona>\n\n总结一下',
+    );
+    expect(direct?.contextSnapshot).toBeUndefined();
+    const group = await adapterWith(
+      { supportsGroupHistory: () => false },
+      persona,
+    ).prepareAgentTurnText?.(groupEvent);
+    expect(group?.agentText).toMatch(/^<bot_persona>[\s\S]*<\/bot_persona>\n\n\[发言人\] 张三/);
+  });
+});
+
+describe('dingtalk adapter full access in groups', () => {
+  const adapter = buildDingTalkAdapter({} as unknown as DingTalkChannelIM, CONFIG, {
+    readPersona: () => ({ botName: '', soul: '' }),
+  });
+  const event: IMMessageEvent = {
+    channelName: 'dingtalk',
+    senderId: encodeDingTalkLaneUserId('cid-group'),
+    chatId: 'cid-group',
+    contextId: 'corp:user',
+    messageId: 'm1',
+    text: 'run',
+    attachments: [],
+    unsupported: [],
+  };
+
+  it('lets owner-triggered group turns run under full access', () => {
+    const policy = adapter.turnPermissionPolicyFor?.({
+      ...event,
+      speaker: { id: 'owner', name: '张三', isOwner: true },
+    });
+    expect(policy).toBeDefined();
+    expect(adapter.turnPolicyOptionalForMode?.('bypassPermissions', policy!)).toBe(true);
+    expect(adapter.turnPolicyOptionalForMode?.('auto', policy!)).toBe(false);
+  });
+
+  it('keeps the policy for non-owner group turns even under full access', () => {
+    const policy = adapter.turnPermissionPolicyFor?.({
+      ...event,
+      speaker: { id: 'member', name: '成员', isOwner: false },
+    });
+    expect(adapter.turnPolicyOptionalForMode?.('bypassPermissions', policy!)).toBe(false);
   });
 });

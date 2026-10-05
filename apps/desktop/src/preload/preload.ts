@@ -2430,6 +2430,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
     clearDwsOwner: (): Promise<DingTalkDwsStateSnapshot> =>
       ipcRenderer.invoke('dingtalkBot:dws-clear-owner'),
     onDwsStateChange: fanOutDingTalkDwsStateChange,
+    // 人格（名字 + soul），两种连接方式共用。
+    getPersona: (): Promise<{ botName: string; soul: string }> =>
+      ipcRenderer.invoke('dingtalkBot:get-persona'),
+    setPersona: (payload: {
+      botName?: string;
+      soul?: string;
+    }): Promise<{ botName: string; soul: string }> =>
+      ipcRenderer.invoke('dingtalkBot:set-persona', payload),
   },
 
   // ── WeCom intelligent bot (Settings → IM Bot → Personal) ──

@@ -2395,6 +2395,11 @@ interface ElectronAPI {
     onDwsStateChange: (
       callback: (update: { state: DingTalkDwsStateSnapshot }) => void,
     ) => () => void;
+    getPersona: () => Promise<{ botName: string; soul: string }>;
+    setPersona: (payload: {
+      botName?: string;
+      soul?: string;
+    }) => Promise<{ botName: string; soul: string }>;
   };
 
   wecomBot: {
