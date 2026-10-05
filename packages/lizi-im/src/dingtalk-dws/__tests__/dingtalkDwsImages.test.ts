@@ -311,3 +311,110 @@ describe('DingTalkDwsIM group history resources', () => {
     await ctx.im.dispose();
   });
 });
+
+describe('DingTalkDwsIM quoted attachments', () => {
+  it('keeps quoted-message attachments out of the current message attachments', async () => {
+    const ctx = setup({
+      downloads: [
+        { localPath: 'downloads/own.png', bytes: PNG, resourceId: 'own', messageId: 'msg-img' },
+        { localPath: 'downloads/quoted.png', bytes: PNG, resourceId: 'quoted', messageId: 'msg-quoted' },
+      ],
+    });
+    await connectAndPair(ctx);
+    ctx.streams[0].emit(
+      ownerMessage({
+        content: '对比一下这两张',
+        quoted_message: { message_id: 'msg-quoted', sender: '同事', content: '[图片]' },
+      }),
+    );
+    await flush();
+    const event = ctx.messages[0];
+    expect(event.attachments).toHaveLength(1);
+    expect(event.attachments[0].url).toBe('cindy-media://blobs/1.png');
+    expect(event.replyAttachments).toEqual([
+      expect.objectContaining({ kind: 'image', url: 'cindy-media://blobs/2.png' }),
+    ]);
+    await ctx.im.dispose();
+  });
+
+  it('still delivers a text-free reply that only quotes an image', async () => {
+    const ctx = setup({
+      downloads: [
+        { localPath: 'downloads/quoted.png', bytes: PNG, resourceId: 'q', messageId: 'msg-quoted' },
+      ],
+    });
+    await connectAndPair(ctx);
+    ctx.streams[0].emit(
+      ownerMessage({ content: '', quoted_message: { message_id: 'msg-quoted', sender: '同事', content: '' } }),
+    );
+    await flush();
+    expect(ctx.messages).toHaveLength(1);
+    expect(ctx.messages[0].attachments).toEqual([]);
+    expect(ctx.messages[0].replyAttachments).toHaveLength(1);
+    await ctx.im.dispose();
+  });
+});
+
+describe('DingTalkDwsIM group context files', () => {
+  const PDF = Uint8Array.from([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31]);
+  const history = [
+    { messageId: 'h1', sender: '甲', senderId: 'a', text: '方案文档', createTime: '2026-10-05 10:01:00' },
+  ];
+
+  it('reuses one stored copy when the same file is pulled into context repeatedly', async () => {
+    const filesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dws-context-test-'));
+    const ctx = setup({
+      filesDir,
+      history,
+      downloads: [{ localPath: 'downloads/plan.pdf', bytes: PDF, resourceId: 'file-1', messageId: 'h1' }],
+    });
+    await ctx.im.init();
+    const first = await ctx.im.fetchRecentGroupMessages('cid', 30, { withResources: 10 });
+    const second = await ctx.im.fetchRecentGroupMessages('cid', 30, { withResources: 10 });
+    const a = first[0].attachments[0];
+    const b = second[0].attachments[0];
+    expect(a).toMatchObject({ kind: 'file', originalName: 'plan.pdf' });
+    expect(b.absPath).toBe(a.absPath);
+    const contextRoot = path.join(filesDir, 'context');
+    expect(fs.readdirSync(contextRoot)).toHaveLength(1);
+    fs.rmSync(filesDir, { recursive: true, force: true });
+    await ctx.im.dispose();
+  });
+
+  it('prunes context files that have not been used for 7 days', async () => {
+    const filesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dws-context-prune-'));
+    const staleDir = path.join(filesDir, 'context', 'stale');
+    fs.mkdirSync(staleDir, { recursive: true });
+    const staleFile = path.join(staleDir, 'old.pdf');
+    fs.writeFileSync(staleFile, 'x');
+    const old = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+    fs.utimesSync(staleFile, old, old);
+    const ctx = setup({
+      filesDir,
+      history,
+      downloads: [{ localPath: 'downloads/plan.pdf', bytes: PDF, resourceId: 'file-2', messageId: 'h1' }],
+    });
+    await ctx.im.init();
+    await ctx.im.fetchRecentGroupMessages('cid', 30, { withResources: 10 });
+    await flush();
+    expect(fs.existsSync(staleDir)).toBe(false);
+    expect(fs.readdirSync(path.join(filesDir, 'context'))).toHaveLength(1);
+    fs.rmSync(filesDir, { recursive: true, force: true });
+    await ctx.im.dispose();
+  });
+
+  it('keeps direct-message files as individual attachments (not in the context cache)', async () => {
+    const filesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dws-direct-files-'));
+    const ctx = setup({
+      filesDir,
+      downloads: [{ localPath: 'downloads/r.pdf', bytes: PDF, resourceId: 'f9', messageId: 'msg-img' }],
+    });
+    await connectAndPair(ctx);
+    ctx.streams[0].emit(ownerMessage());
+    await flush();
+    expect(path.dirname(ctx.messages[0].attachments[0].absPath)).toBe(filesDir);
+    expect(fs.existsSync(path.join(filesDir, 'context'))).toBe(false);
+    fs.rmSync(filesDir, { recursive: true, force: true });
+    await ctx.im.dispose();
+  });
+});

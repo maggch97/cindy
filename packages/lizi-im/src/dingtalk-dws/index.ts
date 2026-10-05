@@ -12,7 +12,7 @@
  *     触发，但非主人轮次受逐轮强确认约束（动手要主人拍板）。
  */
 
-import { randomInt } from 'node:crypto';
+import { createHash, randomInt } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -21,7 +21,7 @@ import { BaseIM } from '../BaseIM.js';
 import type { ImFinalOutput } from '../channelIM.js';
 import { decodeLaneUserId, encodeLaneUserId } from '../dingtalk/codec.js';
 import { imageAttachment } from '../dingtalk/inbound.js';
-import { persistWecomDownload } from '../wecom/media.js';
+import { mimeTypeForFilename, persistWecomDownload, safeWecomFilename } from '../wecom/media.js';
 import { PendingReplies, type SharedReplyDecision } from '../dingtalk/pendingReplies.js';
 import type {
   IMAttachment,
@@ -166,14 +166,17 @@ export class DingTalkDwsIM extends BaseIM {
   /** 探测本机 dws 安装与登录状态；不改变连接。 */
   async probe(): Promise<DingTalkDwsPublicState> {
     this.installed = await this.runner.isAvailable().catch(() => false);
-    if (this.installed && this.status.kind !== 'connected') {
+    // 事件流在跑或正在重连时，身份由连接流程持有；探测不能悄悄换掉它
+    // （否则断线期间换号会让旧主人绑定落到新账号上）。
+    if (this.installed && !this.proc && !this.reconnectTimer) {
       this.identity = await this.readIdentity().catch(() => null);
     }
     return this.getPublicState();
   }
 
   getPublicState(): DingTalkDwsPublicState {
-    const owner = this.readOwner();
+    // 身份已知时只认属于当前账号的绑定；未连接（身份未知）时展示已存的绑定。
+    const owner = this.identity ? this.currentOwner() : this.readOwner();
     return {
       // 渲染层只需要连接态；不外送 corpId / userId 组成的内部会话键。
       status:
@@ -336,7 +339,7 @@ export class DingTalkDwsIM extends BaseIM {
       const recent = history.filter((m) => m.messageId !== options.excludeMessageId).slice(-take);
       const downloaded = await this.downloadResources(
         recent.map((m) => m.messageId),
-        { maxImages: MAX_CONTEXT_IMAGES, maxFiles: MAX_CONTEXT_FILES },
+        { maxImages: MAX_CONTEXT_IMAGES, maxFiles: MAX_CONTEXT_FILES, contextFiles: true },
       );
       for (const m of recent) m.attachments = downloaded.byMessage.get(m.messageId) ?? [];
     }
@@ -353,12 +356,7 @@ export class DingTalkDwsIM extends BaseIM {
     if (!this.installed) throw codedError(DINGTALK_DWS_ERROR.notInstalled);
     const identity = await this.readIdentity();
     if (generation !== this.generation) throw new Error('DINGTALK_DWS_CONNECTION_REPLACED');
-    this.identity = identity;
-    const owner = this.readOwner();
-    if (owner && owner.contextId !== this.contextId) {
-      // dws 换了登录账号：旧主人绑定不再适用。
-      this.host.secrets.remove(OWNER_SECRET);
-    }
+    this.adoptIdentity(identity);
     await this.startStream(generation);
   }
 
@@ -475,7 +473,13 @@ export class DingTalkDwsIM extends BaseIM {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       if (generation !== this.generation) return;
-      void this.startStream(generation).catch((error) => {
+      void (async () => {
+        // 断线期间 dws 可能换了登录账号：重连前重新核对身份，换号就清旧绑定。
+        const identity = await this.readIdentity();
+        if (generation !== this.generation) return;
+        this.adoptIdentity(identity);
+        await this.startStream(generation);
+      })().catch((error) => {
         if (generation !== this.generation) return;
         this.log.warn(`dingtalk dws stream restart failed: ${safeErrorCode(error)}`);
         this.scheduleReconnect(generation);
@@ -544,7 +548,7 @@ export class DingTalkDwsIM extends BaseIM {
   private async process(userId: string, message: DwsInboundMessage, generation: number): Promise<void> {
     if (generation !== this.generation) return;
     const isGroup = message.kind === 'mention';
-    const owner = this.readOwner();
+    const owner = this.currentOwner();
     if (!owner) {
       // dws 登录的是真实账号，同事随时可能私聊它，不能像新建机器人那样
       // 「第一个私聊者即主人」：只有私聊发送设置页配对码的人才会被绑定。
@@ -566,12 +570,17 @@ export class DingTalkDwsIM extends BaseIM {
     // 等待回复期间，群里非主人的回答被吞掉（只有主人能确认），不落成普通消息。
     if (text && this.pendingReplies.tryResolve(userId, text, isOwner)) return;
 
-    // 截图等图片：连同被引用的原消息一起，经 dws 下载后入 Cindy 媒体缓存。
+    // 截图 / 文件：连同被引用的原消息一起经 dws 下载。按消息归属拆开——当前消息
+    // 自己的附件才算本条附件；被引消息的附件放在 replyAttachments，只供模型理解
+    // 引用、不当作当前发言人发送的附件落库。
+    const quotedId = message.quoted?.messageId;
     const media = await this.downloadResources(
-      [message.messageId, ...(message.quoted?.messageId ? [message.quoted.messageId] : [])],
+      [message.messageId, ...(quotedId ? [quotedId] : [])],
       { maxImages: MAX_INBOUND_IMAGES, maxFiles: MAX_INBOUND_FILES },
     );
     if (generation !== this.generation) return;
+    const ownAttachments = media.byMessage.get(message.messageId) ?? media.unattributed;
+    const replyAttachments = quotedId ? (media.byMessage.get(quotedId) ?? []) : [];
 
     const event: IMMessageEvent = {
       channelName: 'dingtalk',
@@ -588,11 +597,19 @@ export class DingTalkDwsIM extends BaseIM {
       ...(message.quoted
         ? { replyContext: { author: message.quoted.author, text: message.quoted.text } }
         : {}),
-      attachments: media.attachments,
+      ...(replyAttachments.length > 0 ? { replyAttachments } : {}),
+      attachments: ownAttachments,
       unsupported: media.unsupported,
     };
     // 只发图片、没有文字的私聊照常处理；真正的空消息才丢弃。
-    if (!event.text && event.attachments.length === 0 && event.unsupported.length === 0) return;
+    if (
+      !event.text &&
+      event.attachments.length === 0 &&
+      replyAttachments.length === 0 &&
+      event.unsupported.length === 0
+    ) {
+      return;
+    }
     for (const handler of this.messageHandlers) {
       try {
         handler(event);
@@ -612,19 +629,20 @@ export class DingTalkDwsIM extends BaseIM {
    */
   private async downloadResources(
     messageIds: string[],
-    limits: { maxImages: number; maxFiles: number },
+    limits: { maxImages: number; maxFiles: number; contextFiles?: boolean },
   ): Promise<{
-    attachments: IMAttachment[];
     unsupported: IMUnsupportedEntry[];
     byMessage: Map<string, IMAttachment[]>;
+    /** ledger 未标明所属消息的资源（按当前消息处理）。 */
+    unattributed: IMAttachment[];
   }> {
-    const attachments: IMAttachment[] = [];
     const unsupported: IMUnsupportedEntry[] = [];
     const byMessage = new Map<string, IMAttachment[]>();
+    const unattributed: IMAttachment[] = [];
     const media = this.host.media;
     const filesDir = this.host.paths.dingtalkMediaDir;
     const ids = Array.from(new Set(messageIds.filter(Boolean))).slice(0, 50);
-    if (!media || ids.length === 0) return { attachments, unsupported, byMessage };
+    if (!media || ids.length === 0) return { unsupported, byMessage, unattributed };
     let images = 0;
     let files = 0;
     let dir: string | null = null;
@@ -648,7 +666,7 @@ export class DingTalkDwsIM extends BaseIM {
       );
       const ledger =
         isRecord(result) && isRecord(result.resourceDownloads) ? result.resourceDownloads : null;
-      if (!ledger) return { attachments, unsupported, byMessage };
+      if (!ledger) return { unsupported, byMessage, unattributed };
       const failedCount = typeof ledger.failedCount === 'number' ? ledger.failedCount : 0;
       for (let i = 0; i < failedCount && i < limits.maxImages; i += 1) {
         unsupported.push({ type: 'picture', label: '图片（下载失败）' });
@@ -692,11 +710,10 @@ export class DingTalkDwsIM extends BaseIM {
             continue;
           }
           // 单个文件落盘失败只影响它自己，不中断其余资源。
-          const persisted = await persistWecomDownload({
-            mediaDir: filesDir,
-            buffer,
-            filename: path.basename(localPath),
-          }).catch(() => null);
+          const persisted = await (limits.contextFiles
+            ? persistContextFile(filesDir, str(entry.resourceId) || `${str(entry.messageId)}:${localPath}`, buffer, path.basename(localPath))
+            : persistWecomDownload({ mediaDir: filesDir, buffer, filename: path.basename(localPath) })
+          ).catch(() => null);
           if (!persisted) {
             unsupported.push({ type: 'file', label: '文件（保存失败）' });
             continue;
@@ -704,16 +721,17 @@ export class DingTalkDwsIM extends BaseIM {
           attachment = { kind: 'file', ...persisted };
           files += 1;
         }
-        attachments.push(attachment);
         const messageId = str(entry.messageId);
         if (messageId) byMessage.set(messageId, [...(byMessage.get(messageId) ?? []), attachment]);
+        else unattributed.push(attachment);
       }
     } catch {
       this.log.warn('dingtalk dws resource download failed');
     } finally {
       if (dir) await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => undefined);
     }
-    return { attachments, unsupported, byMessage };
+    if (limits.contextFiles && filesDir) void pruneContextFiles(filesDir);
+    return { unsupported, byMessage, unattributed };
   }
 
   private claimOwner(message: DwsInboundMessage): OwnerRecord | null {
@@ -732,6 +750,28 @@ export class DingTalkDwsIM extends BaseIM {
   private ensurePairingCode(): string {
     this.pairingCode ??= String(randomInt(100_000, 1_000_000));
     return this.pairingCode;
+  }
+
+  /** 只有属于当前登录账号的主人绑定才有效；换号后旧绑定一律视为未绑定。 */
+  private currentOwner(): OwnerRecord | null {
+    const owner = this.readOwner();
+    if (!owner || !this.identity || owner.contextId !== this.contextId) return null;
+    return owner;
+  }
+
+  /** 采用新读到的身份；与已存主人绑定的账号不一致时清掉旧绑定与等待中的确认。 */
+  private adoptIdentity(identity: DingTalkDwsIdentity): void {
+    const previous = this.contextId;
+    this.identity = identity;
+    const owner = this.readOwner();
+    if (owner && owner.contextId !== this.contextId) {
+      this.host.secrets.remove(OWNER_SECRET);
+      this.pairingCode = null;
+    }
+    if (previous && previous !== this.contextId) {
+      this.pendingReplies.rejectAll('DINGTALK_ACCOUNT_CHANGED');
+      this.emitStateChange();
+    }
   }
 
   private readOwner(): OwnerRecord | null {
@@ -895,6 +935,52 @@ function safeErrorCode(error: unknown): string {
     if (message.startsWith(`[${code}]`)) return code;
   }
   return 'DINGTALK_DWS_CONNECTION_ERROR';
+}
+
+const CONTEXT_FILES_SUBDIR = 'context';
+const CONTEXT_FILE_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
+
+/**
+ * 群上下文文件按资源 ID 固定落盘位置：同一资源被反复 @ 时复用同一份，而不是
+ * 每次新增一份。复用时刷新 mtime，配合 pruneContextFiles 的 7 天回收。
+ */
+async function persistContextFile(
+  filesDir: string,
+  resourceKey: string,
+  buffer: Buffer,
+  filename: string,
+): Promise<{ absPath: string; originalName: string; mimeType: string }> {
+  const originalName = safeWecomFilename(filename);
+  const digest = createHash('sha256').update(resourceKey).digest('hex').slice(0, 24);
+  const dir = path.join(filesDir, CONTEXT_FILES_SUBDIR, digest);
+  const absPath = path.join(dir, originalName);
+  const existing = await fs.promises.stat(absPath).catch(() => null);
+  if (existing?.isFile() && existing.size === buffer.byteLength) {
+    const now = new Date();
+    await fs.promises.utimes(absPath, now, now).catch(() => undefined);
+  } else {
+    await fs.promises.mkdir(dir, { recursive: true });
+    await fs.promises.writeFile(absPath, buffer);
+  }
+  return { absPath, originalName, mimeType: mimeTypeForFilename(originalName) };
+}
+
+/** 尽力回收 7 天未再被引用的群上下文文件；失败静默，下次再试。 */
+async function pruneContextFiles(filesDir: string): Promise<void> {
+  const root = path.join(filesDir, CONTEXT_FILES_SUBDIR);
+  const entries = await fs.promises.readdir(root, { withFileTypes: true }).catch(() => []);
+  const cutoff = Date.now() - CONTEXT_FILE_TTL_MS;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = path.join(root, entry.name);
+    const files = await fs.promises.readdir(dir).catch(() => [] as string[]);
+    let newest = 0;
+    for (const file of files) {
+      const stat = await fs.promises.stat(path.join(dir, file)).catch(() => null);
+      if (stat) newest = Math.max(newest, stat.mtimeMs);
+    }
+    if (newest < cutoff) await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+  }
 }
 
 /** 按文件头识别图片类型；非图片返回 null（与机器人方式同一组格式）。 */

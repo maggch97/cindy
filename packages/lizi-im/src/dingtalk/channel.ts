@@ -36,6 +36,12 @@ export class DingTalkChannelIM extends BaseIM implements ChannelIM {
   private readonly statusHandlers = new Set<(status: IMStatus) => void>();
   private mode: DingTalkTransportMode;
   private switching: Promise<void> = Promise.resolve();
+  /**
+   * 每个会话（userId / 群 lane）最近一次是从哪种连接方式进来的。出站按来源
+   * 方式发送：切换连接方式时仍在进行的任务，其回复绝不改走新方式（两种方式
+   * 的 userId 语义不同，改走会错发或用新账号发出），来源方式已停用就明确失败。
+   */
+  private readonly laneMode = new Map<string, DingTalkTransportMode>();
 
   constructor(
     host: IMHost,
@@ -50,6 +56,7 @@ export class DingTalkChannelIM extends BaseIM implements ChannelIM {
     ] as const) {
       transport.onMessage((event) => {
         if (this.mode !== mode) return;
+        this.laneMode.set(event.senderId, mode);
         for (const handler of this.messageHandlers) handler(event);
       });
       transport.onStatusChange((status) => {
@@ -151,32 +158,38 @@ export class DingTalkChannelIM extends BaseIM implements ChannelIM {
     return this.active().getStatus();
   }
 
-  sendText(userId: string, text: string): Promise<{ messageId: string }> {
-    return this.active().sendText(userId, text);
+  async sendText(userId: string, text: string): Promise<{ messageId: string }> {
+    return this.outboundFor(userId).sendText(userId, text);
   }
 
-  sendMarkdownText(userId: string, markdown: string): Promise<{ messageId: string }> {
-    return this.active().sendMarkdownText(userId, markdown);
+  async sendMarkdownText(userId: string, markdown: string): Promise<{ messageId: string }> {
+    return this.outboundFor(userId).sendMarkdownText(userId, markdown);
   }
 
-  sendFile(userId: string, absPath: string, displayName?: string): Promise<SendFileResult> {
-    return this.mode === 'dws'
+  async sendFile(userId: string, absPath: string, displayName?: string): Promise<SendFileResult> {
+    let transport: DingTalkIM | DingTalkDwsIM;
+    try {
+      transport = this.outboundFor(userId);
+    } catch {
+      return { ok: false, reason: 'SEND_FAIL' };
+    }
+    return transport === this.dws
       ? this.dws.sendFile(userId, absPath)
       : this.robot.sendFile(userId, absPath, displayName);
   }
 
-  commitFinal(output: ImFinalOutput): Promise<void> {
-    return this.active().commitFinal(output);
+  async commitFinal(output: ImFinalOutput): Promise<void> {
+    return this.outboundFor(output.userId).commitFinal(output);
   }
 
-  requestTextReply<T>(
+  async requestTextReply<T>(
     userId: string,
     prompt: string,
     parse: (text: string) => T | null,
     timeoutMs?: number,
     shared?: SharedReplyDecision<T>,
   ): Promise<T> {
-    return this.active().requestTextReply(userId, prompt, parse, timeoutMs, shared);
+    return this.outboundFor(userId).requestTextReply(userId, prompt, parse, timeoutMs, shared);
   }
 
   fetchRecentGroupMessages(
@@ -209,6 +222,18 @@ export class DingTalkChannelIM extends BaseIM implements ChannelIM {
 
   private active(): DingTalkIM | DingTalkDwsIM {
     return this.mode === 'dws' ? this.dws : this.robot;
+  }
+
+  /**
+   * 出站选传输：按该会话的来源方式，而不是「当前」方式。来源方式已被切走时
+   * 抛错放弃发送（编排层按发送失败收口），宁可不发也不错发。
+   */
+  private outboundFor(userId: string): DingTalkIM | DingTalkDwsIM {
+    const origin = this.laneMode.get(userId) ?? this.mode;
+    if (origin !== this.mode) {
+      throw new Error('DINGTALK_TRANSPORT_SWITCHED');
+    }
+    return this.active();
   }
 
   private readMode(): DingTalkTransportMode {

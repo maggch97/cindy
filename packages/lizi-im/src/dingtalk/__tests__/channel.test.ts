@@ -147,4 +147,34 @@ describe('DingTalkChannelIM', () => {
       ]),
     );
   });
+
+  it('never sends an in-flight reply through the newly selected transport', async () => {
+    const { channel, robot, dws, handlers } = build();
+    channel.registerIpc();
+    await channel.init();
+    channel.onMessage(() => undefined);
+    // 机器人方式下进来一条消息，任务进行中用户把连接方式切到钉钉账号。
+    robot.emit({ messageId: 'm1', senderId: 'robot-user' });
+    await handlers.get('dingtalkBot:set-mode')?.({ mode: 'dws' });
+    await expect(
+      channel.commitFinal({ userId: 'robot-user', text: 'done', terminal: 'done' }),
+    ).rejects.toThrow('DINGTALK_TRANSPORT_SWITCHED');
+    await expect(channel.sendText('robot-user', 'hi')).rejects.toThrow('DINGTALK_TRANSPORT_SWITCHED');
+    await expect(channel.sendFile('robot-user', '/a.txt')).resolves.toEqual({
+      ok: false,
+      reason: 'SEND_FAIL',
+    });
+    expect(dws.commitFinal).not.toHaveBeenCalled();
+    expect(dws.sendText).not.toHaveBeenCalled();
+    expect(robot.commitFinal).not.toHaveBeenCalled();
+  });
+
+  it('routes replies of conversations that arrived on the current transport normally', async () => {
+    const { channel, dws } = build('dws');
+    await channel.init();
+    channel.onMessage(() => undefined);
+    dws.emit({ messageId: 'm2', senderId: 'dws-user' });
+    await channel.commitFinal({ userId: 'dws-user', text: 'done', terminal: 'done' });
+    expect(dws.commitFinal).toHaveBeenCalledTimes(1);
+  });
 });

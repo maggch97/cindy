@@ -244,6 +244,11 @@ export interface IMMessageEvent {
     /** 被引消息的附件数(已并入本事件 attachments;0/缺省 = 无)。 */
     attachmentCount?: number;
   };
+  /**
+   * 被引消息的附件, **不**并入 attachments(不算当前发言人发送的附件、不落库)。
+   * 渠道 adapter 可将其作为 contextAttachments 只交给模型。目前仅钉钉账号(dws)方式提供。
+   */
+  replyAttachments?: IMAttachment[];
   /** Native private topic metadata. Root message id and thread id are distinct. */
   replyThread?: { rootMessageId: string; threadId: string };
   /** Channel-specific raw event for debug. */

@@ -192,6 +192,24 @@ describe('dingtalk adapter prepareAgentTurnText', () => {
     expect(prepared?.contextSnapshot).toMatchObject({ replyMessageCount: 1 });
   });
 
+  it('passes quoted-message attachments to the model only and notes them in the quote block', async () => {
+    const quotedImage = {
+      kind: 'image' as const,
+      absPath: '/c/q.png',
+      originalName: 'q.png',
+      mimeType: 'image/png',
+    };
+    const prepared = await adapterWith({ supportsGroupHistory: () => true }).prepareAgentTurnText?.(
+      {
+        ...baseEvent,
+        replyContext: { author: '甲', text: '[图片]' },
+        replyAttachments: [quotedImage],
+      },
+    );
+    expect(prepared?.contextAttachments).toEqual([quotedImage]);
+    expect(prepared?.agentText).toContain('被引消息的 1 个附件已随本轮一并提供');
+  });
+
   it('leaves plain direct messages untouched', async () => {
     await expect(
       adapterWith({ supportsGroupHistory: () => true }).prepareAgentTurnText?.(baseEvent),

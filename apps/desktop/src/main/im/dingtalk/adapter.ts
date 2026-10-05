@@ -117,16 +117,20 @@ export function buildDingTalkAdapter(
       // 人格块（设置卡「人格」）：每轮现读，私聊与群聊都在最前面注入。
       const persona = buildDingTalkPersonaBlock(deps.readPersona());
       // 引用回复（仅「钉钉账号」方式会带 replyContext）：私聊与群聊都注入。
+      // 被引消息的附件（replyAttachments）只作为 contextAttachments 交给模型，
+      // 不算当前发言人发送的附件、不落库。
+      const replyAttachments = event.replyAttachments ?? [];
       const replyPrefix = event.replyContext
-        ? buildDingTalkReplyContextBlock(event.replyContext)
+        ? buildDingTalkReplyContextBlock(event.replyContext, replyAttachments.length)
         : '';
       if (!event.speaker) {
-        if (!replyPrefix && !persona) return null;
+        if (!replyPrefix && !persona && replyAttachments.length === 0) return null;
         return {
           agentText: `${persona}${replyPrefix}${event.text}`,
           ...(replyPrefix
             ? { contextSnapshot: captureImContext({ replyPrefix, replyMessageCount: 1 }) }
             : {}),
+          ...(replyAttachments.length > 0 ? { contextAttachments: replyAttachments } : {}),
         };
       }
       const speaker = sanitizeSpeaker(event.speaker.name);
@@ -158,7 +162,10 @@ export function buildDingTalkAdapter(
         }
       }
       if (!groupPrefix && !replyPrefix) {
-        return { agentText: `${persona}${speakerLine}${event.text}` };
+        return {
+          agentText: `${persona}${speakerLine}${event.text}`,
+          ...(replyAttachments.length > 0 ? { contextAttachments: replyAttachments } : {}),
+        };
       }
       // 顺序：人格 → 群上下文（较远背景）→ 引用块（直接相关）→ 发言人 → 正文。
       return {
@@ -167,8 +174,10 @@ export function buildDingTalkAdapter(
           ...(groupPrefix ? { groupPrefix, groupMessageCount } : {}),
           ...(replyPrefix ? { replyPrefix, replyMessageCount: 1 } : {}),
         }),
-        // 群历史里的图片 / 文件只进模型消息，不落库（与飞书同口径）。
-        ...(contextAttachments.length > 0 ? { contextAttachments } : {}),
+        // 群历史与被引消息里的图片 / 文件只进模型消息，不落库（与飞书同口径）。
+        ...(contextAttachments.length + replyAttachments.length > 0
+          ? { contextAttachments: [...contextAttachments, ...replyAttachments] }
+          : {}),
       };
     },
   };
