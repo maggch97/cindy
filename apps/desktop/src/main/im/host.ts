@@ -37,6 +37,7 @@ import {
 import { pinBlob } from '../cindy-media/ledger';
 import { t } from '../i18n';
 import { createDwsRunner } from './dingtalk/dwsRunner';
+import { patchDingTalkAccess, readDingTalkAccess } from './dingtalk/accessStore';
 import { patchDingTalkPersona, readDingTalkPersona } from './dingtalk/personaStore';
 import { discordUiText } from './discord/uiText';
 import { telegramUiText } from './telegram/uiText';
@@ -282,6 +283,14 @@ export function registerDingTalkBotConfigIpc(): void {
   ipcMain.handle('dingtalkBot:set-persona', (e, payload) => {
     assertTrustedAppRendererEvent(e);
     return patchDingTalkPersona(payload);
+  });
+  ipcMain.handle('dingtalkBot:get-access', (e) => {
+    assertTrustedAppRendererEvent(e);
+    return readDingTalkAccess();
+  });
+  ipcMain.handle('dingtalkBot:set-access', (e, payload) => {
+    assertTrustedAppRendererEvent(e);
+    return patchDingTalkAccess(payload);
   });
 }
 

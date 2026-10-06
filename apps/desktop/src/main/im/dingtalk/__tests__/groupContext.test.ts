@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { DingTalkChannelIM, GroupHistoryMessage, IMMessageEvent } from '@cindy/im';
 import { encodeDingTalkLaneUserId } from '@cindy/im';
@@ -126,6 +126,7 @@ describe('dingtalk adapter prepareAgentTurnText', () => {
   ) {
     return buildDingTalkAdapter(im as unknown as DingTalkChannelIM, CONFIG, {
       readPersona: () => persona,
+      readAccess: () => ({ guestFullAccess: false }),
     });
   }
 
@@ -235,8 +236,19 @@ describe('dingtalk adapter prepareAgentTurnText', () => {
 });
 
 describe('dingtalk adapter full access in groups', () => {
-  const adapter = buildDingTalkAdapter({} as unknown as DingTalkChannelIM, CONFIG, {
-    readPersona: () => ({ botName: '', soul: '' }),
+  let guestFullAccess = false;
+  let mode: 'robot' | 'dws' = 'dws';
+  const adapter = buildDingTalkAdapter(
+    { getMode: () => mode } as unknown as DingTalkChannelIM,
+    CONFIG,
+    {
+      readPersona: () => ({ botName: '', soul: '' }),
+      readAccess: () => ({ guestFullAccess }),
+    },
+  );
+  afterEach(() => {
+    guestFullAccess = false;
+    mode = 'dws';
   });
   const event: IMMessageEvent = {
     channelName: 'dingtalk',
@@ -260,6 +272,30 @@ describe('dingtalk adapter full access in groups', () => {
   });
 
   it('keeps the policy for non-owner group turns even under full access', () => {
+    const policy = adapter.turnPermissionPolicyFor?.({
+      ...event,
+      speaker: { id: 'member', name: '成员', isOwner: false },
+    });
+    expect(adapter.turnPolicyOptionalForMode?.('bypassPermissions', policy!)).toBe(false);
+  });
+
+  it('lets non-owner account-mode turns use full access once the owner opts in', () => {
+    const policy = adapter.turnPermissionPolicyFor?.({
+      ...event,
+      speaker: { id: 'member', name: '成员', isOwner: false },
+    });
+    guestFullAccess = true;
+    expect(adapter.turnPolicyOptionalForMode?.('bypassPermissions', policy!)).toBe(true);
+    // 其它权限档不受影响，策略照挂。
+    expect(adapter.turnPolicyOptionalForMode?.('auto', policy!)).toBe(false);
+    // 设置每轮现读：关掉后立刻恢复 fail-closed。
+    guestFullAccess = false;
+    expect(adapter.turnPolicyOptionalForMode?.('bypassPermissions', policy!)).toBe(false);
+  });
+
+  it('keeps robot-mode guest turns fail-closed even when the setting is on', () => {
+    mode = 'robot';
+    guestFullAccess = true;
     const policy = adapter.turnPermissionPolicyFor?.({
       ...event,
       speaker: { id: 'member', name: '成员', isOwner: false },

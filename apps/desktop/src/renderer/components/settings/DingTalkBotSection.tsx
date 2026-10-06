@@ -9,6 +9,7 @@ import { useDingTalkBot } from '@/hooks/useDingTalkBot';
 import { useDingTalkDws, type DingTalkTransportMode } from '@/hooks/useDingTalkDws';
 import { cn } from '@/lib/utils';
 import { DingTalkDwsPanel } from './DingTalkDwsPanel';
+import { DingTalkGuestAccessSetting } from './DingTalkGuestAccessSetting';
 import { DingTalkPersonaSettings } from './DingTalkPersonaSettings';
 import { ImChannelSettingsCard, useImChannelSettingsSummary } from './ImChannelSettingsCard';
 import { ImDefaultSettingsSection } from './ImDefaultSettingsSection';
@@ -120,7 +121,10 @@ export function DingTalkBotSection({
       </div>
 
       {mode === 'dws' ? (
-        <DingTalkDwsPanel dws={dws} />
+        <>
+          <DingTalkDwsPanel dws={dws} />
+          <DingTalkGuestAccessSetting />
+        </>
       ) : (
         <>
           {connected ? (

@@ -20,6 +20,7 @@ import {
   readDingTalkPersona,
   type DingTalkPersonaConfig,
 } from './personaStore';
+import { readDingTalkAccess, type DingTalkAccessConfig } from './accessStore';
 import { createDingTalkTurnPermissionPolicy } from './permissionPolicy';
 import { ui } from './uiText';
 
@@ -55,18 +56,25 @@ function sanitizeSpeaker(value: string): string {
 export interface DingTalkAdapterDeps {
   /** 每轮现读人格，设置卡改动即生效；测试注入。 */
   readPersona(): DingTalkPersonaConfig;
+  /** 每轮派发前现读群访问设置，关闭后立即生效；测试注入。 */
+  readAccess(): DingTalkAccessConfig;
 }
 
-const defaultDeps: DingTalkAdapterDeps = { readPersona: readDingTalkPersona };
+const defaultDeps: DingTalkAdapterDeps = {
+  readPersona: readDingTalkPersona,
+  readAccess: readDingTalkAccess,
+};
 
 export function buildDingTalkAdapter(
   dingtalkIm: DingTalkChannelIM,
   config: ImOrchestratorConfig,
   deps: DingTalkAdapterDeps = defaultDeps,
 ): ImChannelAdapter {
-  // 同一条群任务里只有主人触发的轮次可以凭「完全访问」取缔逐轮强确认；用对象
-  // 身份记下这批 policy，非主人轮次（机器人方式的群成员）仍 fail-closed。
+  // 同一条群任务里默认只有主人触发的轮次可以凭「完全访问」取缔逐轮强确认；用对象
+  // 身份记下这批 policy，非主人轮次仍 fail-closed。
   const ownerGroupTurnPolicies = new WeakSet<object>();
+  // 「钉钉账号」方式下群成员的轮次：仅在主人打开 guestFullAccess 时才可取缔。
+  const dwsGuestGroupTurnPolicies = new WeakSet<object>();
   return {
     channel: 'dingtalk',
     // The shared card-action subscription still expects the rich interface.
@@ -107,12 +115,19 @@ export function buildDingTalkAdapter(
       if (!event.speaker) return undefined;
       const policy = createDingTalkTurnPermissionPolicy(event.messageId, event.speaker.isOwner);
       if (event.speaker.isOwner) ownerGroupTurnPolicies.add(policy);
+      // 「钉钉账号」方式下的群成员轮次：主人可在设置里显式允许它们也用完全访问。
+      // 机器人方式不受该设置影响。
+      else if (dingtalkIm.getMode() === 'dws') dwsGuestGroupTurnPolicies.add(policy);
       return policy;
     },
     // 「完全访问」是主人对这条任务的明确授权：该档下 Agent 的工具调用不会冒泡到
     // 宿主，逐轮强确认无法兑现，因此主人触发的群轮次取缔策略（对齐 Telegram）。
+    // 群成员轮次默认保留策略并 fail-closed；仅当主人打开「群成员也使用完全访问」
+    // 时一并取缔（设置每轮现读，关闭即恢复）。
     turnPolicyOptionalForMode: (mode, policy) =>
-      mode === 'bypassPermissions' && ownerGroupTurnPolicies.has(policy),
+      mode === 'bypassPermissions' &&
+      (ownerGroupTurnPolicies.has(policy) ||
+        (dwsGuestGroupTurnPolicies.has(policy) && deps.readAccess().guestFullAccess)),
     prepareAgentTurnText: async (event) => {
       // 人格块（设置卡「人格」）：每轮现读，私聊与群聊都在最前面注入。
       const persona = buildDingTalkPersonaBlock(deps.readPersona());

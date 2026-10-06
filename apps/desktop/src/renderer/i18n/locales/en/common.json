@@ -3310,6 +3310,16 @@
         "step4": "After connecting, DM the bot once to link the owner. @mention it in group chats.",
         "openPortal": "Open DingTalk developer portal ↗"
       },
+      "guestFullAccess": {
+        "label": "Let group members use Full access",
+        "description": "When a group task is on Full access, only the owner can use it directly by default and other members are rejected. Turning this on lets anyone who @mentions you in the group run with this computer's full permissions, without per-action confirmation. Applies to the DingTalk account connection only.",
+        "confirm": {
+          "title": "Let group members use Full access?",
+          "description": "Any member of the group will be able to make the AI run commands and read or write files with your computer's permissions, without asking you. Persona rules are only soft guidance and can be talked around, so keys, credentials and private files on this computer could leak. Only turn this on if you trust everyone in the group.",
+          "confirm": "Turn on anyway",
+          "cancel": "Cancel"
+        }
+      },
       "persona": {
         "title": "Persona",
         "description": "Define who it is, how it talks, and what it should and should not do. Shared by both the bot app and DingTalk account connection methods, and applied to every reply.",

@@ -2438,6 +2438,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
       soul?: string;
     }): Promise<{ botName: string; soul: string }> =>
       ipcRenderer.invoke('dingtalkBot:set-persona', payload),
+    // 「钉钉账号」方式：群任务完全访问时是否也放行群成员。
+    getAccess: (): Promise<{ guestFullAccess: boolean }> =>
+      ipcRenderer.invoke('dingtalkBot:get-access'),
+    setAccess: (payload: { guestFullAccess: boolean }): Promise<{ guestFullAccess: boolean }> =>
+      ipcRenderer.invoke('dingtalkBot:set-access', payload),
   },
 
   // ── WeCom intelligent bot (Settings → IM Bot → Personal) ──

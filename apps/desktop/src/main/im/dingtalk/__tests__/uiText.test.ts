@@ -19,8 +19,7 @@ describe('DingTalk UI text pack', () => {
   });
 
   it('points the group permission-mode rejection to the desktop app', () => {
-    const copy = ui.error?.permissionModeUnsupported;
-    const text = typeof copy === 'function' ? copy('bypassPermissions') : copy;
+    const text = String(ui.error?.permissionModeUnsupported);
     expect(text).not.toContain('/permission');
     expect(text).toContain('Cindy 桌面端');
   });

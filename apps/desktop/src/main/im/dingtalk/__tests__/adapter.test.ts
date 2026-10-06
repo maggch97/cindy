@@ -63,7 +63,10 @@ describe('dingtalk session identity', () => {
 });
 
 describe('dingtalk turn permission boundary', () => {
-  const adapter = buildDingTalkAdapter({} as unknown as DingTalkChannelIM, CONFIG);
+  const adapter = buildDingTalkAdapter(
+    { getMode: () => 'robot' } as unknown as DingTalkChannelIM,
+    CONFIG,
+  );
   const baseEvent = {
     channelName: 'dingtalk',
     senderId: 'owner-user',

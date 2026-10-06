@@ -2400,6 +2400,8 @@ interface ElectronAPI {
       botName?: string;
       soul?: string;
     }) => Promise<{ botName: string; soul: string }>;
+    getAccess: () => Promise<{ guestFullAccess: boolean }>;
+    setAccess: (payload: { guestFullAccess: boolean }) => Promise<{ guestFullAccess: boolean }>;
   };
 
   wecomBot: {
