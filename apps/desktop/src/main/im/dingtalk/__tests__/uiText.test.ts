@@ -18,6 +18,13 @@ describe('DingTalk UI text pack', () => {
     expect(ui.slash.interactiveCommandUnsupported?.('/model')).toContain('Cindy 桌面端');
   });
 
+  it('points the group permission-mode rejection to the desktop app', () => {
+    const copy = ui.error?.permissionModeUnsupported;
+    const text = typeof copy === 'function' ? copy('bypassPermissions') : copy;
+    expect(text).not.toContain('/permission');
+    expect(text).toContain('Cindy 桌面端');
+  });
+
   it('relabels inherited Telegram copy for DingTalk', () => {
     expect(ui.slash.detachedBySlash).toContain('钉钉');
     expect(ui.slash.detachedBySlash).not.toContain('Telegram');
