@@ -1206,10 +1206,15 @@ function applyDeviceSessionPhase(
       return { changed, event: entering && previous !== null ? 'needs-reply' : null };
     }
     case 'completed': {
-      if (previous === 'completed') return { changed: false, event: null };
+      if (previous === 'completed') {
+        return { changed: mirrorDeviceSessionSummary(session, input.detail), event: null };
+      }
       clearDeviceSessionInteraction(session);
       session.running = false;
       session.lastActivityAt = now;
+      // 先换掉上一轮的摘要,且必须先于 complete:有摘要可显示时就不再补「完成」占位。
+      session.activityLines = [];
+      mirrorDeviceSessionSummary(session, input.detail);
       // 对方设备已经仲裁过终态,这里不再套本机「报错后的配对 done」保护。
       session.completionAllowedAfterTerminalError = true;
       completeAgentIslandSession(state, session, now, observed
@@ -1235,6 +1240,18 @@ function applyDeviceSessionPhase(
       return { changed: true, event: observed ? 'error' : null };
     }
   }
+}
+
+/**
+ * 设备任务不同步对话,只带对方岛上算好的一行摘要,不带消息角色。记成状态行(不冒充
+ * 回复):完成卡片取它当文案,连续更新原地替换;没有摘要时才退回「完成」。
+ */
+function mirrorDeviceSessionSummary(session: AgentIslandSessionState, detail: string): boolean {
+  const text = normalizeActivityText(detail);
+  const last = session.activityLines.at(-1);
+  if (!text || (last?.kind === 'status' && last.text === text)) return false;
+  appendActivityLine(session, 'status', text);
+  return true;
 }
 
 function clearDeviceSessionInteraction(session: AgentIslandSessionState): void {
@@ -2379,6 +2396,23 @@ function compactDetailForSession(session: AgentIslandSessionState): string {
   if (userActivity) return truncateInlineText(userActivity.text, AGENT_ISLAND_COMPACT_DETAIL_MAX_LENGTH);
 
   return detail ? truncateInlineText(detail, AGENT_ISLAND_COMPACT_DETAIL_MAX_LENGTH) : '';
+}
+
+/**
+ * 同步给其它设备的完成摘要:只取本轮(最后一条用户消息之后)的最后一条回复。驻留中的
+ * 用户提问、「完成」占位、工具状态和上一轮的回复都不算结果;没有回复时给空串,由接收端
+ * 用自己的语言显示「完成」。
+ */
+export function completedReplySummary(
+  snapshot: Pick<AgentIslandSessionSnapshot, 'activityLines'>,
+): string {
+  for (const line of snapshot.activityLines.slice().reverse()) {
+    if (line.kind === 'user') break;
+    if (line.kind === 'assistant') {
+      return truncateInlineText(line.text, AGENT_ISLAND_COMPACT_DETAIL_MAX_LENGTH);
+    }
+  }
+  return '';
 }
 
 function messagePreviewTextForSession(session: AgentIslandSessionState): string | null {

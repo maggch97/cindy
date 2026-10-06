@@ -23,7 +23,7 @@ import { shouldShowOpenPathError } from '../../../shared/openPathResult';
 import { CHAT_LIGHTBOX_ICON_BUTTON_CLASS, CHAT_FOCUS_CLASS } from './chatChrome';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Copy, ExternalLink, Folder, TriangleAlert, X } from 'lucide-react';
+import { Copy, Download, ExternalLink, Folder, TriangleAlert, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import { cn, basename } from '@/lib/utils';
@@ -32,7 +32,11 @@ import { toast } from '@/lib/toast';
 import { Tooltip } from '@/components/ui/tooltip';
 import { detectRenderable } from '@/lib/textPreview';
 import { isRemoteFileOrigin } from '@/lib/sessionFileOrigin';
-import { chatFileErrorText, fetchChatFileToCache } from '@/lib/remoteFileOpen';
+import {
+  chatFileErrorText,
+  downloadRemoteChatEntry,
+  fetchChatFileToCache,
+} from '@/lib/remoteFileOpen';
 import { useChatSessionFile } from './ChatSessionFileContext';
 import { PlaintextEditor, type PlaintextEditorHandle } from '@/components/markdown/PlaintextEditor';
 import { MarkdownRenderer } from './MarkdownRenderer';
@@ -339,9 +343,9 @@ export function TextLightbox({ filePath, fileName, initialLine, triggerRef, onCl
     }
   }
 
-  // 远程会话:系统打开 / 目录定位一律对**本地缓存副本**进行(远端路径在本机
-  // 无意义,直呼 openPath 是误开本机同路径文件的隐患);copyPath 仍复制远端
-  // 原始路径(用户要的是"这个文件在远端哪里")。
+  // 远程会话:系统打开对**本地缓存副本**进行(远端路径在本机无意义,直呼
+  // openPath 是误开本机同路径文件的隐患),定位改为「下载到本地」(落到系统下载
+  // 文件夹);copyPath 仍复制远端原始路径(用户要的是"这个文件在远端哪里")。
   async function openInSystem() {
     const target = remoteOrigin ? remoteCopy?.cachePath : filePath;
     if (!target) return;
@@ -352,9 +356,11 @@ export function TextLightbox({ filePath, fileName, initialLine, triggerRef, onCl
   }
 
   async function showInFolder() {
-    const target = remoteOrigin ? remoteCopy?.cachePath : filePath;
-    if (!target) return;
-    const res = await window.electronAPI.showItemInFolder({ filePath: target });
+    if (remoteOrigin) {
+      await downloadRemoteChatEntry(remoteOrigin, sessionFileCtx.workingDir, filePath);
+      return;
+    }
+    const res = await window.electronAPI.showItemInFolder({ filePath });
     if (!res.success) {
       toast.error(res.error || t('chat.textLightbox.openSystemFailed'));
     }
@@ -489,15 +495,19 @@ export function TextLightbox({ filePath, fileName, initialLine, triggerRef, onCl
                 <button
                   type="button"
                   onClick={showInFolder}
-                  aria-label={remoteOrigin ? t('chat.remoteFile.revealLocalCopy') : t('chat.lightbox.openInExplorer')}
+                  aria-label={remoteOrigin ? t('chat.remoteFile.downloadToLocal') : t('chat.lightbox.openInExplorer')}
                   disabled={!localActionsReady}
                   className={CHAT_LIGHTBOX_ICON_BUTTON_CLASS}
                 >
-                  <Folder size={18} className="text-[var(--msg-tool-card-chevron)]" />
+                  {remoteOrigin ? (
+                    <Download size={18} className="text-[var(--msg-tool-card-chevron)]" />
+                  ) : (
+                    <Folder size={18} className="text-[var(--msg-tool-card-chevron)]" />
+                  )}
                 </button>
               </Tooltip.Trigger>
               <Tooltip.Content style={TEXT_LIGHTBOX_TOOLTIP_STYLE}>
-                {remoteOrigin ? t('chat.remoteFile.revealLocalCopy') : t('chat.lightbox.openInExplorer')}
+                {remoteOrigin ? t('chat.remoteFile.downloadToLocal') : t('chat.lightbox.openInExplorer')}
               </Tooltip.Content>
             </Tooltip.Root>
             <Tooltip.Root>

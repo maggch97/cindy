@@ -21,6 +21,7 @@ function channelRequestId(message: unknown): string | null {
 }
 import { DESKTOP_AUDIO_RETRY_MS, type DesktopCaptureApi } from '../../../shared/remoteDesktop';
 import {
+  desktopEncoderLimits,
   desktopVideoFramerate,
   desktopVideoProfile,
   withDesktopBitrateHints,
@@ -57,6 +58,10 @@ export function startDesktopCaptureHost(api: DesktopCaptureApi): () => void {
   // A hidden viewer pauses the video encoder in place; audio, input and the
   // data channel keep running, and showing the viewer resumes the same stream.
   let viewerHidden = false;
+  // A background viewer (phone picture-in-picture) gets the saver ceilings on
+  // the same stream; returning to fullscreen restores the negotiated tier.
+  let background = false;
+  let applyEncoder: (() => Promise<boolean>) | null = null;
   // setParameters rejects stale parameters, so every sender update is queued.
   let senderUpdates = Promise.resolve();
   /** Resolves false when an encoder update was rejected. */
@@ -88,6 +93,8 @@ export function startDesktopCaptureHost(api: DesktopCaptureApi): () => void {
   const stop = () => {
     generation++;
     viewerHidden = false;
+    background = false;
+    applyEncoder = null;
     exchanging = false;
     clearTimeout(disconnectedTimer);
     clearTimeout(gatheringTimer);
@@ -208,6 +215,12 @@ export function startDesktopCaptureHost(api: DesktopCaptureApi): () => void {
       void applyViewerHidden().then((applied) => api.reply(command.id, applied).catch(() => {}));
       return;
     }
+    if (command.op === 'background-viewing') {
+      if (command.lease !== activeLease) return;
+      background = command.background === true;
+      void applyEncoder?.();
+      return;
+    }
     stop();
     if (
       command.op !== 'offer' ||
@@ -220,6 +233,7 @@ export function startDesktopCaptureHost(api: DesktopCaptureApi): () => void {
     const current = generation;
     const lease = command.lease;
     activeLease = lease;
+    background = command.background === true;
     attemptId = command.attemptId;
     void (async () => {
       try {
@@ -229,16 +243,27 @@ export function startDesktopCaptureHost(api: DesktopCaptureApi): () => void {
         // Native capture reports whether the screen is moving; tiers that stay
         // sharp when still trade frame rate for resolution only while still.
         let moving = true;
-        let tuned = false;
-        const degradation = () => (moving ? profile.degradation : 'maintain-resolution');
+        // Below these ceilings WebRTC's congestion controller picks the rate;
+        // the tier decides whether resolution or frame rate gives way first.
+        const tune = () =>
+          updateVideoSenders((parameters) => {
+            const limits = desktopEncoderLimits(command.settings!, background);
+            const degradation =
+              moving || !limits.sharpWhenStill ? limits.degradation : 'maintain-resolution';
+            let changed = parameters.degradationPreference !== degradation;
+            parameters.degradationPreference = degradation;
+            for (const encoding of parameters.encodings) {
+              changed ||=
+                encoding.maxBitrate !== limits.maxBitrate ||
+                encoding.maxFramerate !== limits.maxFramerate;
+              encoding.maxBitrate = limits.maxBitrate;
+              encoding.maxFramerate = limits.maxFramerate;
+            }
+            return changed;
+          });
         const onMotion = (next: boolean) => {
           moving = next;
-          if (!tuned || current !== generation) return;
-          void updateVideoSenders((parameters) => {
-            if (parameters.degradationPreference === degradation()) return false;
-            parameters.degradationPreference = degradation();
-            return true;
-          });
+          if (current === generation) void applyEncoder?.();
         };
         const capture = () =>
           navigator.mediaDevices.getDisplayMedia({
@@ -290,7 +315,8 @@ export function startDesktopCaptureHost(api: DesktopCaptureApi): () => void {
               if (current === generation) latestCursor = value;
             },
             command.cursorOverlay || command.continuousNativeCapture ? fps : 15,
-            command.settings && profile.sharpWhenStill ? onMotion : undefined,
+            // Any tier may become the saver tier in the background, so motion is always tracked.
+            command.settings ? onMotion : undefined,
           );
           if (current !== generation) {
             result.stop();
@@ -435,6 +461,9 @@ export function startDesktopCaptureHost(api: DesktopCaptureApi): () => void {
           let requests = 0;
           let challenge = '';
           heartbeat = setInterval(() => {
+            // Encoder ceilings follow state, not events: an update the encoder
+            // rejected converges here, and a matching encoder is left untouched.
+            if (current === generation) void applyEncoder?.();
             // Keep one outstanding challenge until its reply arrives. The host
             // lease bounds silence; replacing it here rejects valid slow pongs.
             if (channel.readyState !== 'open' || current !== generation || challenge) return;
@@ -585,19 +614,11 @@ export function startDesktopCaptureHost(api: DesktopCaptureApi): () => void {
           };
         }
         await rtc.setLocalDescription(await rtc.createAnswer());
-        for (const sender of rtc.getSenders()) {
-          if (sender.track?.kind !== 'video' || !command.settings) continue;
-          const parameters = sender.getParameters();
-          if (!parameters.encodings?.length) continue;
-          // Below these ceilings WebRTC's congestion controller picks the rate;
-          // the tier decides whether resolution or frame rate gives way first.
-          parameters.degradationPreference = degradation();
-          tuned = true;
-          for (const encoding of parameters.encodings) {
-            encoding.maxFramerate = fps;
-            encoding.maxBitrate = profile.maxBitrate;
-          }
-          await sender.setParameters(parameters);
+        if (current !== generation) throw new Error('DESKTOP_VIDEO_STOPPED');
+        if (command.settings) {
+          // Published before the first update, so a change arriving meanwhile queues after it.
+          applyEncoder = tune;
+          if (!(await tune())) throw new Error('DESKTOP_VIDEO_UNAVAILABLE');
         }
         // A pause that arrived while this peer was still being set up applies now.
         if (viewerHidden) void applyViewerHidden();

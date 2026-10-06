@@ -84,6 +84,7 @@ import {
   buildAllSessionActivitySnapshots,
   closeAgentIslandSessionPreservingUnread,
   completeAgentIslandSessionWithoutAttention,
+  completedReplySummary,
   createAgentIslandUserPromptRollbackToken,
   createAgentIslandState,
   dismissAgentIslandActiveReveal,
@@ -1551,7 +1552,8 @@ export class AgentIslandService {
       }),
       phase: s.phase,
       interactionKind: s.interactionKind,
-      compactDetail: s.compactDetail,
+      // 完成后这份摘要只给其它设备的完成卡片用(本机岛面直接读展示快照)。
+      compactDetail: s.phase === 'completed' ? completedReplySummary(s) : s.compactDetail,
       workingPhase: s.workingPhase,
     }));
   }

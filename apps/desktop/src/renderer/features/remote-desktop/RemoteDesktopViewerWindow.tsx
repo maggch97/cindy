@@ -4,12 +4,11 @@ import {
   SlidersHorizontal,
   Clipboard,
   Shield,
-  AppWindow,
-  LayoutGrid,
   ZoomIn,
   ZoomOut,
   X,
   Monitor,
+  createLucideIcon,
 } from 'lucide-react';
 import {
   REMOTE_DESKTOP_VIDEO_QUALITIES,
@@ -156,7 +155,7 @@ export function RemoteDesktopViewerWindow() {
     const owner = generation.current;
     setModesStatus('loading');
     void controller.current
-      ?.displayModes()
+      ?.resolutionModes()
       .then((value) => {
         if (owner !== generation.current) return;
         setModes(value);
@@ -169,11 +168,18 @@ export function RemoteDesktopViewerWindow() {
   const openPanel = (panel: 'display' | 'clipboard' | 'security', open: boolean) => {
     controller.current?.releaseInput();
     setSettings((current) => (open ? panel : current === panel ? null : current));
-    if (open && panel === 'display' && state?.caps?.displayModes) loadModes();
+    if (open && panel === 'display' && (state?.caps?.displayModes || state?.fittedDisplay))
+      loadModes();
   };
   const onSelectOpenChange = (open: boolean) => {
     setSelectOpen(open);
     if (open) controller.current?.releaseInput();
+  };
+  const workspaceAction = (action: 'workspaceLeft' | 'workspaceRight' | 'omarchyMenu') => {
+    const owner = generation.current;
+    void controller.current?.workspaceAction(action).catch(() => {
+      if (owner === generation.current) setNotice(t('remoteDesktop.viewer.actionFailed'));
+    });
   };
   const action = 'remote-viewer-action';
   const network = state?.ready && (
@@ -288,30 +294,62 @@ export function RemoteDesktopViewerWindow() {
           role="group"
           aria-label={t('remoteDesktop.viewer.controlGroup')}
         >
-          <ViewerTool
-            label={t('remoteDesktop.allWindows')}
-            disabled={!state?.controlling || state.controlPending}
-            onClick={() =>
-              controller.current?.keys(
-                state?.caps?.platform === 'darwin'
-                  ? ['ControlLeft', 'ArrowUp']
-                  : ['MetaLeft', 'Tab'],
-              )
-            }
-          >
-            <LayoutGrid size={16} />
-          </ViewerTool>
-          <ViewerTool
-            label={t('remoteDesktop.showDesktop')}
-            disabled={!state?.controlling || state.controlPending}
-            onClick={() =>
-              controller.current?.keys(
-                state?.caps?.platform === 'darwin' ? ['MetaLeft', 'F3'] : ['MetaLeft', 'KeyD'],
-              )
-            }
-          >
-            <AppWindow size={16} />
-          </ViewerTool>
+          {state?.caps?.workspaceNavigation ? (
+            <>
+              <ViewerTool
+                label={t('remoteDesktop.workspaceLeft')}
+                disabled={!state.controlling || state.controlPending}
+                onClick={() => workspaceAction('workspaceLeft')}
+              >
+                <WorkspaceLeftIcon size={16} />
+              </ViewerTool>
+              <ViewerTool
+                label={t('remoteDesktop.workspaceRight')}
+                disabled={!state.controlling || state.controlPending}
+                onClick={() => workspaceAction('workspaceRight')}
+              >
+                <WorkspaceRightIcon size={16} />
+              </ViewerTool>
+            </>
+          ) : (
+            <>
+              <ViewerTool
+                label={t('remoteDesktop.allWindows')}
+                disabled={!state?.controlling || state.controlPending}
+                onClick={() =>
+                  controller.current?.keys(
+                    state?.caps?.platform === 'darwin'
+                      ? ['ControlLeft', 'ArrowUp']
+                      : ['MetaLeft', 'Tab'],
+                  )
+                }
+              >
+                <AllWindowsIcon size={16} />
+              </ViewerTool>
+              <ViewerTool
+                label={t('remoteDesktop.showDesktop')}
+                disabled={!state?.controlling || state.controlPending}
+                onClick={() =>
+                  // Cmd+F3 only works from the physical Mission Control key; a
+                  // synthesized F3 keycode never triggers it. F11 is the default.
+                  controller.current?.keys(
+                    state?.caps?.platform === 'darwin' ? ['F11'] : ['MetaLeft', 'KeyD'],
+                  )
+                }
+              >
+                <ShowDesktopIcon size={16} />
+              </ViewerTool>
+            </>
+          )}
+          {state?.caps?.omarchyMenu && (
+            <ViewerTool
+              label={t('remoteDesktop.omarchyMenu')}
+              disabled={!state.controlling || state.controlPending}
+              onClick={() => workspaceAction('omarchyMenu')}
+            >
+              <OmarchyMenuIcon size={16} />
+            </ViewerTool>
+          )}
         </div>
         <div className="remote-viewer-zoom-group" role="group" aria-label={t('remoteDesktop.fit')}>
           <ViewerTool
@@ -424,7 +462,15 @@ export function RemoteDesktopViewerWindow() {
                       .catch(() => setNotice(t('remoteDesktop.viewer.settingsFailed')));
                   }}
                 >
-                  {t('remoteDesktop.viewer.fitViewerDisplay')}
+                  {t(
+                    root.current &&
+                      controller.current?.viewerDisplayMatched(
+                        root.current.clientWidth,
+                        root.current.clientHeight,
+                      )
+                      ? 'remoteDesktop.viewer.restoreViewerDisplay'
+                      : 'remoteDesktop.viewer.fitViewerDisplay',
+                  )}
                 </Button>
                 <p>{t('remoteDesktop.viewer.fitViewerDisplayHint')}</p>
               </div>
@@ -456,19 +502,23 @@ export function RemoteDesktopViewerWindow() {
                       value: mode.id,
                       label: `${mode.width} × ${mode.height}${mode.native ? ` · ${t('remoteDesktop.nativeResolution')}` : ''}`,
                     }))}
-                    onValueChange={(value) =>
+                    onValueChange={(value) => {
+                      const mode = modes.find((item) => item.id === value);
+                      if (!mode) return;
                       void controller.current
-                        ?.resolution(value)
+                        ?.resolution(mode)
                         .then(loadModes)
-                        .catch(() => setNotice(t('remoteDesktop.viewer.settingsFailed')))
-                    }
+                        .catch(() => setNotice(t('remoteDesktop.viewer.settingsFailed')));
+                    }}
                     onOpenChange={onSelectOpenChange}
                   />
                 )}
               </FormField>
             )}
 
-            {state?.caps?.displayModes && <p>{t('remoteDesktop.viewer.resolutionHint')}</p>}
+            {(state?.caps?.displayModes || state?.fittedDisplay) && (
+              <p>{t('remoteDesktop.viewer.resolutionHint')}</p>
+            )}
             <div className="remote-viewer-panel-section">
               <label className="remote-viewer-toggle-row" htmlFor="viewer-audio">
                 <span>{t('remoteDesktop.viewer.sound')}</span>
@@ -495,7 +545,6 @@ export function RemoteDesktopViewerWindow() {
           <ViewerPanel
             label={t('remoteDesktop.viewer.clipboardPanel')}
             icon={<Clipboard size={16} />}
-            active={state?.preferences.clipboardSync}
             open={settings === 'clipboard'}
             restoreFocus={() => activePanel.current === null}
             onOpenChange={(open) => openPanel('clipboard', open)}
@@ -537,7 +586,6 @@ export function RemoteDesktopViewerWindow() {
           <ViewerPanel
             label={t('remoteDesktop.viewer.securityPanel')}
             icon={<Shield size={16} />}
-            active={state?.safety.privacyActive}
             open={settings === 'security'}
             restoreFocus={() => activePanel.current === null}
             onOpenChange={(open) => openPanel('security', open)}
@@ -680,15 +728,13 @@ export function RemoteDesktopViewerWindow() {
             </div>
           )}
         {isFullscreen && network && <div className="remote-viewer-network-overlay">{network}</div>}
-        {(notice || state?.safety.notice || state?.safety.privacyActive) && (
+        {/* Announce the privacy screen to assistive tech without covering the remote picture. */}
+        <span className="sr-only" role="status">
+          {state?.safety.privacyActive ? t('remoteDesktop.privacyActive') : ''}
+        </span>
+        {(notice || state?.safety.notice) && (
           <div className="remote-viewer-feedback" role="status">
-            {state?.safety.privacyActive && <Shield size={14} aria-hidden="true" />}
-            <span>
-              {notice ??
-                (state?.safety.notice
-                  ? t(`remoteDesktop.${state.safety.notice}`)
-                  : t('remoteDesktop.privacyActive'))}
-            </span>
+            <span>{notice ?? t(`remoteDesktop.${state?.safety.notice}`)}</span>
             {state?.safety.notice && (
               <Button
                 variant="secondary"
@@ -745,6 +791,47 @@ export function RemoteDesktopViewerWindow() {
     </div>
   );
 }
+
+// Same glyphs as Mobile's remote desktop toolbar
+// (apps/mobile/src/remote-desktop/RemoteDesktopIcons.tsx).
+const WorkspaceLeftIcon = createLucideIcon('RemoteDesktopWorkspaceLeft', [
+  ['rect', { x: '3', y: '3', width: '18', height: '14', rx: '2', key: 'screen' }],
+  ['path', { d: 'M12 17v4M8 21h8M15 10H9m3-3-3 3 3 3', key: 'direction' }],
+]);
+
+const WorkspaceRightIcon = createLucideIcon('RemoteDesktopWorkspaceRight', [
+  ['rect', { x: '3', y: '3', width: '18', height: '14', rx: '2', key: 'screen' }],
+  ['path', { d: 'M12 17v4M8 21h8M9 10h6m-3-3 3 3-3 3', key: 'direction' }],
+]);
+
+// Official Omarchy mark: https://omarchy.org/brand/omarchy-logo.svg
+// Preserve its path and proportions; inherit the toolbar's Light/Dark foreground.
+const OmarchyMenuIcon = createLucideIcon('RemoteDesktopOmarchyMenu', [
+  [
+    'path',
+    {
+      d: 'm1200 1200h-480v-80h400v-1040h-479.996v160h-400v720h720v-720h-80v-80h159.996v880h-400v160h-640v-1200h1200zm-1120-80h480v-80h-400l.004-400h-80.004zm0-560h80.004v-400h400v-80h-480.004z',
+      transform: 'scale(0.02)',
+      fill: 'currentColor',
+      fillRule: 'evenodd',
+      clipRule: 'evenodd',
+      stroke: 'none',
+      key: 'official-mark',
+    },
+  ],
+]);
+
+const AllWindowsIcon = createLucideIcon('RemoteDesktopAllWindows', [
+  ['path', { d: 'M4 16a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v1', key: 'rear' }],
+  ['rect', { x: '7', y: '8', width: '15', height: '13', rx: '2', key: 'front' }],
+  ['path', { d: 'M7 12h15', key: 'titlebar' }],
+]);
+
+const ShowDesktopIcon = createLucideIcon('RemoteDesktopShowDesktop', [
+  ['rect', { x: '2', y: '3', width: '20', height: '14', rx: '2', key: 'screen' }],
+  ['path', { d: 'M8 13h8', key: 'dock' }],
+  ['path', { d: 'M12 17v4M8 21h8', key: 'stand' }],
+]);
 
 function ZoomModeIcon({ actual = false }: { actual?: boolean }) {
   return (
@@ -806,7 +893,6 @@ function ViewerTool({
 function ViewerPanel({
   label,
   icon,
-  active,
   open,
   restoreFocus,
   onOpenChange,
@@ -814,7 +900,6 @@ function ViewerPanel({
 }: {
   label: string;
   icon: ReactNode;
-  active?: boolean;
   open: boolean;
   restoreFocus(): boolean;
   onOpenChange(open: boolean): void;
@@ -833,7 +918,6 @@ function ViewerPanel({
             aria-pressed={open}
           >
             {icon}
-            {active && <span className="remote-viewer-active-dot" aria-hidden="true" />}
           </Button>
         </Tip>
       </PopoverTrigger>

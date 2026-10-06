@@ -2,6 +2,10 @@
 import { afterEach, beforeEach, it, expect, vi } from 'vitest';
 import { mountRemoteDesktopViewer } from '@cindy/maker-shared/remote-desktop-viewer';
 import { DESKTOP_KEY_CODES, REMOTE_DESKTOP_NETWORK } from '@cindy/device-link';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+const viewerCss = readFileSync(resolve(__dirname, '..', 'viewerWindow.css'), 'utf8');
 
 let viewer: ReturnType<typeof mountRemoteDesktopViewer>;
 let messages: Record<string, unknown>[];
@@ -78,6 +82,25 @@ function events() {
     m.type === 'input' ? (m.events as Record<string, unknown>[]) : [],
   );
 }
+
+it('keeps a frameless picture hidden by the viewer stylesheet so it never paints a broken image', () => {
+  const style = document.createElement('style');
+  style.textContent = viewerCss;
+  document.head.append(style);
+  document.body.className = 'remote-viewer-content';
+  const image = document.getElementById('image')!;
+  try {
+    expect(getComputedStyle(image).visibility).toBe('hidden');
+    viewer.receive({ type: 'stop' });
+    expect(getComputedStyle(image).visibility).toBe('hidden');
+    viewer.receive({ type: 'init', epoch: 'next', width: 1000, height: 600 });
+    viewer.receive({ type: 'frame', jpeg: 'AA==' });
+    expect(getComputedStyle(image).visibility).toBe('visible');
+  } finally {
+    style.remove();
+    document.body.className = '';
+  }
+});
 
 it('zooms locally within bounds and fit restores scale and position', () => {
   const image = document.getElementById('image')!;
@@ -385,6 +408,21 @@ it('maps real mouse movement, right button and wheel to the picture below the to
   expect(events()).toContainEqual({ kind: 'button', button: 2, down: false, x: 0.5, y: 0.5 });
   expect(events()).toContainEqual({ kind: 'scroll', dx: 0, dy: 32 });
 });
+it('carries sub-pixel wheel deltas instead of letting hosts truncate them away', () => {
+  pointer('pointermove');
+  vi.advanceTimersByTime(34);
+  const wheel = (deltaX: number, deltaY: number) =>
+    stage.dispatchEvent(new WheelEvent('wheel', { deltaX, deltaY, bubbles: true, cancelable: true }));
+  wheel(0, 0.4);
+  wheel(0, 0.4);
+  expect(events().filter((e) => e.kind === 'scroll')).toEqual([]);
+  wheel(-0.5, 0.4);
+  wheel(-0.7, 2.5);
+  expect(events().filter((e) => e.kind === 'scroll')).toEqual([
+    { kind: 'scroll', dx: 0, dy: 1 },
+    { kind: 'scroll', dx: -1, dy: 2 },
+  ]);
+});
 it('commits IME text once and never forwards local toolbar keyboard input', () => {
   pointer('pointerdown');
   pointer('pointerup');
@@ -560,4 +598,34 @@ it('continues edge panning when the first browser frame predates the pointer eve
   firstFrame(performance.now() - 1);
   vi.advanceTimersByTime(200);
   expect(parseFloat(document.getElementById('image')!.style.left)).toBeLessThan(-500);
+});
+it('still releases host input when a local view-only switch abandons an in-flight batch', () => {
+  viewer.dispose();
+  messages = [];
+  // No automatic ACK: the first batch stays in flight.
+  viewer = mountRemoteDesktopViewer(document, (message) => messages.push(message), {
+    desktop: true,
+    net: REMOTE_DESKTOP_NETWORK,
+    iceServers: [],
+    keyCodes: DESKTOP_KEY_CODES,
+  });
+  viewer.receive({ type: 'init', epoch: 'lease', width: 1000, height: 600 });
+  viewer.receive({ type: 'control', enabled: true });
+  pointer('pointermove');
+  vi.advanceTimersByTime(34);
+  pointer('pointerdown');
+  vi.advanceTimersByTime(34);
+  const before = messages.filter((m) => m.type === 'input').length;
+  viewer.receive({ type: 'control', enabled: false, release: true });
+  const after = messages.filter((m) => m.type === 'input');
+  expect(after.length).toBe(before + 1);
+  expect(after.at(-1)?.events).toEqual([{ kind: 'release' }]);
+  // Without the flag (the host revoked control) an in-flight batch still
+  // drops the queued release, as before.
+  viewer.receive({ type: 'control', enabled: true });
+  pointer('pointermove', 400, 300);
+  vi.advanceTimersByTime(34);
+  const count = messages.filter((m) => m.type === 'input').length;
+  viewer.receive({ type: 'control', enabled: false });
+  expect(messages.filter((m) => m.type === 'input').length).toBe(count);
 });

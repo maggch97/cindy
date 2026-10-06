@@ -13,6 +13,8 @@ const lifecycle = vi.hoisted(() => ({
   zoom: vi.fn(),
   fit: vi.fn(),
   actualSize: vi.fn(),
+  keys: vi.fn(),
+  workspaceAction: vi.fn(async () => {}),
   update: null as ((state: ViewerSnapshot) => void) | null,
 }));
 vi.mock('../viewerController', () => ({
@@ -31,6 +33,8 @@ vi.mock('../viewerController', () => ({
     zoom = lifecycle.zoom;
     fit = lifecycle.fit;
     actualSize = lifecycle.actualSize;
+    keys = lifecycle.keys;
+    workspaceAction = lifecycle.workspaceAction;
     close = () => this._api.close(1);
   },
 }));
@@ -103,6 +107,7 @@ it('confirms toolbar and native exits, keeps cancellation connected, and discard
     credential: null,
     credentialBusy: false,
     credentialNotice: null,
+    fittedDisplay: null,
   };
   for (const status of ['connecting', 'reconnecting']) {
     act(() => lifecycle.update?.({ ...connected, ready: false, status }));
@@ -184,6 +189,7 @@ it('hides view-only controls and enables desktop actions only after control is c
     credential: null,
     credentialBusy: false,
     credentialNotice: null,
+    fittedDisplay: null,
     target: { deviceId: 'host', name: 'Windows' },
     ready: true,
     controlling: false,
@@ -238,6 +244,32 @@ it('hides view-only controls and enables desktop actions only after control is c
   };
   await act(async () => lifecycle.update?.(supported));
   expect(desktop.disabled).toBe(false);
+  fireEvent.click(desktop);
+  expect(lifecycle.keys).toHaveBeenLastCalledWith(['MetaLeft', 'KeyD']);
+  // A synthesized Cmd+F3 never reaches Mission Control; F11 is the macOS default.
+  await act(async () =>
+    lifecycle.update?.({ ...supported, caps: { ...supported.caps, platform: 'darwin' } }),
+  );
+  fireEvent.click(desktop);
+  expect(lifecycle.keys).toHaveBeenLastCalledWith(['F11']);
+  // Linux workspace hosts swap the shortcut buttons for host-side window actions, as on Mobile.
+  await act(async () =>
+    lifecycle.update?.({
+      ...supported,
+      caps: { ...supported.caps, platform: 'linux', workspaceNavigation: true, omarchyMenu: true },
+    }),
+  );
+  expect(screen.queryByRole('button', { name: i18n.t('remoteDesktop.showDesktop') })).toBeNull();
+  expect(screen.queryByRole('button', { name: i18n.t('remoteDesktop.allWindows') })).toBeNull();
+  for (const action of ['workspaceLeft', 'workspaceRight', 'omarchyMenu'] as const) {
+    fireEvent.click(screen.getByRole('button', { name: i18n.t(`remoteDesktop.${action}`) }));
+    expect(lifecycle.workspaceAction).toHaveBeenLastCalledWith(action);
+  }
+  lifecycle.workspaceAction.mockRejectedValueOnce(new Error('DESKTOP_INPUT_UNSUPPORTED'));
+  fireEvent.click(screen.getByRole('button', { name: i18n.t('remoteDesktop.workspaceLeft') }));
+  expect(await screen.findByText(i18n.t('remoteDesktop.viewer.actionFailed'))).toBeDefined();
+  expect(lifecycle.keys).toHaveBeenCalledTimes(2);
+  await act(async () => lifecycle.update?.(supported));
   expect(
     (
       panel.getByRole('switch', {
@@ -316,6 +348,7 @@ it.each([
       credential: null,
       credentialBusy: false,
       credentialNotice: null,
+      fittedDisplay: null,
       target: null,
       ready: true,
       controlling: true,
@@ -332,6 +365,59 @@ it.each([
   const toolbar = within(view.container.querySelector('header')!);
   expect(toolbar.getByText('正在控制')).toBeDefined();
   expect(toolbar.getByText(label)).toBeDefined();
+});
+
+it('announces an active privacy screen without a banner or toolbar setting markers', async () => {
+  await i18n.changeLanguage('zh-CN');
+  Object.assign(window, {
+    electronAPI: {
+      remoteDesktopViewer: {
+        onActive: () => () => {},
+        onLocale: () => () => {},
+        onCloseRequested: () => () => {},
+        state: async () => ({ generation: 1 }),
+        rendererReady: async () => {},
+        presentationReady: async () => {},
+      },
+    },
+  });
+  render(<RemoteDesktopViewerWindow />);
+  await act(async () =>
+    lifecycle.update?.({
+      preferences: {
+        audio: true,
+        privacyScreen: true,
+        hostMute: false,
+        clipboardSync: true,
+        lockOnExit: false,
+      },
+      safety: { privacyActive: true, notice: null, clipboardProgress: null },
+      receiveRate: null,
+      closing: false,
+      credential: null,
+      credentialBusy: false,
+      credentialNotice: null,
+      fittedDisplay: null,
+      target: null,
+      ready: true,
+      controlling: true,
+      controlPending: false,
+      status: 'live',
+      error: null,
+      caps: null,
+      displayId: 'one',
+      transport: 'direct',
+      latency: null,
+      settings: { fps: 30, quality: 'auto', audio: false },
+    }),
+  );
+  expect(document.querySelector('.remote-viewer-feedback')).toBeNull();
+  const announcement = screen.getByText(i18n.t('remoteDesktop.privacyActive'));
+  expect(announcement.getAttribute('role')).toBe('status');
+  expect(announcement.classList.contains('sr-only')).toBe(true);
+  for (const name of ['剪贴板', '安全']) {
+    expect(screen.getByRole('button', { name }).querySelector('span')).toBeNull();
+  }
 });
 
 it('updates translated controls without ending or recreating the viewer connection', async () => {

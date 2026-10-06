@@ -169,6 +169,8 @@ export function useFileContent(
           setState({ workdir, relPath, content: { kind: 'fetching', received: 0, total: size } });
           const off = window.electronAPI.fileBrowser.onTransferProgress((e) => {
             if (cancelled || e.workdir !== workdir || e.relPath !== relPath) return;
+            // 打包 / 解包阶段只出现在文件夹下载(relPath 键为远端绝对路径),这里收不到。
+            if (e.phase === 'pack' || e.phase === 'extract') return;
             setState({
               workdir,
               relPath,

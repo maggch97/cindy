@@ -92,7 +92,7 @@ import {
   peekRemotePathVerdict,
   peekRemotePathVerdictForRender,
   remotePathVerdictKey,
-  revealRemoteChatFile,
+  downloadRemoteChatEntry,
   subscribeRemotePathVerdictChange,
   verifyRemotePathCached,
 } from '@/lib/remoteFileOpen';
@@ -1407,9 +1407,9 @@ async function activateResolvedLocalTarget(
   // 会弹"文件已损坏"的误导弹窗,定位到文件让用户拖进 DCC 才是本意。
   if (target.localKind === 'model') {
     if (remoteOrigin) {
-      // 3D 远程本期不做(xdt-model:// 无远程管线):下载缓存副本并在文件管理
-      // 器定位,不误开本机同路径文件。
-      await revealRemoteChatFile(remoteOrigin, ctx.workingDir, target.absPath);
+      // 3D 远程本期不做(xdt-model:// 无远程管线):下载到本地并在文件管理器
+      // 定位,不误开本机同路径文件。
+      await downloadRemoteChatEntry(remoteOrigin, ctx.workingDir, target.absPath);
       return;
     }
     if (/\.fbx(\?.*)?$/i.test(target.absPath)) {

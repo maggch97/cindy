@@ -317,7 +317,7 @@ Chat Server 的群角色，可由人或伙伴担任；不要与伙伴主人或�
 
 ### iOS Simulator
 
-Apple Simulator 与 Cindy 内置查看器能力的用户可见名称。iOS 保留官方大小写；中文使用「模拟器」，日语使用「シミュレータ」，韩语使用「시뮬레이터」。先登记为 proposed，待插件与内置面板文案稳定后固化。
+Apple Simulator 的用户可见名称，也用于原内置模拟器的下线说明。Cindy 已移除内置查看器能力。iOS 保留官方大小写；中文使用「模拟器」，日语使用「シミュレータ」，韩语使用「시뮬레이터」。译法仍为 proposed。
 
 ### Lark
 
@@ -568,6 +568,10 @@ Cindy 里的**持久 AI 助手实体**（原名 Bot）：有长期身份、自�
 ### Wallpaper
 
 Desktop appearance setting for an in-app visual background layer.
+
+### Wallpaper Visibility
+
+壁纸背景层的实际可见程度，0% 隐藏，100% 原样显示；不改变文字或控件的不透明度。
 
 ### WeChat
 

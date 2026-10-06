@@ -223,6 +223,44 @@ describe('AgentInputCoordinator Orca priority queue transactions', () => {
     );
   });
 
+  it('carries host-stamped message sources through drain (device top-level, plugin to the user row)', async () => {
+    const h = createHarness();
+    const sid = 'source-drain';
+    await h.coordinator.ensureQueueRestored(sid);
+    const sourceDevice = { deviceId: 'phone-1', name: 'iPhone', platform: 'mobile' as const };
+    const sourcePlugin = { pluginId: 'gh-1', name: 'Reviewer' };
+    h.coordinator.enqueue(sid, makeItem('source-input', 'hello', { sourceDevice, sourcePlugin }));
+    await flush();
+    const sendOpts = h.sendToAgent.mock.calls[0]?.[3];
+    expect(sendOpts).toMatchObject({ sourceDevice, persistUserMessage: { sourcePlugin } });
+    // 来源不是 maker-core turn origin。
+    expect(sendOpts).not.toHaveProperty('origin');
+  });
+
+  it('carries message sources through steer delivery and the steer user row', async () => {
+    const h = createHarness();
+    const sid = 'source-steer';
+    h.setRunning(true);
+    const sourceDevice = { deviceId: 'pc-1', platform: 'desktop' as const };
+    const origin = { kind: 'session' as const, senderSessionId: 'sender', displayText: 'hello' };
+    const projection = h.coordinator.enqueue(sid, makeItem('source-steer-input', 'hello', {
+      sourceDevice,
+      sourcePlugin: { pluginId: 'gh-1' },
+      origin,
+    }));
+    await expect(h.coordinator.steer(sid, projection.pendingQueue[0]!, { removeFromQueue: true })).resolves.toBe(true);
+    await flush();
+    expect(h.steerToAgent.mock.calls[0]?.[2]).toMatchObject({
+      sourceDevice,
+      sourcePlugin: { pluginId: 'gh-1' },
+      sourceOrigin: origin,
+    });
+    expect(h.steerToAgent.mock.calls[0]?.[2]).not.toHaveProperty('origin');
+    const row = mocks.createMessage.mock.calls.find((call) => (call[1] as { clientId?: string }).clientId === 'source-steer-input')?.[1] as
+      { agentMeta: Record<string, unknown> } | undefined;
+    expect(row?.agentMeta).toMatchObject({ sourceDevice, sourcePlugin: { pluginId: 'gh-1' }, origin });
+  });
+
   it('retains host-stamped sharedTask attribution when the queue drains outside the original invoke', async () => {
     const h = createHarness();
     const sid = 'sharedTask-task';
@@ -444,7 +482,6 @@ describe('AgentInputCoordinator Orca priority queue transactions', () => {
       },
       markWorkerIdleIfStatus: async () => false,
       restoreWorkerDoneIfIdle: async () => false,
-      cancelWorkerSessionOperations: async () => {},
       closeWorkerSession: async () => {},
       closeWorkerSessionIfIdle: async () => true,
       hasPendingWorkerInput: async () => false,
@@ -512,6 +549,8 @@ describe('AgentInputCoordinator Orca priority queue transactions', () => {
       ensureWorkerQueueRestored: async () => true,
       removeQueuedMessage: () => false,
       replaceQueuedMessage: () => false,
+      steerStoredQueuedMessage: async () => ({ kind: 'gone' as const }),
+      moveQueuedMessage: () => null,
       mergeQueuedMessages: () => false,
       log: mocks.logger,
     } satisfies OrcaTeamServiceDeps;
@@ -865,6 +904,9 @@ function createHarness(opts?: {
   const onAcceptedQueuedMessage = vi.fn<
     NonNullable<AgentInputCoordinatorDeps['onAcceptedQueuedMessage']>
   >(() => {});
+  const onSteerAccepted = vi.fn<NonNullable<AgentInputCoordinatorDeps['onSteerAccepted']>>(
+    () => {},
+  );
   const onDispatchedUserTurn = vi.fn<
     NonNullable<AgentInputCoordinatorDeps['onDispatchedUserTurn']>
   >(() => {});
@@ -993,6 +1035,7 @@ function createHarness(opts?: {
     onUserMessageQueryable,
     onUserMessagePersistenceFailed,
     onAcceptedQueuedMessage,
+    onSteerAccepted,
     onDispatchedUserTurn,
     onResumableTurnError,
     isResumableTurnErrorCandidate,
@@ -1034,6 +1077,7 @@ function createHarness(opts?: {
     onUserMessageQueryable,
     onUserMessagePersistenceFailed,
     onAcceptedQueuedMessage,
+    onSteerAccepted,
     onDispatchedUserTurn,
     onResumableTurnError,
     isResumableTurnErrorCandidate,
@@ -1139,6 +1183,132 @@ function createHarness(opts?: {
     },
   };
 }
+
+describe('agent-chosen control steering', () => {
+  const sid = 'lead-report';
+  function expected(h: ReturnType<typeof createHarness>) {
+    return { session: h.getTurnSessionIdentity(), turnGeneration: 0 };
+  }
+  it('joins a running turn even though ordinary new turns must queue', async () => {
+    const h = createHarness();
+    h.setRunning(true);
+    expect(h.coordinator.shouldQueueNewTurn(sid)).toBe(true);
+    const item = makeItem('report', 'worker result');
+    expect(await h.coordinator.steerControlInput(sid, { item }, expected(h))).toBe('steered');
+    expect(h.steerToAgent).toHaveBeenCalledOnce();
+    expect(h.sendToAgent).not.toHaveBeenCalled();
+    expect(h.coordinator.hasPendingQueueItem(sid, 'report')).toBe(false);
+    expect(h.onSteerAccepted).toHaveBeenCalledWith(sid, expect.objectContaining({ clientId: 'report' }));
+  });
+  it('may pass earlier queued rows because the sender chose to steer', async () => {
+    const h = createHarness();
+    h.setRunning(true);
+    await h.coordinator.ensureQueueRestored(sid);
+    h.coordinator.enqueue(sid, makeItem('human', 'user instruction'));
+    expect(await h.coordinator.steerControlInput(sid, { item: makeItem('report', 'r') }, expected(h)))
+      .toBe('steered');
+    expect(h.coordinator.getQueueControlSnapshot(sid).pendingQueue.map((item) => item.clientId))
+      .toEqual(['human']);
+  });
+  it.each(['pause', 'stop-pause', 'interaction', 'credential', 'generation', 'identity', 'idle', 'restore'])
+    ('does not bypass the %s boundary', async boundary => {
+      const h = createHarness();
+      h.setRunning(true);
+      const turn = expected(h);
+      await h.coordinator.ensureQueueRestored(sid);
+      if (boundary === 'pause') h.coordinator.setExecutionPaused(sid, true);
+      if (boundary === 'stop-pause') {
+        h.coordinator.enqueue(sid, makeItem('human', 'user instruction'));
+        h.coordinator.pausePendingQueueForRewind(sid);
+      }
+      if (boundary === 'interaction') h.setPendingInteraction(true);
+      if (boundary === 'credential') h.setHasPendingCredentialSwitch(() => true);
+      if (boundary === 'generation') h.setTurnGeneration(1);
+      if (boundary === 'identity') h.setTurnSessionIdentity({ instanceId: 'replacement' });
+      if (boundary === 'idle') h.setRunning(false);
+      if (boundary === 'restore') {
+        // A different session has not successfully restored its authoritative queue.
+        h.setLoadQueueSnapshot(async () => { throw new Error('queue unavailable'); });
+      }
+      expect(await h.coordinator.steerControlInput(boundary === 'restore' ? 'unrestored' : sid,
+        { item: makeItem('report', 'result') }, turn)).toBe('not-attempted');
+      expect(h.steerToAgent).not.toHaveBeenCalled();
+    });
+  it('re-checks the boundary after async screening, before provider dispatch', async () => {
+    const h = createHarness();
+    h.setRunning(true);
+    h.setScreenUserMessage(async () => {
+      h.setPendingInteraction(true);
+      return { action: 'allow' };
+    });
+    // Not delivered and nothing retained: safe for ordinary delivery, unlike a screening block.
+    expect(await h.coordinator.steerControlInput(sid, { item: makeItem('report', 'r') }, expected(h)))
+      .toBe('not-attempted');
+    expect(h.steerToAgent).not.toHaveBeenCalled();
+    expect(h.onSteerAccepted).not.toHaveBeenCalled();
+  });
+  it('retains one paused report after an uncertain ACK, including when the turn ends', async () => {
+    const h = createHarness();
+    h.setAgentKind('codex');
+    h.setRunning(true);
+    h.steerToAgent.mockImplementationOnce(async () => {
+      h.setRunning(false);
+      throw new Error('Codex turn/steer did not acknowledge within 10000ms');
+    });
+    expect(await h.coordinator.steerControlInput(sid, { item: makeItem('report', 'result') }, expected(h)))
+      .toBe('queued');
+    const queue = h.coordinator.getQueueControlSnapshot(sid).pendingQueue;
+    expect(queue.map(item => item.clientId)).toEqual(['report']);
+    expect(h.coordinator.isQueuePaused(sid)).toBe(true);
+    h.coordinator.onTurnEvent(sid, 'done');
+    await flush();
+    expect(h.sendToAgent).not.toHaveBeenCalled();
+  });
+  it('reports screened rejection without reviving blocked content as ordinary input', async () => {
+    const h = createHarness();
+    h.setRunning(true);
+    h.setScreenUserMessage(async () => ({ action: 'block', ghostId: 'guard', ghostName: 'guard', reason: 'blocked' }));
+    expect(await h.coordinator.steerControlInput(sid, { item: makeItem('report', 'result') }, expected(h)))
+      .toBe('rejected');
+    expect(h.steerToAgent).not.toHaveBeenCalled();
+    expect(h.coordinator.hasPendingQueueItem(sid, 'report')).toBe(false);
+  });
+  it('promotes a stored queued row without releasing the rest of the queue', async () => {
+    const h = createHarness();
+    h.setRunning(true);
+    await h.coordinator.ensureQueueRestored(sid);
+    h.coordinator.enqueue(sid, makeItem('human', 'user instruction'));
+    h.coordinator.enqueue(sid, makeItem('report', 'worker result'));
+    expect(await h.coordinator.steerControlInput(sid, { queuedClientId: 'report' }, expected(h)))
+      .toBe('steered');
+    expect(h.steerToAgent).toHaveBeenCalledOnce();
+    expect(h.coordinator.getQueueControlSnapshot(sid).pendingQueue.map((item) => item.clientId))
+      .toEqual(['human']);
+    expect(h.onSteerAccepted).toHaveBeenCalledWith(sid, expect.objectContaining({ clientId: 'report' }));
+  });
+  it('leaves an edit-locked or missing stored row alone', async () => {
+    const h = createHarness();
+    h.setRunning(true);
+    await h.coordinator.ensureQueueRestored(sid);
+    h.coordinator.enqueue(sid, makeItem('report', 'worker result'));
+    h.coordinator.setEditLock(sid, 'report', true);
+    expect(await h.coordinator.steerControlInput(sid, { queuedClientId: 'report' }, expected(h)))
+      .toBe('not-attempted');
+    expect(await h.coordinator.steerControlInput(sid, { queuedClientId: 'missing' }, expected(h)))
+      .toBe('rejected');
+    expect(h.steerToAgent).not.toHaveBeenCalled();
+    expect(h.coordinator.hasPendingQueueItem(sid, 'report')).toBe(true);
+  });
+  it('notifies the host when an ordinary UI steer is accepted', async () => {
+    const h = createHarness();
+    h.setRunning(true);
+    await h.coordinator.ensureQueueRestored(sid);
+    h.coordinator.enqueue(sid, makeItem('queued', 'q'));
+    const [queued] = h.coordinator.getQueueControlSnapshot(sid).pendingQueue;
+    expect(await h.coordinator.steer(sid, queued!, { removeFromQueue: true })).toBe(true);
+    expect(h.onSteerAccepted).toHaveBeenCalledOnce();
+  });
+});
 
 function latestSnapshotClientIds(
   persistQueueSnapshot: ReturnType<typeof createHarness>['persistQueueSnapshot'],
@@ -6822,6 +6992,7 @@ describe('AgentInputCoordinator steer transaction', () => {
         fallbackToTurn: false, expectedTurnSession: expected.session, expectedTurnGeneration: expected.turnGeneration,
       }),
       getQueueSnapshot: vi.fn(), replaceQueuedMessage: vi.fn(), removeQueuedMessage: vi.fn(),
+      steerStoredQueuedMessage: vi.fn(), moveQueuedMessage: vi.fn(),
       createId: () => `unexpected-random-ID-${++allocatedIds}`,
     });
     const input = { callerSessionId: 'caller', targetSessionId: sid, message: 'urgent', queuedMessageId: 'stable-ID' };
@@ -6895,6 +7066,7 @@ describe('AgentInputCoordinator steer transaction', () => {
         fallbackToTurn: false, expectedTurnSession: expected.session, expectedTurnGeneration: expected.turnGeneration,
       }),
       getQueueSnapshot: vi.fn(), replaceQueuedMessage: vi.fn(), removeQueuedMessage: vi.fn(),
+      steerStoredQueuedMessage: vi.fn(), moveQueuedMessage: vi.fn(),
       createId: () => `unexpected-random-ID-${++allocatedIds}`,
     });
     const input = { callerSessionId: 'caller', targetSessionId: sid, message: 'urgent', queuedMessageId: 'stable-ID' };

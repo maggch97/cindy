@@ -169,6 +169,12 @@ export interface RemoteDesktopCapabilities {
   channelRequests?: boolean;
   /** Display changes requested with `keepVideo` may keep the live video stream. */
   liveDisplaySwitch?: boolean;
+  /**
+   * `start` and display changes accept `control: true`: the host takes control
+   * (starts input) within the same request and replies `controlling: true`, so
+   * the viewer needs no separate `control` request.
+   */
+  autoControl?: boolean;
   backgroundViewing?: boolean;
   cursorOverlay?: boolean;
   clipboardText?: boolean;
@@ -236,7 +242,13 @@ export type RemoteDesktopRequest =
   | ClipboardContentRequest
   | { op: "capabilities" }
   | { op: "permissions"; action: "check" | "guide" }
-  | { op: "start"; displayId: string; resume?: boolean; takeover?: boolean }
+  | {
+      op: "start";
+      displayId: string;
+      resume?: boolean;
+      takeover?: boolean;
+      control?: boolean;
+    }
   | { op: "heartbeat"; lease: string }
   | { op: "stop"; lease: string; lockScreen?: boolean }
   | { op: "frame"; lease: string; cursorOverlay?: boolean }
@@ -259,14 +271,21 @@ export type RemoteDesktopRequest =
       width: number;
       height: number;
       keepVideo?: boolean;
+      control?: boolean;
     }
-  | { op: "restoreViewerDisplay"; lease: string; keepVideo?: boolean }
+  | {
+      op: "restoreViewerDisplay";
+      lease: string;
+      keepVideo?: boolean;
+      control?: boolean;
+    }
   | {
       op: "resolution";
       lease: string;
       modeId: string;
       temporary?: boolean;
       keepVideo?: boolean;
+      control?: boolean;
     };
 
 export function parseRemoteDesktopRequest(
@@ -275,6 +294,13 @@ export function parseRemoteDesktopRequest(
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new Error("INVALID_REQUEST");
   const v = value as Record<string, unknown>;
+  // Optional on start and display changes; older hosts drop it and the viewer
+  // asks for control separately.
+  const control = () => {
+    if (v.control !== undefined && typeof v.control !== "boolean")
+      throw new Error("INVALID_REQUEST");
+    return v.control === true ? { control: true as const } : {};
+  };
   if (v.op === "capabilities") return { op: v.op };
   if (v.op === "permissions" && (v.action === "check" || v.action === "guide"))
     return { op: v.op, action: v.action };
@@ -294,6 +320,7 @@ export function parseRemoteDesktopRequest(
       displayId: v.displayId,
       ...(v.takeover === true ? { takeover: true } : {}),
       ...(typeof v.resume === "boolean" ? { resume: v.resume } : {}),
+      ...control(),
     };
   }
   if (typeof v.lease !== "string" || v.lease.length > 128 || !v.lease)
@@ -393,7 +420,7 @@ export function parseRemoteDesktopRequest(
     return v.keepVideo === true ? { keepVideo: true as const } : {};
   };
   if (v.op === "restoreViewerDisplay")
-    return { op: v.op, lease, ...keepVideo() };
+    return { op: v.op, lease, ...keepVideo(), ...control() };
   if (v.op === "displayModes") return { op: v.op, lease };
   if (v.op === "viewerDisplay") {
     if (
@@ -412,6 +439,7 @@ export function parseRemoteDesktopRequest(
       width: v.width as number,
       height: v.height as number,
       ...keepVideo(),
+      ...control(),
     };
   }
   if (
@@ -425,7 +453,7 @@ export function parseRemoteDesktopRequest(
       op: v.op,
       lease,
       modeId: v.modeId,
-      ...(v.temporary === true ? { temporary: true } : {}),
+      ...(v.temporary === true ? { temporary: true, ...control() } : {}),
       ...keepVideo(),
     };
   }

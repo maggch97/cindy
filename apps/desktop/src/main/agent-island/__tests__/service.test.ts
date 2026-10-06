@@ -909,6 +909,7 @@ describe('AgentIslandService native publishing', () => {
 
       service.setEnabled(false);
       service.handleUserPrompt({ sessionId: 's1', agentKind: 'codex' }, 'run tests');
+      service.handleAgentEvent({ sessionId: 's1', agentKind: 'codex' }, textEvent('Tests pass.', true));
       service.handleAgentEvent({ sessionId: 's1', agentKind: 'codex' }, doneEvent());
       const sessions = (
         service as unknown as { state: { sessions: Map<string, unknown>; remoteUnreadTerminals: Map<string, unknown> } }
@@ -954,6 +955,7 @@ describe('AgentIslandService native publishing', () => {
 
       service.setEnabled(true);
       service.handleUserPrompt({ sessionId: 's1', agentKind: 'codex' }, 'run tests');
+      service.handleAgentEvent({ sessionId: 's1', agentKind: 'codex' }, textEvent('Tests pass.', true));
       service.handleAgentEvent({ sessionId: 's1', agentKind: 'codex' }, doneEvent());
       expect(publish.mock.calls.at(-1)?.[0]).toMatchObject({
         totalCount: 1,
@@ -1149,6 +1151,34 @@ describe('AgentIslandService native publishing', () => {
       expect.objectContaining({
         sessionId: 's1',
         attention: false,
+      }),
+    );
+  });
+
+  it('relays the last reply as the completion summary for other devices', async () => {
+    const { AgentIslandService } = await import('../service.js');
+    const service = new AgentIslandService({
+      getMainWindow: () => null,
+      nativeHost: {
+        failed: false,
+        headless: true,
+        publish: () => true,
+        suspend: () => undefined,
+      },
+    });
+    service.setEnabled(false);
+    const meta = { sessionId: 'summary', agentKind: 'codex' as const };
+
+    service.handleUserPrompt(meta, 'fix the login bug');
+    service.handleAgentEvent(meta, textEvent('Login is fixed.', true));
+    service.handleAgentEvent(meta, doneEvent());
+
+    expect(mocks.tapWindowBroadcast).toHaveBeenLastCalledWith(
+      SESSION_ACTIVITY_CHANNEL,
+      expect.objectContaining({
+        sessionId: 'summary',
+        phase: 'completed',
+        compactDetail: 'Login is fixed.',
       }),
     );
   });

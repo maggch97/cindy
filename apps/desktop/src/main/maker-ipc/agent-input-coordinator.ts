@@ -75,6 +75,7 @@ import {
   updateQueuedMessageText,
 } from '../../shared/agentInputQueue.js';
 import { CONTINUE_AFTER_ERROR_PROMPT, syntheticTriggerKind } from '../../shared/interruptedTurn.js';
+import { isSyntheticTriggerText } from '@cindy/maker-shared/synthetic-trigger';
 import { attachSessionReferenceMetadata } from '../../shared/sessionReferenceMetadata.js';
 import {
   appendRecoveryCheckpointPrompt,
@@ -229,6 +230,19 @@ export interface AgentInputSendOpts {
   uiLanguage?: string;
   /** Queue provenance stamped by the controlled desktop at device-link input IPC entry. */
   fromDeviceLinkClient?: boolean;
+  /**
+   * 远程设备来源(见 AgentInputQueuedMessage.sourceDevice)。drain 与 steer 都透传:
+   * 派发时生成 `[客户端说明]`,落库写 agentMeta.sourceDevice。**由 main 构造,不是 wire 输入。**
+   */
+  sourceDevice?: AgentInputQueuedMessage['sourceDevice'];
+  /**
+   * steer 投递专用的消息来源(drain 走 persistUserMessage.origin / sourcePlugin /
+   * sharedTaskAuthor)。只用于生成 `[消息来源]` 说明,**不是** maker-core SendOrigin,
+   * 也不参与任何权限判定;刻意不复用 `origin`(那是 scheduler 的 turn origin)。
+   */
+  sourceOrigin?: AgentInputQueuedMessage['origin'];
+  sourcePlugin?: AgentInputQueuedMessage['sourcePlugin'];
+  sharedTaskAuthor?: AgentInputQueuedMessage['sharedTaskAuthor'];
   /** Main-owned clear token captured when this input became active. */
   expectedClearBoundaryMs?: number | null;
   /** Main-owned input generation captured before async preparation. */
@@ -241,6 +255,8 @@ export interface AgentInputSendOpts {
   onVendorTurnReserved?: (generation: number) => void;
   persistUserMessage?: {
     sharedTaskAuthor?: AgentInputQueuedMessage['sharedTaskAuthor'];
+    /** 插件来源:写入 agentMeta.sourcePlugin 并生成 `[消息来源]`(不传给 maker-core)。 */
+    sourcePlugin?: AgentInputQueuedMessage['sourcePlugin'];
     clientId: string;
     content: string;
     /** Overflow 重放用的 agent-facing wire payload（mention / 标注附件等）。 */
@@ -513,6 +529,12 @@ export interface AgentInputCoordinatorDeps {
     item: AgentInputQueuedMessage,
     restoredFromSnapshot?: boolean,
   ) => void | Promise<void>;
+  /**
+   * A steer crossed the irreversible provider boundary (direct or promoted queue row).
+   * The item joined the running turn instead of starting one, so hosts release any
+   * per-clientId turn-start bookkeeping here rather than running it.
+   */
+  onSteerAccepted?: (sessionId: string, item: AgentInputQueuedMessage) => void | Promise<void>;
   /**
    * Awaited only after vendor dispatch is irreversible (`accepted=true`).
    * Hosts use this for side effects that must not run on cancelled-before-dispatch
@@ -879,6 +901,32 @@ function normalizeRestoredSyntheticTrigger(item: AgentInputQueuedMessage): Agent
 
 type PersistAcceptedUserMessageResult = 'persisted' | 'stale' | 'failed';
 
+/**
+ * steered = provider accepted; queued = the coordinator still owns the row (ACK-uncertain
+ * pause, or the queued row stayed in place); not-attempted = not delivered and nothing is
+ * retained, so ordinary delivery is still safe; rejected = input screening discarded it.
+ */
+export type ControlSteerOutcome = 'steered' | 'queued' | 'not-attempted' | 'rejected';
+
+/** What a steer attempt actually did, beyond the boolean UI contract. */
+interface SteerObservation {
+  providerAccepted: AgentInputQueuedMessage | null;
+  policyBlocked: boolean;
+}
+
+interface SteerOptions {
+  removeFromQueue?: boolean;
+  touchUserSend?: boolean;
+  /** 控制面插话不允许在 turn 结束竞态下退化成下一轮普通输入。 */
+  fallbackToTurn?: boolean;
+  /** 控制面初检捕获的 live Session 对象，防 session id 被新实例复用。 */
+  expectedTurnSession?: object;
+  /** 控制面初检捕获的 maker-core turn generation。 */
+  expectedTurnGeneration?: number;
+  /** Agent-chosen steer: never unpause the queue, and re-check its guard before dispatch. */
+  controlInput?: { fromQueue: boolean };
+}
+
 function isNoActiveTurnError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return /\[NO_ACTIVE_TURN\]|no active .*turn|has no active turn/i.test(msg);
@@ -1032,6 +1080,13 @@ function sendFailureLogFields(result: AgentInputSendFailure): Record<string, unk
     context: result.context,
     message: result.message,
   };
+}
+
+/** 主机生成的隐藏指令或自动续跑:沿用原条目的来源,但不是来源方说的话。 */
+function isHostGeneratedSteerItem(item: AgentInputQueuedMessage): boolean {
+  if (item.autoResume === true || item.agentOmitsTriggerPrefix === true) return true;
+  return isSyntheticTriggerText(item.text.trimStart())
+    || isSyntheticTriggerText((item.persistedContent ?? '').trimStart());
 }
 
 export class AgentInputCoordinator {
@@ -1982,19 +2037,111 @@ export class AgentInputCoordinator {
     }
   }
 
+  /**
+   * Agent-chosen steer (Orca / cindy_helper tools) of either a host-built message or a
+   * queued row. The agent picked "steer", so it may pass earlier queued rows, but it must
+   * not reopen Stop/pause/recovery/interaction boundaries. The same guard is re-checked
+   * just before provider dispatch. A failed ACK can leave the item in a paused queue:
+   * that is host ownership, not permission to send a second copy.
+   */
+  async steerControlInput(
+    sessionId: string,
+    target: { item: AgentInputQueuedMessage } | { queuedClientId: string },
+    expectedTurn: { session: object; turnGeneration: number },
+  ): Promise<ControlSteerOutcome> {
+    await this.ensureQueueRestored(sessionId).catch(() => undefined);
+    const state = this.getState(sessionId);
+    const fromQueue = 'queuedClientId' in target;
+    const item = fromQueue
+      ? state.pendingQueue.find((queued) => queued.clientId === target.queuedClientId)
+      : target.item;
+    if (!item) return 'rejected';
+    if (
+      this.deps.getTurnSessionIdentity?.(sessionId) !== expectedTurn.session ||
+      this.deps.getTurnGeneration?.(sessionId) !== expectedTurn.turnGeneration ||
+      this.isControlSteerBlocked(sessionId, state, item.clientId, { fromQueue, ownSteer: false })
+    ) return 'not-attempted';
+
+    const observed = await this.steerObserved(sessionId, item, {
+      fallbackToTurn: false,
+      removeFromQueue: fromQueue,
+      controlInput: { fromQueue },
+      expectedTurnSession: expectedTurn.session,
+      expectedTurnGeneration: expectedTurn.turnGeneration,
+    });
+    if (observed.providerAccepted) return 'steered';
+    // Input screening discarded the content: a definitive refusal, never a retry candidate.
+    if (observed.policyBlocked) return 'rejected';
+    // In particular, preserve ACK-uncertain items and their protective pause.
+    // Do not infer non-delivery from the live turn ending during the request.
+    return this.hasPendingQueueItem(sessionId, item.clientId) ? 'queued' : 'not-attempted';
+  }
+
+  /** Shared by the pre-check and the pre-provider re-check of agent-chosen steering. */
+  private isControlSteerBlocked(
+    sessionId: string,
+    state: SessionInputState,
+    clientId: string,
+    opts: { fromQueue: boolean; ownSteer: boolean },
+  ): boolean {
+    return (
+      !this.isQueueRestored(sessionId) ||
+      !this.deps.isTurnRunning(sessionId) ||
+      state.queuePaused || state.queueAbortPending || state.abortBoundaryToken !== null ||
+      state.queueInteractionLocks.length > 0 ||
+      state.steeringQueueClientIds.some((id) => !opts.ownSteer || id !== clientId) ||
+      state.recovery !== null || state.pendingExternalTerminalDone ||
+      this.deps.hasPendingInteraction(sessionId) ||
+      this.deps.hasPendingCredentialSwitch?.(sessionId) === true ||
+      (state.activeTurn !== null && !isActiveTurnDispatched(state.activeTurn)) ||
+      (opts.fromQueue &&
+        (state.queueEditLocks.includes(clientId) ||
+          !state.pendingQueue.some((queued) => queued.clientId === clientId)))
+    );
+  }
+
   async steer(
     sessionId: string,
     item: AgentInputQueuedMessage,
-    opts?: {
-      removeFromQueue?: boolean;
-      touchUserSend?: boolean;
-      /** 控制面插话不允许在 turn 结束竞态下退化成下一轮普通输入。 */
-      fallbackToTurn?: boolean;
-      /** 控制面初检捕获的 live Session 对象，防 session id 被新实例复用。 */
-      expectedTurnSession?: object;
-      /** 控制面初检捕获的 maker-core turn generation。 */
-      expectedTurnGeneration?: number;
-    },
+    opts?: SteerOptions,
+  ): Promise<boolean> {
+    return (await this.steerObserved(sessionId, item, opts)).accepted;
+  }
+
+  private async steerObserved(
+    sessionId: string,
+    item: AgentInputQueuedMessage,
+    opts: SteerOptions | undefined,
+  ): Promise<SteerObservation & { accepted: boolean }> {
+    const observation: SteerObservation = { providerAccepted: null, policyBlocked: false };
+    const accepted = await this.steerWithinBoundary(sessionId, item, opts, observation);
+    if (observation.providerAccepted) {
+      await this.notifySteerAccepted(sessionId, observation.providerAccepted);
+    }
+    return { ...observation, accepted };
+  }
+
+  private async notifySteerAccepted(
+    sessionId: string,
+    item: AgentInputQueuedMessage,
+  ): Promise<void> {
+    try {
+      await this.deps.onSteerAccepted?.(sessionId, item);
+    } catch (err) {
+      // Provider acceptance is irreversible; host bookkeeping must not turn it into a failure.
+      log.warn('steer accepted hook failed', {
+        sessionId,
+        clientId: item.clientId,
+        error: errorMessage(err),
+      });
+    }
+  }
+
+  private async steerWithinBoundary(
+    sessionId: string,
+    item: AgentInputQueuedMessage,
+    opts: SteerOptions | undefined,
+    observation: SteerObservation,
   ): Promise<boolean> {
     const matchesExpectedTurn = () =>
       (opts?.expectedTurnSession === undefined ||
@@ -2111,7 +2258,9 @@ export class AgentInputCoordinator {
     const steerContinuationOwnerClientId = state.activeTurn?.continuationOwnerClientId ?? null;
     const steerVendorTurnGeneration = this.deps.getTurnGeneration?.(sessionId) ?? null;
     this.clearErrorUnlessQueueHeadBlocked(state, item.clientId);
-    state.queuePaused = false;
+    // UI steer doubles as "resume"; an agent-chosen steer only runs when the queue is
+    // not paused and must never release a pause the user owns.
+    if (!opts?.controlInput) state.queuePaused = false;
     if (!state.steeringQueueClientIds.includes(item.clientId)) {
       state.steeringQueueClientIds.push(item.clientId);
     }
@@ -2170,6 +2319,7 @@ export class AgentInputCoordinator {
           cur.queueEditLocks = cur.queueEditLocks.filter((id) => id !== item.clientId);
           if (cur.pendingQueue.length === 0) cur.queuePaused = false;
         }
+        observation.policyBlocked = true;
         this.deps.onUserMessageBlocked?.(sessionId, item, verdict);
         this.notifyRejectedUserTurn(sessionId, item);
         this.deps.onDiscardedQueuedMessage?.(sessionId, item);
@@ -2207,7 +2357,10 @@ export class AgentInputCoordinator {
       const current = this.getState(sessionId);
       if (!matchesExpectedTurn() || current.queueInteractionLocks.length > 0
         || current.queueAbortPending || inputBoundarySignal.aborted || steerAbort.signal.aborted
-        || !this.isCurrentSteerRequest(current, item.clientId, steerGeneration, steerRequestToken)) {
+        || !this.isCurrentSteerRequest(current, item.clientId, steerGeneration, steerRequestToken)
+        || (opts?.controlInput !== undefined && this.isControlSteerBlocked(
+          sessionId, current, item.clientId, { fromQueue: opts.controlInput.fromQueue, ownSteer: true },
+        ))) {
         const latest = current;
         if (
           this.clearSteeringMarker(latest, item.clientId, {
@@ -2246,6 +2399,11 @@ export class AgentInputCoordinator {
         // 同 drain:steer 投递也在入队时的 async context 之外。
         ...(item.fromMobileClient ? { fromMobileClient: true } : {}),
         ...(item.uiLanguage ? { uiLanguage: item.uiLanguage } : {}),
+        // 消息来源同样随 steer 透传(只用于说明与归属,steer 不经 send 事务)。主机生成的
+        // 隐藏指令([UI_ACTION_TRIGGER])与自动续跑不是来源方的话,同 send 事务不加 `[消息来源]`。
+        ...(item.sourceDevice ? { sourceDevice: item.sourceDevice } : {}),
+        ...(!isHostGeneratedSteerItem(item) && item.sourcePlugin ? { sourcePlugin: item.sourcePlugin } : {}),
+        ...(!isHostGeneratedSteerItem(item) && item.origin ? { sourceOrigin: item.origin } : {}),
       });
     } catch (err) {
       const latest = this.getState(sessionId);
@@ -2373,6 +2531,8 @@ export class AgentInputCoordinator {
       this.scheduleDrain(sessionId, 'steer-hard-failure');
       return finishSteerRequest(false);
     }
+    // Every path below follows a resolved provider steer, including clear/Stop races.
+    observation.providerAccepted = item;
     const accepted = this.getState(sessionId);
     const ownsCurrentSteerMarker = this.isCurrentSteerRequest(
       accepted,
@@ -4029,6 +4189,8 @@ export class AgentInputCoordinator {
     delete projected.hostAcceptedAtMs;
     delete projected.autoReviewUserText;
     delete projected.fromDeviceLinkClient;
+    // Main-only wire-assembly hint; renderers mask rows from `text` alone.
+    delete projected.agentOmitsTriggerPrefix;
     delete projected.trustedSessionReferenceContexts;
     delete projected.sessionReferencesRequireTrustedSnapshot;
     delete (projected as Record<string, unknown>)[TRUSTED_DESKTOP_PI_COMMAND_SNAPSHOT];
@@ -4607,8 +4769,10 @@ export class AgentInputCoordinator {
         ...(head.fromMobileClient ? { fromMobileClient: true } : {}),
         ...(head.uiLanguage ? { uiLanguage: head.uiLanguage } : {}),
         ...(head.fromDeviceLinkClient ? { fromDeviceLinkClient: true } : {}),
+        ...(head.sourceDevice ? { sourceDevice: head.sourceDevice } : {}),
         persistUserMessage: {
           ...(head.sharedTaskAuthor ? { sharedTaskAuthor: head.sharedTaskAuthor } : {}),
+          ...(head.sourcePlugin ? { sourcePlugin: head.sourcePlugin } : {}),
           clientId: head.clientId,
           content: head.persistedContent,
           agentFacingWireContent: makerUserMessage,
@@ -6334,6 +6498,9 @@ export class AgentInputCoordinator {
           agentMeta: {
             uuid: active.messageUuid,
             ...(item.sharedTaskAuthor ? { sharedTaskAuthor: item.sharedTaskAuthor } : {}),
+            // 来源标签数据(同 drain 落库口径;只用于归属展示,不是权限判据)。
+            ...(item.sourceDevice ? { sourceDevice: item.sourceDevice } : {}),
+            ...(item.sourcePlugin ? { sourcePlugin: item.sourcePlugin } : {}),
             ...(item.autoReviewUserText !== undefined ? { autoReviewUserText: item.autoReviewUserText } : {}),
             // 与 drain 派发落库（makerSendTransaction）同口径：工具 / Orca / 自动化注入的
             // steer 也要保留来源，接收方才能渲染来源标签。

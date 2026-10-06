@@ -109,6 +109,46 @@ describe('Agent Island device sessions', () => {
     );
   });
 
+  it('shows the synced summary on a remote completion instead of the done placeholder', () => {
+    const state = createAgentIslandState();
+    syncAgentIslandDeviceSessions(state, [remote('running')], 1_000);
+    syncAgentIslandDeviceSessions(
+      state,
+      [remote('completed', { detail: 'Login is fixed and tests pass.' })],
+      2_000,
+    );
+
+    const session = buildAgentIslandDisplayState(state, 2_000).sessions[0];
+    expect(session?.compactDetail).toBe('Login is fixed and tests pass.');
+    // 摘要不带消息角色,不能冒充助手回复。
+    expect(session?.activityLines.map((line) => [line.kind, line.text])).toEqual([
+      ['status', 'Login is fixed and tests pass.'],
+    ]);
+
+    const updated = syncAgentIslandDeviceSessions(
+      state,
+      [remote('completed', { detail: 'Login is fixed; PR opened.' })],
+      3_000,
+    );
+    expect(updated).toEqual(expect.objectContaining({ changed: true, events: [] }));
+    expect(
+      buildAgentIslandDisplayState(state, 3_000).sessions[0]?.activityLines.map((line) => line.text),
+    ).toEqual(['Login is fixed; PR opened.']);
+  });
+
+  it('falls back to the done placeholder instead of the previous turn summary', () => {
+    const state = createAgentIslandState();
+    syncAgentIslandDeviceSessions(state, [remote('running')], 1_000);
+    syncAgentIslandDeviceSessions(state, [remote('completed', { detail: 'First turn done.' })], 2_000);
+    syncAgentIslandDeviceSessions(state, [remote('running')], 3_000);
+    syncAgentIslandDeviceSessions(state, [remote('completed')], 4_000);
+
+    const session = buildAgentIslandDisplayState(state, 4_000).sessions[0];
+    expect(session?.activityLines.map((line) => [line.kind, line.text])).toEqual([
+      ['status', 'Done'],
+    ]);
+  });
+
   it('does not repeat events for an unchanged phase', () => {
     const state = createAgentIslandState();
     syncAgentIslandDeviceSessions(state, [remote('running')], 1_000);

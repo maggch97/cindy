@@ -379,6 +379,7 @@ import {
   buildPendingSendItems,
   type MobilePendingSendActions,
 } from '@/session/pendingSendItems';
+import { isSourceDeviceRemoved } from '@/session/messageSourceLabels';
 import {
   appendOptimisticUserMessage,
   confirmedHistoryUserClientIds,
@@ -567,6 +568,10 @@ import {
   switchDrawerSessionInPlace,
   type SessionRouteParamsNavigation,
 } from '@/session/sessionDrawerNavigation';
+import {
+  navigateToCollabSession,
+  type CollabSessionStateLike,
+} from '@/session/collabSessionNavigation';
 import type { RemoteSessionListItem } from '@/session/sessionList';
 import {
   findMobileMessageSearchHits,
@@ -593,6 +598,7 @@ import { compactSessionMessageLabel, mobileSessionMessageDisplayText } from '@/s
 import { copyMessageText } from '@/session/messageActions';
 import {
   remoteSessionStore,
+  resolveSessionWriteDevices,
   sessionMetaWriteGuard,
   sessionMetaWriteQueue,
   sessionPendingWrites,
@@ -995,7 +1001,12 @@ export default function SessionScreen() {
   const visualFocusComposer = MOBILE_VISUAL_MOCK_ENABLED && readRouteParam(params.visualFocusComposer) === '1';
   const visualOpenSearch = MOBILE_VISUAL_MOCK_ENABLED && readRouteParam(params.visualOpenSearch) === '1';
   const visualSearchQuery = MOBILE_VISUAL_MOCK_ENABLED ? readRouteParam(params.visualSearchQuery) : null;
-  const navigation = useNavigation<SessionRouteParamsNavigation & { isFocused(): boolean }>();
+  const navigation = useNavigation<SessionRouteParamsNavigation & {
+    isFocused(): boolean;
+    // useNavigation 返回的 navigation 对象没有 getRootState(那是容器 ref 的方法),
+    // 这里只需要本 route 所属 navigator 的 state —— session 路由直属 root stack。
+    getState(): CollabSessionStateLike | undefined;
+  }>();
   useEffect(() => subscribeCredentialSwitchOutcome((outcome) => {
     if (outcome.deviceId !== deviceId || outcome.sessionId !== sessionId || !navigation.isFocused()) return;
     Alert.alert(t(outcome.kind === 'applied' ? 'models.switchOutcome.applied' : 'models.switchOutcome.failed'));
@@ -2057,13 +2068,36 @@ export default function SessionScreen() {
     currentSession,
   );
   // 协同(Orca):+ 面板「协同模式」二级视图 + Lead / Worker 导航。团队真身在被控端。
+  // Lead <-> Worker 往返不能用 push:session 路由带 getId,同 id 的 PUSH 会被 StackRouter
+  // 「复用 + 移到栈顶」,返回手势就落回 Worker,且每往返一次改写一次栈内 Screen 顺序
+  // (Android 白屏)。已在栈里 → dismissTo 回退,不在栈里 → push。理由与不变量见
+  // collabSessionNavigation.ts。
   const openCollabSession = useCallback((targetSessionId: string) => {
-    if (!deviceId || !targetSessionId || targetSessionId === sessionId) return;
-    router.push({
-      pathname: '/sessions/[sessionId]',
-      params: { sessionId: targetSessionId, deviceId, deviceName },
-    });
-  }, [deviceId, deviceName, router, sessionId]);
+    if (!deviceId || !targetSessionId) return;
+    navigateToCollabSession(
+      {
+        getState: () => navigation.getState(),
+        push: (target) => router.push({
+          pathname: '/sessions/[sessionId]',
+          params: {
+            sessionId: target.sessionId,
+            deviceId: target.deviceId,
+            deviceName: target.deviceName,
+          },
+        }),
+        dismissTo: (target) => router.dismissTo({
+          pathname: '/sessions/[sessionId]',
+          params: {
+            sessionId: target.sessionId,
+            deviceId: target.deviceId,
+            deviceName: target.deviceName,
+          },
+        }),
+      },
+      { sessionId: targetSessionId, deviceId, deviceName },
+      sessionId,
+    );
+  }, [deviceId, deviceName, navigation, router, sessionId]);
   // 来源目录在协同 hook 之后才取得(它依赖 Worker 选择器是否打开),经 ref 在提交时读。
   const collabProvidersRef = useRef<readonly ProviderView[] | null>(null);
   const collab = useSessionOrcaCollab({
@@ -5819,9 +5853,6 @@ export default function SessionScreen() {
     return collectConversationShareMessages(
       messageListItems,
       isFoldableBlockExpanded,
-      (origin) => origin.scheduleName
-        ? t('message.renderer.automationOriginNamed', { name: origin.scheduleName })
-        : t('message.renderer.automationOrigin'),
     );
   }, [
     i18nInstance.language,
@@ -8579,6 +8610,10 @@ export default function SessionScreen() {
   ) => {
     const session = currentSession;
     if (!deviceId || !session) return;
+    // 出网沿用本页路由设备;乐观 patch / 回滚 / reseed 落行真实所在的物理 shard(与首页
+    // 同一解析):re-link 后两者可能不同,按路由 id 落 shard 会让归档移行落空、回滚插错 shard。
+    const { rpcDeviceId, shardId } = resolveSessionWriteDevices(sessionId, session, deviceId)
+      ?? { rpcDeviceId: deviceId, shardId: deviceId };
     if (patch.status === 'archived' || patch.status === 'deleted') {
       goBackToHome();
     }
@@ -8588,7 +8623,7 @@ export default function SessionScreen() {
     // pickWriteFields 字段级对账/回滚。
     const fields = Object.keys(patch);
     const write = sessionMetaWriteGuard.begin(sessionId, writeGuardFields(patch));
-    remoteSessionStore.applySessionPatch(deviceId, sessionId, patch as Partial<RemoteSession>);
+    remoteSessionStore.applySessionPatch(shardId, sessionId, patch as Partial<RemoteSession>);
     // 在途登记 + 共享队列:本页写同样遮蔽 push 回流 / 全量对账,并与首页写同字段串行。
     const releasePending = sessionPendingWrites.track(sessionId, fields);
     void (async () => {
@@ -8598,7 +8633,7 @@ export default function SessionScreen() {
           // preSend:重连等待(最长 1.5s)之后、真正出网之前再查一次让位——本页同
           // 字段连续两次操作时,前笔在等待中被取代不得再发出(review P2)。
           (assertStillLatest) => invoke<RemoteSession>(
-            deviceId,
+            rpcDeviceId,
             'local-db:sessions:patch-meta',
             [sessionId, patch],
             { preSend: assertStillLatest },
@@ -8610,33 +8645,35 @@ export default function SessionScreen() {
           const currentUpdatedAt = remoteSessionStore.getSessions()
             .find((s) => s.id === sessionId)?.updatedAt ?? null;
           remoteSessionStore.applySessionPatch(
-            deviceId,
+            shardId,
             sessionId,
             pickWriteFields(updated, fields, currentUpdatedAt),
           );
           // 与首页成功分支同口径(review P1):在途期间被遮的同字段外部更新可能晚于
           // 本机写落库——回包是旧值,命中遮蔽留痕即 reseed 收敛。
           if (sessionPendingWrites.consumeMaskedPush(sessionId, fields)) {
-            remoteSessionStore.requestReseed(deviceId);
+            remoteSessionStore.requestReseed(shardId);
           }
         }
       } catch (err) {
         if (write.isLatest()) {
           if (fields.includes('status')) {
             // 归档/删除/恢复失败:行可能已被移出列表,反向 patch 复活不了,整对象
-            // 插回。回滚设备名优先取 shard 当前值(同首页 review P2 教训):用旧
-            // stamp 会把整台设备改名。
+            // 插回原物理 shard。回滚设备名优先取 shard 当前值(同首页 review P2 教训):
+            // 用旧 stamp 会把整台设备改名。先释放本笔在途登记:upsertDeviceSession
+            // 会挡掉 status 在途、已被乐观移出的行。
+            releasePending();
             const shardName = remoteSessionStore.getSessions()
-              .find((s) => s.deviceLinkDeviceId === deviceId)?.deviceLinkDeviceName
+              .find((s) => s.deviceLinkDeviceId === shardId)?.deviceLinkDeviceName
               ?? session.deviceLinkDeviceName
-              ?? deviceId;
-            remoteSessionStore.upsertDeviceSession(deviceId, shardName, session);
+              ?? shardId;
+            remoteSessionStore.upsertDeviceSession(shardId, shardName, session);
           } else {
             // 置顶/重命名失败:只还原本笔字段,不整对象覆盖其它字段的并发写。
             const currentUpdatedAt = remoteSessionStore.getSessions()
               .find((s) => s.id === sessionId)?.updatedAt ?? null;
             remoteSessionStore.applySessionPatch(
-              deviceId,
+              shardId,
               sessionId,
               pickWriteFields(session, fields, currentUpdatedAt),
             );
@@ -8644,7 +8681,7 @@ export default function SessionScreen() {
         }
         // 无论是否最新写都 reseed:回滚可能吞并行结果 / 被遮的外部值 / 被让位前笔
         // 污染的快照值(与首页失败分支同口径);离线时 reseed 失败无害。
-        remoteSessionStore.requestReseed(deviceId);
+        remoteSessionStore.requestReseed(shardId);
         // 与首页同款人话文案(review P2):不把 [NOT_CONNECTED] 原始错误码怼给用户。
         Alert.alert(t('session.screen.operationFailed'), humanizeRemoteError(err));
       } finally {
@@ -8771,6 +8808,19 @@ export default function SessionScreen() {
       params: { sessionId: originSessionId, deviceId, deviceName },
     });
   }, [deviceId, deviceName, router, sessionId]);
+
+  // 「从手机 / 电脑「X」发送」设备标签点击:打开设备详情。设备清单已加载且不含该设备时
+  // 直接提示已移除;清单还没拉到时照常进入详情页,由详情页给出「未找到」。
+  const openSourceDevice = useCallback((sourceDeviceId: string) => {
+    if (isSourceDeviceRemoved(sourceDeviceId, remoteSessionStore.getDeviceIdentity())) {
+      Alert.alert(t('message.renderer.sourceDeviceRemoved'));
+      return;
+    }
+    router.push({
+      pathname: '/devices/manage/[deviceId]',
+      params: { deviceId: sourceDeviceId },
+    });
+  }, [router, t]);
 
   // 正文里会话深链 chip(xdt-maker://session/<id>[?message=<clientId>])点击:
   // 同会话带锚点 → setParams 原地定位(不 push 同页新栈帧);跨会话 → 反查所属
@@ -9577,6 +9627,9 @@ export default function SessionScreen() {
                     onLoadToolInput={loadToolInput}
                     onOpenForkOrigin={forkOrigin ? openForkOrigin : undefined}
                     onOpenOriginSession={openOriginSession}
+                    // 设备来源标签只标别的设备发来的消息:本机发出的不标。
+                    viewerDeviceId={auth.deviceId}
+                    onOpenSourceDevice={openSourceDevice}
                     onBlockingOverlayChange={handleMessageBlockingOverlayChange}
                     onOpenSessionLink={openSessionLink}
                     onPreviewRewind={isSharedTaskPeer(deviceId) ? undefined : previewRewindAtMessage}

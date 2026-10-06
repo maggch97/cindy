@@ -443,15 +443,16 @@ describe('远程机器切换入口并入 SidebarTopNav(置顶段上方,固定不
   });
 
   it('项目视图:范围判定走 effective 选择 hook,不再有旧 hasRemoteMachines 结构', () => {
-    // 单机范围下设备分组退场(2026-08-13 用户定稿)——生效与选项可见共用
-    // deviceGroupingAvailable,由 effective 机器选择派生。
+    // 单机范围下设备分组照常保留(2026-10-05 用户定稿,推翻 2026-08-13「单机范围退场」)
+    // ——生效与选项可见共用 deviceGroupingAvailable,只看有无远程设备。
     expect(projectsSectionSource).toContain('useEffectiveSelectedMachineId');
-    expect(projectsSectionSource).toContain(
-      'const singleMachineScope = selectedMachineId !== MACHINE_ALL && selectedMachineId.length === 1',
+    expect(projectsSectionSource).not.toContain('singleMachineScope');
+    expect(projectsSectionSource).toContain('const deviceGroupingAvailable = hasRemoteDevices;');
+    expect(sidebarUpperSource).toContain(
+      'const deviceGroupingAvailable = (remoteDeviceIndex?.size ?? 0) > 0;',
     );
-    expect(projectsSectionSource).toContain(
-      'const deviceGroupingAvailable = hasRemoteDevices && !singleMachineScope',
-    );
+    // 读取中 / 失败的远程设备空段头不算已有内容,不能遮掉整屏加载与失败提示。
+    expect(sidebarUpperSource).toContain('hasSettledOnlineDeviceSection(');
     expect(projectsSectionSource).toContain('hasRemoteDevices={deviceGroupingAvailable}');
     expect(projectsSectionSource).not.toContain('hasRemoteMachines');
     expect(sidebarUpperSource).toContain("if (device.status === 'rejected') continue;");

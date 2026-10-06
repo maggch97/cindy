@@ -38,6 +38,7 @@ export interface DesktopHostCommand {
     | 'display-hold'
     | 'display-swap'
     | 'viewer-hidden'
+    | 'background-viewing'
     | 'ice'
     | 'prepare'
     | 'frame';
@@ -54,6 +55,9 @@ export interface DesktopHostCommand {
   cursorOverlay?: boolean;
   /** viewer-hidden: stop sending video while the viewer is hidden. */
   hidden?: boolean;
+  /** offer / background-viewing: the viewer is view-only in the background
+   * (phone picture-in-picture), so the encoder uses the saver ceilings. */
+  background?: boolean;
   lease?: string;
   sourceId?: string;
   sdp?: string;

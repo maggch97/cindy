@@ -27,6 +27,7 @@ import { extractIpcError } from '../../shared/ipcError.js';
 import { RemoteViewerConnection } from './connection.js';
 import { ViewerCredentials } from './credentials.js';
 import { readViewerPreferences, writeViewerPreferences } from './preferences.js';
+import { readViewerResolution, writeViewerResolution } from './resolutionMemory.js';
 import { resolveDesktopInputBinary } from '../remote-desktop/inputHost.js';
 import { ClipboardCounter } from '../remote-desktop/clipboardCounter.js';
 import { transferDesktopClipboardContent } from '../remote-desktop/clipboard.js';
@@ -140,6 +141,14 @@ export class RemoteDesktopViewerWindows {
       writeClipboard: (value) => clipboard.writeText(value),
       preferences: readViewerPreferences,
       savePreferences: writeViewerPreferences,
+      resolution: readViewerResolution,
+      saveResolution: writeViewerResolution,
+      channel: (generation, id, request) => {
+        const win = entry.window;
+        if (!win || win.isDestroyed()) return false;
+        win.webContents.send(REMOTE_VIEWER.CHANNEL_REQUEST, { generation, id, request });
+        return true;
+      },
       focused: () => entry.window?.isFocused() === true,
       clipboard: {
         version: (current) => {
@@ -279,6 +288,23 @@ export class RemoteDesktopViewerWindows {
         return await this.entry(event).connection.preferences(generation, patch);
       } catch {
         throwIpcError('PRECONDITION_FAILED', 'DESKTOP_SETTINGS_FAILED');
+      }
+    });
+    ipcMain.handle(REMOTE_VIEWER.RESOLUTION, async (event, generation, displayId, value) => {
+      const entry = this.entry(event);
+      try {
+        // An omitted value reads; an explicit null forgets.
+        return await entry.connection.resolution(generation, displayId, value);
+      } catch {
+        throwIpcError('PRECONDITION_FAILED', 'DESKTOP_SETTINGS_FAILED');
+      }
+    });
+    ipcMain.handle(REMOTE_VIEWER.CHANNEL_REPLY, (event, generation, id, outcome) => {
+      const entry = this.entry(event);
+      try {
+        entry.connection.channelReply(generation, id, outcome);
+      } catch {
+        throwIpcError('PRECONDITION_FAILED', 'DESKTOP_STOPPED');
       }
     });
     ipcMain.handle(REMOTE_VIEWER.SAFETY, async (event, generation, retry) => {

@@ -24,6 +24,7 @@ vi.mock('../../logger', () => ({
   createLogger: () => ({ trace: vi.fn(), debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
 }));
 
+import { isWorkdirRoot } from '../../../shared/workdirPath';
 import {
   buildDevicePathUrl,
   fetchChatFile,
@@ -67,6 +68,16 @@ describe('toWorkdirRel', () => {
     expect(toWorkdirRel('C:\\w', 'C:\\w\\.\\a.txt')).toBe('a.txt');
   });
 
+  it('UNC 共享:`\\\\server` 与入库形态 `//server` 同一判据,长路径前缀也归一', () => {
+    expect(toWorkdirRel('//server/share/repo', '\\\\server\\share\\repo\\folder')).toBe('folder');
+    expect(toWorkdirRel('//Server/Share/repo', '//server/share/repo/a/b.txt')).toBe('a/b.txt');
+    expect(toWorkdirRel('//server/share/repo', '\\\\?\\UNC\\server\\share\\repo\\a')).toBe('a');
+    expect(toWorkdirRel('//server/share/repo', '//server/share/other/a')).toBeNull();
+    expect(toWorkdirRel('//server/share/repo', '/server/share/repo/a')).toBeNull();
+    expect(isWorkdirRoot('//server/share/repo', '\\\\SERVER\\share\\repo\\')).toBe(true);
+    expect(isWorkdirRoot('//server/share/repo', '\\\\server\\share\\repo\\a')).toBe(false);
+  });
+
   it('Windows:大小写不敏感前缀 + 反斜杠归一,输出 POSIX 相对路径', () => {
     expect(toWorkdirRel('C:\\Users\\me\\proj', 'C:\\Users\\me\\proj\\out\\a.png')).toBe('out/a.png');
     expect(toWorkdirRel('c:/users/me/proj', 'C:\\USERS\\ME\\PROJ\\a.txt')).toBe('a.txt');
@@ -88,6 +99,7 @@ describe('fetchChatFile — ssh 来源', () => {
     expect(deps.fetchBigFile).toHaveBeenCalledWith(
       expect.objectContaining({ relPath: 'a.txt', remoteHostId: 'h1' }),
       noop,
+      undefined,
     );
   });
 
@@ -153,6 +165,7 @@ describe('fetchChatFile — device 来源', () => {
     expect(deps.fetchBigFile).toHaveBeenCalledWith(
       expect.objectContaining({ relPath: 'x/b.png', deviceId: 'd1' }),
       noop,
+      undefined,
     );
     expect(deps.deviceMediaFetch).not.toHaveBeenCalled();
   });
@@ -171,12 +184,17 @@ describe('fetchChatFile — device 来源', () => {
     const deps = makeDeps();
     const res = await fetchChatFile({ origin, workdir: '/w', absPath: '/other/c.pdf' }, noop, deps);
     expect(res).toEqual({ ok: true, cachePath: '/cache/out.bin', stale: false, size: 20 });
-    expect(deps.deviceMediaFetch).toHaveBeenCalledWith('d1', buildDevicePathUrl('/other/c.pdf'));
+    expect(deps.deviceMediaFetch).toHaveBeenCalledWith(
+      'd1',
+      buildDevicePathUrl('/other/c.pdf'),
+      undefined,
+    );
     expect(deps.downloadToFile).toHaveBeenCalledWith(
       'k1',
       '/cache/tmp.part',
       undefined,
       expect.any(Function),
+      undefined,
     );
     // 用后删 OSS 对象
     expect(deps.removeRemote).toHaveBeenCalledWith('k1');
@@ -220,6 +238,41 @@ describe('fetchChatFile — device 来源', () => {
     expect(res).toMatchObject({ ok: false, code: 'FETCH_FAILED' });
     // media:fetch 已让被控端上传 k1,catch 路径必须 best-effort 补删
     expect(deps.removeRemote).toHaveBeenCalledWith('k1');
+  });
+
+  it('workdir 外:调用方的中止信号贯穿 media:fetch 与 OSS 直下', async () => {
+    const abort = new AbortController();
+    const transfer = new AbortController();
+    const deps = makeDeps({
+      fetchToCache: vi.fn(async (_id, executor) => {
+        await executor('/cache/tmp.part', () => undefined, transfer.signal);
+        return '/cache/out.bin';
+      }) as unknown as ChatFileDeps['fetchToCache'],
+    });
+    await fetchChatFile(
+      { origin, workdir: '/w', absPath: '/other/c.pdf' },
+      noop,
+      deps,
+      abort.signal,
+    );
+    expect(deps.deviceMediaFetch).toHaveBeenCalledWith(
+      'd1',
+      buildDevicePathUrl('/other/c.pdf'),
+      abort.signal,
+    );
+    expect(deps.downloadToFile).toHaveBeenCalledWith(
+      'k1',
+      '/cache/tmp.part',
+      undefined,
+      expect.any(Function),
+      transfer.signal,
+    );
+    expect(deps.fetchToCache).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(Function),
+      noop,
+      abort.signal,
+    );
   });
 
   it('workdir 外 media:fetch 失败:stale 兜底 / FETCH_FAILED', async () => {

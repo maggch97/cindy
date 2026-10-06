@@ -7,6 +7,7 @@ import { decodeDingTalkLaneUserId } from '@cindy/im';
 import { captureImContext } from '../../../shared/imMessageSource';
 import { createLogger } from '../../logger';
 import type { ImChannelAdapter, ImOrchestratorConfig } from '../shared/types';
+import { imChannelNoteSourceFromEvent } from '../shared/channelNote';
 import { ownerScopedImUserDataPath } from '../ownerScopedStorage';
 import {
   buildDingTalkGroupContextPrefix,
@@ -128,6 +129,8 @@ export function buildDingTalkAdapter(
       mode === 'bypassPermissions' &&
       (ownerGroupTurnPolicies.has(policy) ||
         (dwsGuestGroupTurnPolicies.has(policy) && deps.readAccess().guestFullAccess)),
+    // 群里发言人已由下面的 `[发言人]` 行写明(含主人标记), 渠道说明不再重复。
+    channelNoteSourceFor: (event) => imChannelNoteSourceFromEvent(event, { omitSender: true }),
     prepareAgentTurnText: async (event) => {
       // 人格块（设置卡「人格」）：每轮现读，私聊与群聊都在最前面注入。
       const persona = buildDingTalkPersonaBlock(deps.readPersona());
