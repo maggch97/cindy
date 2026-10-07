@@ -85,8 +85,12 @@ export function parseDwsTransportState(line: string): string | null {
 /** 群 @ 消息正文里去掉对当前账号的 @ 提及。 */
 export function stripSelfMention(text: string, selfName: string): string {
   if (!selfName) return text.trim();
-  const escaped = selfName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return text.replace(new RegExp(`@${escaped}\\s?`, 'g'), '').trim();
+  const name = selfName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // 手机端 @ 只插入「@名字」；电脑端会在后面附带括号，如「@智能机器人(智能机器人)」，
+  // 也可能是「@备注名(名字)」。半角、全角括号都要连同 @ 一起去掉。
+  const paren = '[(（][^()（）\\n]{0,64}[)）]';
+  const mention = new RegExp(`@(?:${name}(?:${paren})?|[^\\s@()（）]{1,64}[(（]${name}[)）])\\s*`, 'g');
+  return text.replace(mention, '').trim();
 }
 
 function displayName(value: string): string {
