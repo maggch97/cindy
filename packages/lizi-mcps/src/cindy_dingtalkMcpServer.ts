@@ -6,9 +6,6 @@ import { z } from 'zod';
 
 import type { DingTalkBotMcpHostDeps } from './types.js';
 
-/** dws 单文件上传上限（钉钉 IM 文件消息限制）。 */
-const MAX_FILE_BYTES = 20 * 1024 * 1024;
-
 type DingTalkMcpDeps = DingTalkBotMcpHostDeps & {
   /** 当前会话所在的钉钉单聊 / 群 lane；不是钉钉会话时为 null。 */
   getChatId: () => string | null;
@@ -29,7 +26,7 @@ export function createDingTalkMcpServer(deps: DingTalkMcpDeps): McpServer {
 
   server.tool(
     'send_file_to_user',
-    '把本机的一个文件（报告、表格、压缩包、图片等，不超过 20 MB）作为文件消息发到当前钉钉单聊或群。' +
+    '把本机的一个文件（报告、表格、压缩包、图片等）作为文件消息发到当前钉钉单聊或群；大小上限以钉钉为准。' +
       '只能发到当前任务所在的钉钉对话；仅「钉钉账号」连接方式支持。参数 absPath 为文件绝对路径。' +
       '发送后群里所有人都能下载，不要发送密钥、凭证或与请求无关的私人文件。',
     { absPath: z.string().min(1).describe('要发送的文件的绝对路径') },
@@ -64,9 +61,6 @@ async function sendFileToUser(deps: DingTalkMcpDeps, absPath: string) {
     }
     if (stat.size === 0) {
       return result({ ok: false, errorCode: 'FILE_EMPTY', error: '文件为空' }, true);
-    }
-    if (stat.size > MAX_FILE_BYTES) {
-      return result({ ok: false, errorCode: 'FILE_TOO_LARGE', error: '文件超过 20 MB' }, true);
     }
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'FILE_NOT_FOUND' : 'FILE_UNAVAILABLE';
