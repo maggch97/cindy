@@ -4149,6 +4149,10 @@
           "name": "Personal WeChat",
           "description": "Send messages to known WeChat contacts."
         },
+        "dingtalk_bot": {
+          "name": "DingTalk",
+          "description": "Send files into the current DingTalk chat or group (DingTalk account connection)."
+        },
         "slack": {
           "name": "Slack",
           "description": "Search, read and send messages using the connected Slack account."

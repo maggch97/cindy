@@ -4148,6 +4148,10 @@
           "name": "個人微信",
           "description": "向已知的微信聯絡人傳送訊息。"
         },
+        "dingtalk_bot": {
+          "name": "釘釘",
+          "description": "把檔案傳到目前的釘釘單聊或群組（釘釘帳號連線方式）。"
+        },
         "slack": {
           "name": "Slack",
           "description": "使用已連接的 Slack 帳號搜尋、讀取和傳送訊息。"

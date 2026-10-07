@@ -4148,6 +4148,10 @@
           "name": "개인 WeChat",
           "description": "알고 있는 WeChat 연락처에 메시지를 보냅니다."
         },
+        "dingtalk_bot": {
+          "name": "DingTalk",
+          "description": "현재 DingTalk 개인 채팅 또는 그룹에 파일을 보냅니다(DingTalk 계정 연결)."
+        },
         "slack": {
           "name": "Slack",
           "description": "연결된 Slack 계정으로 메시지를 검색하고 읽고 보냅니다."

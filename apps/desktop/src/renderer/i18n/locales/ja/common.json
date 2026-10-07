@@ -4148,6 +4148,10 @@
           "name": "個人用 WeChat",
           "description": "既知の WeChat 連絡先にメッセージを送信します。"
         },
+        "dingtalk_bot": {
+          "name": "DingTalk",
+          "description": "現在の DingTalk の個別チャットまたはグループにファイルを送信します（DingTalk アカウント接続）。"
+        },
         "slack": {
           "name": "Slack",
           "description": "接続済みの Slack アカウントでメッセージを検索、閲覧、送信します。"

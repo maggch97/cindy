@@ -4148,6 +4148,10 @@
           "name": "个人微信",
           "description": "向已知的微信联系人发送消息。"
         },
+        "dingtalk_bot": {
+          "name": "钉钉",
+          "description": "把文件发到当前钉钉单聊或群（钉钉账号连接方式）。"
+        },
         "slack": {
           "name": "Slack",
           "description": "使用已连接的 Slack 账号搜索、读取和发送消息。"
