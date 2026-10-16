@@ -11,6 +11,11 @@ Cindy 有两个 Telegram bot，用户看到的是同一个产品：
 两者是**两套架构**，不是同一份代码的两个开关。所以"统一"不等于"让两条代码路径长得
 一样"，而是：**能同源的同源；不能同源的，差异必须写在这张表里、有裁决、有理由。**
 
+额度说明的调用边界：IM 入口须显式传入 `surface` 才启用 bot 恢复指引；定时任务运行记录、
+通知与旁路转播未传入口时保留原有错误映射。个人渠道的 `/model` 指引只用于支持富卡的
+输出（包括个人 Telegram）；钉钉、企业微信等纯文本输出指向在 Cindy 中打开当前任务换
+供应商或模型，再回原渠道重发，不把仅影响以后新任务的默认配置当成当前任务的恢复方式。
+
 2026-09-09 多账号路由补充：官方 bot 的 hook 新任务入口保留目录／草稿中明确选中的
 供应商连接；该连接失效时走既有失败提示，不改用另一账号的同名模型。
 未指定连接仍解析默认来源。本项只调整官方 hook（及共用该入口的渠道），
@@ -84,6 +89,7 @@ App 完成未读与提醒统一由 `renderer/hooks/useSessionRunningStatus.ts` �
 | 官方 bot 的**命令菜单**（需双方协商 `telegram-commands-v1`） | `apps/desktop/src/main/im/shared/botCommands.ts` 的 `buildOfficialBotCommandMenus` | 官方菜单的命令集合、顺序、文案都取注册表（与个人菜单同一份 i18n key），desktop 按 en（默认）/ zh / ja / ko 各渲染一份经 `provider.commands.set` 下发，服务端只执行 `setMyCommands`，且只管理默认菜单与 zh / ja / ko（每次全量重写，缺席的语言写空，其它语言码含显式 `en` 一律忽略）；菜单只存服务端内存、不落库：desktop 每次握手都重发，服务端重启后到桌面重连前（以及设备离线期间）用服务端默认菜单。**语言口径沿用两侧既有差异**：官方按用户的 Telegram 语言，个人按桌面端语言。**命令分发不在这一行**：官方命令仍由服务端收入站并分发（1c 的别名差异照旧）。未协商时服务端用自己的 `TELEGRAM_COMMANDS` |
 | 渠道 `/stop` 的**明确停止** | `maker-ipc/register.ts` 的 `stopSessionTurnExplicitly` | 个人 IM 的 `/stop` / `!stop`（含微信，`im/shared/turnRunner.ts` 的 `stopActiveTurn`）与官方 hook 的 `task.cancel`（`hook-control/dispatcher.ts`，经 `stopSessionExplicitly` 注入）都走桌面 Stop 同一套清理：撤自动续跑与退避簿记、取消上下文溢出恢复、暂停 Goal、停输入队列并中止当前一轮。2026-10 之前两侧各少几步（个人不暂停 Goal、官方连自动续跑都不撤）。渠道侧只保留各自的排队收口（个人清 `sendQueue`，官方回 `turn.end(cancelled)`）。账号切换时的中止不是用户喊停，仍是普通 abort |
 | 新任务的**模型准入** | `im/shared/openChannelSession.ts` → `localDb/sessionOpening.ts` 的 `openSession` | 两侧（及共用 `sessionRepo` 的全部个人 IM 渠道）新建任务时都经桌面新建任务同一套准入：模型 / 来源 / 推理强度 / Fast 不被支持就拒绝建任务，不自动换模型；准入可能规范化来源与推理强度。**默认配置从哪读仍是有意不同**（第三节），这里只统一「读出来之后怎么校验」；官方 hook 进准入前对残留目录来源的取舍见文首 2026-10-13 条。复用 / 接管 / 复活既有任务不经过准入 |
+| **额度类失败说明**（花费上限 / 配额 / 余额 / 套餐用量，2026-10-15） | `im/shared/turnRetryNotice.ts` 的 `quotaFailureNotice`（判据复用 `shared/providerErrors.ts` 的 `isQuotaExhaustedErrorMessage`，与桌面错误横幅同一份） | 两侧终态失败都换成同一段中文说明：哪个供应商（`sessionProviderLabel.ts` 按任务实际来源读名字）、什么原因，并附脱敏后的上游原文；**不自动更换模型或供应商**。只有「怎么处理」按入口分开（`surface`）：个人 bot 指向 `/model`（改这个任务）与自己卡片（如「Telegram 机器人」）的「新对话配置」；官方 bot 指向 `/model` 或官方卡片的工作目录模型——两者改的都是目录默认、已有任务保持原模型，所以接着 `/new`，或在 Cindy 里直接给任务换模型。官方 hook 主日志把这类失败记成 `reason=provider-quota-exhausted`，不再是 `unclassified` |
 | 群历史**检索实现** | `im/shared/groupHistorySearch.ts` | 真正执行查询的就是这一份：FTS（`hook_group_messages_fts` 的 MATCH）+ 中文 LIKE 兜底，**lane 条件写在 SQL 里**（MATCH 与 LIKE 用完全相同的 lane 条件，调用方没法先全局搜再事后过滤），加上结果映射（snippet / score / source）与上限（默认 8 条、最多 20 条、query 256 字）。两侧共用 |
 | 群历史检索的**逐 turn 授权租约** | `im/shared/groupHistoryAccess.ts` | 租约机制共用：`beginGroupHistoryAccess` 在 provider 真正开始这一轮之前登记作用域，终态 / 重排 / 失败时释放；`sessionInstanceId` 挡住「同一业务 session 重建后，旧 MCP 请求借用新实例权限」。**但产生 scope 的那一步各写各的**——个人是 `im/telegram/adapter.ts` 的 `groupHistoryAccessFor`，官方是 `hook-control/groupHistoryScope.ts` 的 `groupHistoryAccessForExternalKey`；群轮次两侧同为 lane-only，**私聊上给的不一样**，见第四节 2e。完整调用链：MCP 入口 `mcp-integrations/groupHistoryMcpServer.ts` 先 `readGroupHistoryAccess` 拿租约（拿不到直接 `NO_ACTIVE_TELEGRAM_SCOPE` 拒绝），再 `resolveTargetLane(scope, lane)` 定位，最后才调 `searchGroupHistory` |
 | 交互卡的**语义层**（`ask_user_question` / `plan_review` / 权限确认） | `im/shared/interactionCardModel.ts` | 选项集与决策模型两侧真跑同一份：至多 6 个选项（`MAX_OPTIONS`）、multiSelect 降级单选、只渲染第一问、plan 正文截断 1500（`MAX_PLAN_LEN`）、按钮文案的**产品级**上限 30（`BTN_LABEL_MAX`）、无选项降级时唯一按钮「继续」，以及 buttonId → 决策对象的构造与 header/body 拆分。**2026-08-19 起该模块另有一份全量视图**（顶层 `questions` 数组 + `needsAskMultiCard` 判定），只被支持卡片原地更新（`updateInteractiveCard`）的个人 IM 渠道消费——目前**仅飞书个人 bot**（`ui.cards.ask.multi` 打勾卡，多题/真多选，见 `cardBuilders.buildAskMultiCard`）；**本表对照的两个 Telegram bot 都不消费它**，上列 v1 规则对两侧与未提供 multi 文案的渠道仍逐字成立，看到飞书行为不同不要当漂移报官方那条链路由 `hook-control/interactions.ts` 直接 import 本模块（对 `@cindy/maker-core` 刻意只做 type-only 依赖，免得 hook 链路在运行期加载整个 barrel）。**渲染不在这里**——按钮文案来源、标题格式、省略号样式、尺寸上限都是各自渲染侧的事，见第三节 |
@@ -185,6 +191,12 @@ Hook 与本地 IM 共享消息级来源及上下文快照结构。本地所有�
 上下文片段，不分别实现保存或展示。没有附带上下文时不显示空折叠区。
 过去未保存的内容不可从当前群历史补造，也不可用会话级来源猜测单条消息来源。
 受保护内容仍不落库；群历史二进制附件仍只进模型，不因快照额外保留。
+群历史上下文统一带发送时间：本地群窗口（个人与官方 Telegram）与飞书历史组装器每行写
+`[发言人] MM-DD HH:mm 正文`（本机时区，共用 `im/shared/groupWindowCore.ts` 的
+`formatImHistoryTime`）；时区与上下文整理时间由块外说明 `formatImHistoryTimeNote` 一次给出，
+写「整理于」而非「当前时间」（前缀可能排队后才派发），不改块头、不进上下文快照。与整理时刻
+不同年的消息行内补年份，UTC 偏移与整理时刻不同（跨夏令时切换）的消息行内补该消息自己的偏移，保证每行都能还原绝对时间。群历史检索结果在 `sentAt` 之外附可读的 `sentAtLocal`。
+官方 Slack / X 的 `threadContext` 由服务端下发，协议条目暂无时间字段，补齐需跨仓推进协议。
 本地 IM 使用 `agentMeta.imSource`，Hook 保留原 `hookSource`，Desktop 投影到同一展示结构。
 不复用旧客户端会解释为系统卡的 Hook 标记；旧 Mobile 忽略本地新增字段，保留普通用户
 消息的完整正文、附件与操作。上下文展示本身不改模型输入，不新增实时群历史查询。

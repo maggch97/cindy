@@ -281,6 +281,7 @@ function createDb(filename = ':memory:'): void {
       plan_mode_enabled INTEGER NOT NULL DEFAULT 0,
       cleared_at INTEGER,
       pinned_at INTEGER,
+      hidden_at INTEGER,
       summary TEXT,
       provider_id TEXT,
       user_send_at INTEGER,
@@ -435,6 +436,7 @@ function createDb(filename = ':memory:'): void {
       context_refs_json TEXT DEFAULT '[]' NOT NULL,
       artifact_refs_json TEXT DEFAULT '[]' NOT NULL,
       permission_snapshot_json TEXT DEFAULT '{}' NOT NULL,
+      group_task_posts_json TEXT DEFAULT '{}' NOT NULL,
       lineage_json TEXT DEFAULT '[]' NOT NULL,
       target_profile_version INTEGER,
       depth INTEGER DEFAULT 1 NOT NULL,
@@ -3856,6 +3858,9 @@ describe('Bot Session task end-to-end runtime', () => {
     onResultReceiptPersisted?: () => Promise<void>;
     onCompletionDispatched?: () => Promise<void>;
     onInteractionDispatched?: () => Promise<void>;
+    /** The group message channel for tasks started from a group (bot-group-chat.md §10). */
+    postGroupTaskMessage?: Parameters<typeof createBotDelegationService>[0]['postGroupTaskMessage'];
+    groupHasTaskChannel?: Parameters<typeof createBotDelegationService>[0]['groupHasTaskChannel'];
   } = {}) {
     const accountReady = options.accountReady ?? (() => true);
     const started: StartedTurn[] = [];
@@ -4070,6 +4075,8 @@ describe('Bot Session task end-to-end runtime', () => {
     const closeSession = vi.fn(options.closeSession ?? (async () => undefined));
     const delegation = createBotDelegationService({
       maxActiveChildren: options.maxActiveChildren,
+      postGroupTaskMessage: options.postGroupTaskMessage,
+      groupHasTaskChannel: options.groupHasTaskChannel,
       readSessionExecution: options.readSessionExecution,
       collectArtifacts: options.collectArtifacts,
       discardDelegationQueuedInputs: options.discardDelegationQueuedInputs ?? (coordinator
@@ -4211,24 +4218,50 @@ describe('Bot Session task end-to-end runtime', () => {
       VALUES (?, 'bot-a', ?, 1, 'group', ?, 1)`).run(`${id}-link`, id, route);
   }
 
-  it('starts owner-authorized group work without impersonation and returns cards/results to the owner private chat', async () => {
+  it('projects the owning group of each hidden group lane so entries can return to that group', async () => {
+    await seedPair();
+    seedGroupLane('group-lane', 'group:fixture:access:owner:2');
+    seedGroupLane('group-plan', 'group:fixture:plan:plan-1');
+    const profile = await invoke('local-db:bots:get', 'bot-a') as { sessions: Array<Record<string, unknown>> };
+    const byId = new Map(profile.sessions.map((session) => [session.id, session]));
+    expect(byId.get('group-lane')).toMatchObject({ kind: 'group', role: 'group', groupId: 'fixture' });
+    expect(byId.get('group-plan')).toMatchObject({ kind: 'group', role: 'group', groupId: 'fixture' });
+    expect(byId.get('session-1')).toMatchObject({ kind: 'chat', role: 'canonical' });
+    expect(byId.get('session-1')).not.toHaveProperty('groupId');
+  });
+
+  it('starts owner-authorized group work in the group: card, result and no private-chat wake-up', async () => {
     await seedPair(); seedGroupLane();
     const release = registerGroupToolAuthority('group-lane', { botId: 'bot-a', mode: 'owner', isCurrent: () => true, validate: async () => {} });
     const readCallerPermission = vi.fn(() => ({ mode: 'auto' as const, generation: 2 }));
-    const runtime = createDelegationRuntime({ readCallerPermission });
+    const postGroupTaskMessage = vi.fn(async (input: { clientId: string }) => ({ ok: true as const, messageId: `posted:${input.clientId}` }));
+    const runtime = createDelegationRuntime({ readCallerPermission, postGroupTaskMessage });
     try {
       const result = await runtime.delegation.startSessionTask({ callerSessionId: 'group-lane', objective: 'Fixture-only development task' });
-      expect(result).toMatchObject({ ok: true, completionDestination: 'teammate-private-chat' });
+      expect(result).toMatchObject({ ok: true, completionDestination: 'group' });
       if (!result.ok) throw new Error(result.message);
       expect(readCallerPermission).toHaveBeenCalledWith('group-lane');
       const row = h.sqlite!.prepare('SELECT parent_session_id, permission_snapshot_json FROM bot_delegations WHERE id=?').get(result.delegationId) as { parent_session_id: string; permission_snapshot_json: string };
-      expect(row.parent_session_id).toBe('session-1');
+      // The lane that started the task stays its parent; no private chat is created or re-used.
+      expect(row.parent_session_id).toBe('group-lane');
       expect(JSON.parse(row.permission_snapshot_json)).toMatchObject({ groupOriginRoute: 'group:fixture:access:owner:2', groupOriginSessionId: 'group-lane', permission: { mode: 'auto' } });
       expect(runtime.dispatch).toHaveBeenCalledWith(expect.objectContaining({ targetSessionId: result.childSessionId, dispatcherSessionId: 'group-lane' }));
       expect(h.sqlite!.prepare('SELECT role FROM bot_session_links WHERE session_id=?').get('group-lane')).toEqual({ role: 'group' });
-      expect(h.sqlite!.prepare('SELECT session_id FROM messages WHERE client_id=?').get(`bot-delegation-request:${result.delegationId}`)).toEqual({ session_id: 'session-1' });
+      expect(h.sqlite!.prepare('SELECT session_id FROM messages WHERE client_id=?').get(`bot-delegation-request:${result.delegationId}`)).toEqual({ session_id: 'group-lane' });
+      // The group got the card as the teammate's own message, with the lane as the live-status parent.
+      expect(postGroupTaskMessage).toHaveBeenCalledWith(expect.objectContaining({
+        groupId: 'fixture', botId: 'bot-a', clientId: `bot-delegation-task:${result.delegationId}:started`, text: '',
+        card: expect.objectContaining({ namespace: 'cindy.task', data: expect.objectContaining({ state: 'started',
+          meta: expect.objectContaining({ role: 'delegation-request', delegationId: result.delegationId, parentSessionId: 'group-lane' }) }) }),
+      }));
       await runtime.runPendingTurns();
-      expect(runtime.dispatch.mock.calls.some(([params]) => params.targetSessionId === 'session-1')).toBe(true);
+      // The result returns to the group, not to the owner's private chat, and wakes no lane.
+      expect(postGroupTaskMessage).toHaveBeenLastCalledWith(expect.objectContaining({
+        groupId: 'fixture', clientId: `bot-delegation-task:${result.delegationId}:1:result`, text: `${result.childSessionId} 的结论。`,
+        card: expect.objectContaining({ data: expect.objectContaining({ state: 'completed' }) }),
+      }));
+      expect(runtime.dispatch.mock.calls.some(([params]) => params.targetSessionId === 'session-1' || params.targetSessionId === 'group-lane')).toBe(false);
+      expect(h.sqlite!.prepare('SELECT completion_delivered_at FROM bot_delegations WHERE id=?').pluck().get(result.delegationId)).not.toBeNull();
       expect(await runtime.delegation.getSessionTask('group-lane', result.delegationId)).toMatchObject({ ok: true });
       seedGroupLane('other-group', 'group:other:access:owner:2');
       const releaseOther = registerGroupToolAuthority('other-group', { botId: 'bot-a', mode: 'owner', isCurrent: () => true, validate: async () => {} });
@@ -4242,6 +4275,239 @@ describe('Bot Session task end-to-end runtime', () => {
     } finally { release(); runtime.dispose(); }
   });
 
+  it('never lets the result card overtake a start card still on its way to the group', async () => {
+    await seedPair(); seedGroupLane();
+    const release = registerGroupToolAuthority('group-lane', { botId: 'bot-a', mode: 'owner', isCurrent: () => true, validate: async () => {} });
+    let releaseStart: () => void = () => {};
+    const startLanded = new Promise<void>((resolve) => { releaseStart = resolve; });
+    const landed: string[] = [];
+    const postGroupTaskMessage = vi.fn(async (input: { clientId: string }) => {
+      // The start card's request is slow; the task completes while it is still in flight.
+      if (input.clientId.endsWith(':started')) await startLanded;
+      landed.push(input.clientId);
+      return { ok: true as const, messageId: `posted:${input.clientId}` };
+    });
+    const runtime = createDelegationRuntime({ postGroupTaskMessage });
+    try {
+      const task = await runtime.delegation.startSessionTask({ callerSessionId: 'group-lane', objective: 'Quick work' });
+      if (!task.ok) throw new Error(task.message);
+      const settled = runtime.runPendingTurns();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      // The result waits: nothing has landed yet, and the result request has not even been made.
+      expect(landed).toEqual([]);
+      expect(postGroupTaskMessage.mock.calls.map(([input]) => input.clientId)).toEqual([`bot-delegation-task:${task.delegationId}:started`]);
+      releaseStart();
+      await settled;
+      expect(landed).toEqual([`bot-delegation-task:${task.delegationId}:started`, `bot-delegation-task:${task.delegationId}:1:result`]);
+      expect(h.sqlite!.prepare('SELECT completion_delivered_at FROM bot_delegations WHERE id=?').pluck().get(task.delegationId)).not.toBeNull();
+    } finally { release(); runtime.dispose(); }
+  });
+
+  it('keeps a resumed run start in flight when an older run backoff fires', async () => {
+    await seedPair(); seedGroupLane();
+    vi.useFakeTimers();
+    const release = registerGroupToolAuthority('group-lane', { botId: 'bot-a', mode: 'owner', isCurrent: () => true, validate: async () => {} });
+    let releaseStart: () => void = () => {};
+    const startLanded = new Promise<void>((resolve) => { releaseStart = resolve; });
+    const landed: string[] = [];
+    const postGroupTaskMessage = vi.fn(async (input: { clientId: string }) => {
+      if (input.clientId.endsWith(':2:started')) await startLanded;
+      else if (input.clientId.endsWith(':started')) {
+        return { ok: false as const, errorCode: 'GROUP_CHANNEL_UNAVAILABLE', retryable: true };
+      }
+      landed.push(input.clientId);
+      return { ok: true as const, messageId: `posted:${input.clientId}` };
+    });
+    const runtime = createDelegationRuntime({ postGroupTaskMessage });
+    try {
+      const task = await runtime.delegation.startSessionTask({ callerSessionId: 'group-lane', objective: 'First pass' });
+      if (!task.ok) throw new Error(task.message);
+      const id = task.delegationId;
+      await runtime.runPendingTurns();
+      expect(landed).toEqual([`bot-delegation-task:${id}:1:result`]);
+      expect(await runtime.delegation.messageSessionTask('group-lane', id, { kind: 'message', text: 'One more pass.' }))
+        .toMatchObject({ ok: true, resumed: true });
+      // Run 1's scheduled retry observes run 2 and exits while run 2's start is still pending.
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(postGroupTaskMessage.mock.calls.map(([input]) => input.clientId)).toEqual([
+        `bot-delegation-task:${id}:started`, `bot-delegation-task:${id}:1:result`,
+        `bot-delegation-task:${id}:2:started`,
+      ]);
+      const settled = runtime.runPendingTurns();
+      await vi.advanceTimersByTimeAsync(50);
+      expect(landed).toEqual([`bot-delegation-task:${id}:1:result`]);
+      expect(postGroupTaskMessage).not.toHaveBeenCalledWith(expect.objectContaining({ clientId: `bot-delegation-task:${id}:2:result` }));
+      releaseStart();
+      await settled;
+      expect(landed).toEqual([
+        `bot-delegation-task:${id}:1:result`, `bot-delegation-task:${id}:2:started`,
+        `bot-delegation-task:${id}:2:result`,
+      ]);
+    } finally { releaseStart(); release(); runtime.dispose(); vi.useRealTimers(); }
+  });
+
+  it('clips a long group task title without splitting an emoji', async () => {
+    await seedPair(); seedGroupLane();
+    const release = registerGroupToolAuthority('group-lane', { botId: 'bot-a', mode: 'owner', isCurrent: () => true, validate: async () => {} });
+    const postGroupTaskMessage = vi.fn(async (input: { clientId: string }) => ({ ok: true as const, messageId: `posted:${input.clientId}` }));
+    const runtime = createDelegationRuntime({ postGroupTaskMessage });
+    try {
+      const task = await runtime.delegation.startSessionTask({ callerSessionId: 'group-lane', objective: `${'a'.repeat(59)}😀 and more\nDetails` });
+      if (!task.ok) throw new Error(task.message);
+      await vi.waitFor(() => expect(postGroupTaskMessage).toHaveBeenCalled());
+      const card = (postGroupTaskMessage.mock.calls[0]![0] as unknown as { card: { fallback: string; data: { title: string } } }).card;
+      // The task's own title is cut at 60 units, before the emoji rather than through it.
+      expect(card.data.title).toBe('a'.repeat(59));
+      expect(card.fallback).not.toMatch(/[\ud800-\udbff](?![\udc00-\udfff])/);
+    } finally { release(); runtime.dispose(); }
+  });
+
+  it('posts a fresh in-progress card to the group for each continued run of a group task', async () => {
+    await seedPair(); seedGroupLane();
+    const release = registerGroupToolAuthority('group-lane', { botId: 'bot-a', mode: 'owner', isCurrent: () => true, validate: async () => {} });
+    const postGroupTaskMessage = vi.fn(async (input: { clientId: string }) => ({ ok: true as const, messageId: `posted:${input.clientId}` }));
+    const runtime = createDelegationRuntime({ postGroupTaskMessage });
+    try {
+      const task = await runtime.delegation.startSessionTask({ callerSessionId: 'group-lane', objective: 'First pass' });
+      if (!task.ok) throw new Error(task.message);
+      await runtime.runPendingTurns();
+      const id = task.delegationId;
+      expect(postGroupTaskMessage.mock.calls.map(([input]) => input.clientId))
+        .toEqual([`bot-delegation-task:${id}:started`, `bot-delegation-task:${id}:1:result`]);
+      expect(await runtime.delegation.messageSessionTask('group-lane', id, { kind: 'message', text: 'One more pass.' }))
+        .toMatchObject({ ok: true, resumed: true });
+      // The group no longer shows the first run's 「已完成」 while the second one runs.
+      await vi.waitFor(() => expect(postGroupTaskMessage).toHaveBeenLastCalledWith(expect.objectContaining({
+        clientId: `bot-delegation-task:${id}:2:started`, card: expect.objectContaining({ data: expect.objectContaining({ state: 'started' }) }),
+      })));
+      await runtime.runPendingTurns();
+      expect(postGroupTaskMessage.mock.calls.map(([input]) => input.clientId)).toEqual([
+        `bot-delegation-task:${id}:started`, `bot-delegation-task:${id}:1:result`,
+        `bot-delegation-task:${id}:2:started`, `bot-delegation-task:${id}:2:result`,
+      ]);
+    } finally { release(); runtime.dispose(); }
+  });
+
+  it('keeps the teammate\'s full objective out of the group task card that every member can read', async () => {
+    await seedPair(); seedGroupLane();
+    const release = registerGroupToolAuthority('group-lane', { botId: 'bot-a', mode: 'owner', isCurrent: () => true, validate: async () => {} });
+    const postGroupTaskMessage = vi.fn(async (input: { clientId: string }) => ({ ok: true as const, messageId: `posted:${input.clientId}` }));
+    const runtime = createDelegationRuntime({ postGroupTaskMessage });
+    try {
+      const task = await runtime.delegation.startSessionTask({ callerSessionId: 'group-lane', objective: 'Redo the launch page\nUse the private pricing notes in ~/owner-only.md' });
+      if (!task.ok) throw new Error(task.message);
+      await vi.waitFor(() => expect(postGroupTaskMessage).toHaveBeenCalled());
+      const { card } = postGroupTaskMessage.mock.calls[0]![0] as unknown as { card: unknown };
+      expect(JSON.stringify(card)).not.toContain('private pricing');
+      expect(card).toMatchObject({ data: { title: 'Redo the launch page', meta: { objective: 'Redo the launch page', delegationId: task.delegationId } } });
+    } finally { release(); runtime.dispose(); }
+  });
+
+  it('tells the teammate a task from an old local-only group reports to the owner privately', async () => {
+    await seedPair(); seedGroupLane();
+    const release = registerGroupToolAuthority('group-lane', { botId: 'bot-a', mode: 'owner', isCurrent: () => true, validate: async () => {} });
+    const groupHasTaskChannel = vi.fn(async () => false);
+    const runtime = createDelegationRuntime({ groupHasTaskChannel });
+    try {
+      const task = await runtime.delegation.startSessionTask({ callerSessionId: 'group-lane', objective: 'Local group work' });
+      expect(task).toMatchObject({ ok: true, completionDestination: 'private' });
+      expect(groupHasTaskChannel).toHaveBeenCalledWith('fixture');
+    } finally { release(); runtime.dispose(); }
+  });
+
+  it('lets the owner stop a group task from its card after the group reply that started it has ended', async () => {
+    await seedPair(); seedGroupLane();
+    const release = registerGroupToolAuthority('group-lane', { botId: 'bot-a', mode: 'owner', isCurrent: () => true, validate: async () => {} });
+    const postGroupTaskMessage = vi.fn(async (input: { clientId: string }) => ({ ok: true as const, messageId: `posted:${input.clientId}` }));
+    const runtime = createDelegationRuntime({ postGroupTaskMessage });
+    try {
+      const task = await runtime.delegation.startSessionTask({ callerSessionId: 'group-lane', objective: 'Long-running work' });
+      if (!task.ok) throw new Error(task.message);
+      // The group reply that started the task has ended: its execution authority is gone.
+      release();
+      // A group tool call still needs a live execution; the owner's stop button does not.
+      expect(await runtime.delegation.cancelDelegation('group-lane', task.delegationId)).toMatchObject({ ok: false, errorCode: 'GROUP_AUTHORIZATION_REQUIRED' });
+      // Another group's lane cannot reach the task either way.
+      seedGroupLane('other-group', 'group:other:access:owner:2');
+      expect(await runtime.delegation.cancelDelegationFromOwner('other-group', task.delegationId)).toMatchObject({ ok: false, errorCode: 'NOT_FOUND' });
+      expect(await runtime.delegation.cancelDelegationFromOwner('group-lane', task.delegationId)).toMatchObject({ ok: true, delegationId: task.delegationId });
+      expect(h.sqlite!.prepare('SELECT status FROM bot_delegations WHERE id=?').pluck().get(task.delegationId)).toBe('cancelled');
+    } finally { release(); runtime.dispose(); }
+  });
+
+  it('keeps re-posting the start card while the group task runs, and stops once it has ended', async () => {
+    await seedPair(); seedGroupLane();
+    vi.useFakeTimers();
+    const release = registerGroupToolAuthority('group-lane', { botId: 'bot-a', mode: 'owner', isCurrent: () => true, validate: async () => {} });
+    // The group channel is down for the whole run; only the start card is affected here.
+    const postGroupTaskMessage = vi.fn(async (input: { clientId: string }) => input.clientId.endsWith(':started')
+      ? { ok: false as const, errorCode: 'GROUP_CHANNEL_UNAVAILABLE', retryable: true }
+      : { ok: true as const, messageId: `posted:${input.clientId}` });
+    const runtime = createDelegationRuntime({ postGroupTaskMessage });
+    try {
+      const task = await runtime.delegation.startSessionTask({ callerSessionId: 'group-lane', objective: 'Long work', timeoutMs: 60 * 60_000 });
+      if (!task.ok) throw new Error(task.message);
+      const startAttempts = () => postGroupTaskMessage.mock.calls.filter(([input]) => input.clientId.endsWith(':started')).length;
+      // Backoff 1, 2, 4, 8, 16, 32 s, then once a minute: the outage outlasts the former seven tries.
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(startAttempts()).toBeGreaterThanOrEqual(14);
+      await runtime.runPendingTurns();
+      const afterEnd = startAttempts();
+      // The task ended: no 「进行中」 card may land under its result.
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(startAttempts()).toBe(afterEnd);
+    } finally { release(); runtime.dispose(); vi.useRealTimers(); }
+  });
+
+  it('posts a running group task\'s start card again after a restart when it never reached the group', async () => {
+    await seedPair(); seedGroupLane();
+    const release = registerGroupToolAuthority('group-lane', { botId: 'bot-a', mode: 'owner', isCurrent: () => true, validate: async () => {} });
+    let groupDown = true;
+    const postGroupTaskMessage = vi.fn(async (input: { clientId: string }) => groupDown
+      ? { ok: false as const, errorCode: 'GROUP_CHANNEL_UNAVAILABLE', retryable: true }
+      : { ok: true as const, messageId: `posted:${input.clientId}` });
+    let runtime = createDelegationRuntime({ postGroupTaskMessage });
+    try {
+      const task = await runtime.delegation.startSessionTask({ callerSessionId: 'group-lane', objective: 'Long work' });
+      if (!task.ok) throw new Error(task.message);
+      expect(postGroupTaskMessage).toHaveBeenCalledTimes(1);
+      runtime.dispose();
+      groupDown = false;
+      runtime = createDelegationRuntime({ postGroupTaskMessage });
+      await runtime.delegation.restore();
+      // A second post, from the restored runtime: the same idempotent card, now accepted.
+      await vi.waitFor(() => expect(postGroupTaskMessage).toHaveBeenCalledTimes(2));
+      expect(postGroupTaskMessage).toHaveBeenLastCalledWith(expect.objectContaining({
+        groupId: 'fixture', clientId: `bot-delegation-task:${task.delegationId}:started`,
+        card: expect.objectContaining({ data: expect.objectContaining({ state: 'started' }) }),
+      }));
+      expect(h.sqlite!.prepare('SELECT status FROM bot_delegations WHERE id=?').pluck().get(task.delegationId)).toBe('running');
+    } finally { release(); runtime.dispose(); }
+  });
+
+  it('posts a timed-out group task to the group as timed out, in the sender\'s language, not as failed', async () => {
+    await seedPair(); seedGroupLane();
+    vi.useFakeTimers();
+    setMainLocale('en');
+    const release = registerGroupToolAuthority('group-lane', { botId: 'bot-a', mode: 'owner', isCurrent: () => true, validate: async () => {} });
+    const postGroupTaskMessage = vi.fn(async (input: { clientId: string }) => ({ ok: true as const, messageId: `posted:${input.clientId}` }));
+    const runtime = createDelegationRuntime({ postGroupTaskMessage });
+    try {
+      const task = await runtime.delegation.startSessionTask({ callerSessionId: 'group-lane', objective: 'Deadline work.', timeoutMs: 1000 });
+      if (!task.ok) throw new Error(task.message);
+      runtime.advance(1000);
+      await vi.advanceTimersByTimeAsync(1000);
+      // Stored as failed + TIMEOUT; every reader of the card sees the same normalised state as the owner's live view.
+      expect(h.sqlite!.prepare('SELECT status FROM bot_delegations WHERE id=?').pluck().get(task.delegationId)).toBe('failed');
+      expect(await runtime.delegation.getSessionTask('group-lane', task.delegationId)).toMatchObject({ task: { status: 'timed-out' } });
+      expect(postGroupTaskMessage).toHaveBeenLastCalledWith(expect.objectContaining({
+        clientId: `bot-delegation-task:${task.delegationId}:1:result`,
+        card: expect.objectContaining({ fallback: '[Task] Deadline work. · Timed out', data: expect.objectContaining({ state: 'timed-out' }) }),
+      }));
+      expect(h.sqlite!.prepare('SELECT completion_delivered_at FROM bot_delegations WHERE id=?').pluck().get(task.delegationId)).not.toBeNull();
+    } finally { release(); runtime.dispose(); vi.useRealTimers(); }
+  });
+
   it.each(['retry', 'replay', 'restart'] as const)('continues admitted group work after the originating execution ends during %s', async recovery => {
     await seedPair(); seedGroupLane();
     vi.useFakeTimers();
@@ -4251,7 +4517,7 @@ describe('Bot Session task end-to-end runtime', () => {
     let runtime = createDelegationRuntime({ transientUnavailable: () => unavailable, readCallerPermission: () => permission });
     try {
       const task = await runtime.delegation.startSessionTask({ callerSessionId: 'group-lane', objective: 'Fixture queued independent work' });
-      expect(task).toMatchObject({ ok: true, status: 'queued', completionDestination: 'teammate-private-chat' });
+      expect(task).toMatchObject({ ok: true, status: 'queued', completionDestination: 'group' });
       if (!task.ok) throw new Error(task.message);
       if (recovery === 'replay') {
         h.sqlite!.prepare('INSERT INTO messages (id, client_id, session_id, role, content, created_at) VALUES (?, ?, ?, ?, ?, ?)')
@@ -4268,7 +4534,9 @@ describe('Bot Session task end-to-end runtime', () => {
       expect(h.sqlite!.prepare('SELECT permission_mode FROM sessions WHERE id=?').pluck().get(task.childSessionId)).toBe('auto');
       expect(await runtime.delegation.getSessionTask('group-lane', task.delegationId)).toMatchObject({ ok: false, errorCode: 'GROUP_AUTHORIZATION_REQUIRED' });
       await runtime.runPendingTurns();
+      // Without a group channel the result still reaches the owner, in the private chat.
       expect(runtime.dispatch.mock.calls.some(([params]) => params.targetSessionId === 'session-1')).toBe(true);
+      expect(runtime.dispatch.mock.calls.some(([params]) => params.targetSessionId === 'group-lane')).toBe(false);
     } finally { release(); runtime.dispose(); vi.useRealTimers(); }
   });
 
@@ -4306,7 +4574,9 @@ describe('Bot Session task end-to-end runtime', () => {
       expect(h.sqlite!.prepare('SELECT run_sequence FROM bot_delegations WHERE id=?').pluck().get(task.delegationId)).toBe(2);
       expect(await runtime.delegation.getSessionTask('group-lane', task.delegationId)).toMatchObject({ ok: false, errorCode: 'GROUP_AUTHORIZATION_REQUIRED' });
       await runtime.runPendingTurns();
+      // Without a group channel the result still reaches the owner, in the private chat.
       expect(runtime.dispatch.mock.calls.some(([params]) => params.targetSessionId === 'session-1')).toBe(true);
+      expect(runtime.dispatch.mock.calls.some(([params]) => params.targetSessionId === 'group-lane')).toBe(false);
     } finally { h.tx = originalTx; release(); runtime.dispose(); vi.useRealTimers(); }
   });
 
@@ -4492,10 +4762,11 @@ describe('Bot Session task end-to-end runtime', () => {
         .toEqual({ role: 'assistant', session_id: sent.targetSessionId });
       expect(runtime.dispatch).not.toHaveBeenCalled();
       const task = await runtime.delegation.startSessionTask({ callerSessionId: 'group-lane', objective: 'Fixture task after private-chat recovery' });
-      expect(task).toMatchObject({ ok: true, completionDestination: 'teammate-private-chat' });
+      expect(task).toMatchObject({ ok: true, completionDestination: 'group' });
       if (!task.ok) throw new Error(task.message);
+      // Group work stays with its lane even when a private chat was just recovered.
       expect(h.sqlite!.prepare('SELECT parent_session_id FROM bot_delegations WHERE id=?').get(task.delegationId))
-        .toEqual({ parent_session_id: sent.targetSessionId });
+        .toEqual({ parent_session_id: 'group-lane' });
       expect(await direct.sendToUser({ callerSessionId: 'group-lane', message: 'Recovered private chat', idempotencyKey: 'recovery-fixture' }))
         .toMatchObject({ ok: true, messageId: sent.messageId, targetSessionId: sent.targetSessionId });
     } finally { release(); runtime.dispose(); }
@@ -4529,7 +4800,55 @@ describe('Bot Session task end-to-end runtime', () => {
     } finally { h.tx = originalTx; release(); }
   });
 
-  it.each(['healthy', 'missing'] as const)('keeps or repairs the %s owner chat when group work is the first entry', async state => {
+  it('restores a missing owner chat only when the group refuses a task result for good', async () => {
+    await seedPair(); seedGroupLane();
+    h.sqlite!.pragma('foreign_keys = OFF');
+    h.sqlite!.prepare("DELETE FROM sessions WHERE id='session-1'").run();
+    h.sqlite!.pragma('foreign_keys = ON');
+    const release = registerGroupToolAuthority('group-lane', { botId: 'bot-a', mode: 'owner', isCurrent: () => true, validate: async () => {} });
+    // The card posts; the result is refused for good (the teammate left the group).
+    const postGroupTaskMessage = vi.fn(async (input: { clientId: string }) => input.clientId.endsWith(':started')
+      ? { ok: true as const, messageId: `posted:${input.clientId}` }
+      : { ok: false as const, errorCode: 'MEMBER_UNAVAILABLE', retryable: false });
+    const runtime = createDelegationRuntime({ postGroupTaskMessage });
+    try {
+      const task = await runtime.delegation.startSessionTask({ callerSessionId: 'group-lane', objective: 'Fixture refused result' });
+      if (!task.ok) throw new Error(task.message);
+      // Starting the task repaired no private chat: the stale link still points at the missing row.
+      const liveCanonical = () => h.sqlite!.prepare(`SELECT s.id FROM bot_session_links l JOIN sessions s ON s.id = l.session_id
+        WHERE l.bot_id='bot-a' AND l.role='canonical' AND l.archived_at IS NULL AND s.status='active'`).pluck().get() as string | undefined;
+      expect(liveCanonical()).toBeUndefined();
+      await runtime.runPendingTurns();
+      // Delivery restored one and woke it, so the result is not lost and not retried forever.
+      const restored = liveCanonical();
+      expect(restored).toBeTruthy();
+      expect(runtime.dispatch.mock.calls.some(([params]) => params.targetSessionId === restored)).toBe(true);
+      expect(h.sqlite!.prepare('SELECT completion_delivered_at FROM bot_delegations WHERE id=?').pluck().get(task.delegationId)).not.toBeNull();
+    } finally { release(); runtime.dispose(); }
+  });
+
+  it('does not post a stale 「进行中」 card after the task has already ended', async () => {
+    await seedPair(); seedGroupLane();
+    vi.useFakeTimers();
+    const release = registerGroupToolAuthority('group-lane', { botId: 'bot-a', mode: 'owner', isCurrent: () => true, validate: async () => {} });
+    // The first start post fails transiently; the task finishes before the retry is due.
+    let startAttempts = 0;
+    const postGroupTaskMessage = vi.fn(async (input: { clientId: string }) => {
+      if (input.clientId.endsWith(':started') && ++startAttempts === 1) return { ok: false as const, errorCode: 'ECONNRESET', retryable: true };
+      return { ok: true as const, messageId: `posted:${input.clientId}` };
+    });
+    const runtime = createDelegationRuntime({ postGroupTaskMessage });
+    try {
+      const task = await runtime.delegation.startSessionTask({ callerSessionId: 'group-lane', objective: 'Fixture short task' });
+      if (!task.ok) throw new Error(task.message);
+      await runtime.runPendingTurns();
+      expect(postGroupTaskMessage).toHaveBeenLastCalledWith(expect.objectContaining({ clientId: `bot-delegation-task:${task.delegationId}:1:result` }));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(postGroupTaskMessage.mock.calls.filter(([input]) => input.clientId.endsWith(':started'))).toHaveLength(1);
+    } finally { release(); runtime.dispose(); vi.useRealTimers(); }
+  });
+
+  it.each(['healthy', 'missing'] as const)('leaves the %s owner chat alone when group work is the first entry', async state => {
     await seedPair(); seedGroupLane();
     if (state === 'missing') {
       h.sqlite!.pragma('foreign_keys = OFF');
@@ -4538,19 +4857,21 @@ describe('Bot Session task end-to-end runtime', () => {
     }
     const release = registerGroupToolAuthority('group-lane', { botId: 'bot-a', mode: 'owner', isCurrent: () => true, validate: async () => {} });
     const runtime = createDelegationRuntime();
+    const sessionsBefore = h.sqlite!.prepare('SELECT id FROM sessions ORDER BY id').all() as Array<{ id: string }>;
+    const linksBefore = h.sqlite!.prepare('SELECT * FROM bot_session_links ORDER BY id').all();
     try {
-      const task = await runtime.delegation.startSessionTask({ callerSessionId: 'group-lane', objective: 'Fixture task as first recovery entry' });
-      expect(task).toMatchObject({ ok: true });
+      const task = await runtime.delegation.startSessionTask({ callerSessionId: 'group-lane', objective: 'Fixture task as first entry' });
+      expect(task).toMatchObject({ ok: true, completionDestination: 'group' });
       if (!task.ok) throw new Error(task.message);
-      const parent = h.sqlite!.prepare('SELECT parent_session_id FROM bot_delegations WHERE id=?').pluck().get(task.delegationId);
-      if (state === 'healthy') expect(parent).toBe('session-1');
-      else expect(parent).not.toBe('session-1');
-      expect(h.sqlite!.prepare("SELECT session_id FROM bot_session_links WHERE bot_id='bot-a' AND role='canonical' AND archived_at IS NULL").all())
-        .toEqual([{ session_id: parent }]);
+      // The task lives in the group: no private chat is created or repaired for it.
+      expect(h.sqlite!.prepare('SELECT parent_session_id FROM bot_delegations WHERE id=?').pluck().get(task.delegationId)).toBe('group-lane');
+      expect(h.sqlite!.prepare('SELECT id FROM sessions ORDER BY id').all()).toEqual([...sessionsBefore, { id: task.childSessionId }].sort((a, b) => String(a.id).localeCompare(String(b.id))));
+      expect(h.sqlite!.prepare('SELECT * FROM bot_session_links ORDER BY id').all()).toEqual(linksBefore);
     } finally { release(); runtime.dispose(); }
   });
 
-  it.each([['private-message', 'revoked'], ['independent-task', 'revoked'], ['private-message', 'account'], ['independent-task', 'account']] as const)('does not deliver %s after %s during canonical recovery', async (operation, interruption) => {
+  // Independent tasks no longer recover a private chat: they stay in the group (bot-group-chat.md §10).
+  it.each([['private-message', 'revoked'], ['private-message', 'account']] as const)('does not deliver %s after %s during canonical recovery', async (operation, interruption) => {
     await seedPair(); seedGroupLane();
     h.sqlite!.pragma('foreign_keys = OFF');
     h.sqlite!.prepare("DELETE FROM sessions WHERE id='session-1'").run();
@@ -4580,7 +4901,7 @@ describe('Bot Session task end-to-end runtime', () => {
     } finally { release(); runtime.dispose(); }
   });
 
-  it.each((['private-message', 'peer-message', 'independent-task'] as const).flatMap(operation =>
+  it.each((['private-message', 'peer-message'] as const).flatMap(operation =>
     (['deleted', 'unlinked'] as const).map(state => ({ operation, state }))))('does not commit $state canonical recovery for $operation after preparation revokes the grant', async ({ operation, state }) => {
     await seedPair(); seedGroupLane();
     const targetBotId = operation === 'peer-message' ? 'bot-b' : 'bot-a';
@@ -4656,8 +4977,12 @@ describe('Bot Session task end-to-end runtime', () => {
     } finally { release(); }
   });
 
+  // Reopening group work keeps the lane as its parent (bot-group-chat.md §10), so reopen no
+  // longer reads the owner chat; its revocation boundaries are the child read and reconcile.
   it.each((['resume', 'reopen'] as const).flatMap(mode =>
-    (['requester-read', 'child-read', 'reconcile'] as const).map(boundary => ({ mode, boundary }))))
+    (['requester-read', 'child-read', 'reconcile'] as const)
+      .filter(boundary => !(mode === 'reopen' && boundary === 'requester-read'))
+      .map(boundary => ({ mode, boundary }))))
   ('rejects $mode preparation revoked during $boundary', async ({ mode, boundary }) => {
     await seedPair(); seedGroupLane();
     let armed = false;
@@ -5389,13 +5714,12 @@ describe('Bot Session task end-to-end runtime', () => {
     },
   );
 
-  it.each(['deleted-parent', 'deleting-bot', 'ordinary-task', 'group-link', 'missing-link'] as const)(
+  it.each(['deleted-parent', 'deleting-bot', 'ordinary-task', 'missing-link'] as const)(
     'rejects task title list reads from %s', async (state) => {
       await seedPair();
       if (state === 'deleted-parent') h.sqlite!.prepare("UPDATE sessions SET status = 'deleted' WHERE id = 'session-1'").run();
       if (state === 'deleting-bot') h.sqlite!.prepare("UPDATE bot_profiles SET status = 'deleting' WHERE id = 'bot-a'").run();
       if (state === 'ordinary-task') h.sqlite!.prepare("UPDATE sessions SET source = 'desktop' WHERE id = 'session-1'").run();
-      if (state === 'group-link') h.sqlite!.prepare("UPDATE bot_session_links SET role = 'group' WHERE session_id = 'session-1'").run();
       if (state === 'missing-link') h.sqlite!.prepare("DELETE FROM bot_session_links WHERE session_id = 'session-1'").run();
       const runtime = createDelegationRuntime();
       try {
@@ -5404,6 +5728,23 @@ describe('Bot Session task end-to-end runtime', () => {
       } finally { runtime.dispose(); }
     },
   );
+
+  // The card posted in a group reads its live row through the lane that started the task
+  // (bot-group-chat.md §10); a lane of another group sees nothing, the owner chat sees it all.
+  it('lets a group lane list only the tasks started from its own group', async () => {
+    await seedPair(); seedGroupLane(); seedGroupLane('other-group', 'group:other:access:owner:2');
+    const release = registerGroupToolAuthority('group-lane', { botId: 'bot-a', mode: 'owner', isCurrent: () => true, validate: async () => {} });
+    const runtime = createDelegationRuntime();
+    try {
+      const task = await runtime.delegation.startSessionTask({ callerSessionId: 'group-lane', objective: 'Group-only listing fixture' });
+      if (!task.ok) throw new Error(task.message);
+      expect(await runtime.delegation.listDelegations('group-lane'))
+        .toMatchObject({ ok: true, delegations: [expect.objectContaining({ id: task.delegationId, parentSessionId: 'group-lane' })] });
+      expect(await runtime.delegation.listDelegations('other-group')).toEqual({ ok: true, delegations: [] });
+      expect(await runtime.delegation.listDelegations('session-1'))
+        .toMatchObject({ ok: true, delegations: [expect.objectContaining({ id: task.delegationId })] });
+    } finally { release(); runtime.dispose(); }
+  });
 
   it.each(['cc', 'codex'])('starts a child on the actual %s route after its Bot changes engines', async (agentKind) => {
     await seedPair();

@@ -110,6 +110,13 @@ export const sessions = sqliteTable(
     clearedAt: integer('cleared_at'), // unix ms
     pinnedAt: integer('pinned_at'), // unix ms
     /**
+     * 后台隐藏时刻（unix ms）。非 NULL = 插件以 `agent.hiddenTasks` 声明创建或切换为
+     * 隐藏的后台任务：不进入任务列表、搜索、未结束提示与新任务通知；用户仍可在插件
+     * 详情页「后台任务」打开或显示到任务列表。NULL = 普通可见任务（存量行全部为 NULL）。
+     * 用量统计等全量口径不按此列过滤。
+     */
+    hiddenAt: integer('hidden_at'), // unix ms
+    /**
      * 任务现状一句话摘要（仅置顶段卡片模式展示/生成）。
      * 由 main/sessionTaskSummary.ts 在置顶会话 turn 结束或置顶时经 oneShot 生成,
      * 取消置顶时清空。NULL = 尚未生成或非卡片置顶。
@@ -464,6 +471,8 @@ export const botDelegations = sqliteTable(
     contextRefsJson: text('context_refs_json').notNull().default('[]'),
     artifactRefsJson: text('artifact_refs_json').notNull().default('[]'),
     permissionSnapshotJson: text('permission_snapshot_json').notNull().default('{}'),
+    // Immutable wire payloads per group delivery; independent of mutable execution state.
+    groupTaskPostsJson: text('group_task_posts_json').notNull().default('{}'),
     lineageJson: text('lineage_json').notNull().default('[]'),
     targetProfileVersion: integer('target_profile_version'),
     depth: integer('depth').notNull().default(1),

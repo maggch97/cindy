@@ -66,7 +66,7 @@ import type { BotGroupChatService, BotGroupChatServiceDeps } from '../botGroupCh
 
 const selfId = '30000000-0000-4000-8000-000000000001';
 const rooms = Array.from({ length: 8 }, (_, index) => `10000000-0000-4000-8000-00000000000${index + 1}`);
-const room = (id: string) => ({ id, name: `Room ${id.slice(-1)}`, state: 'joined', response_mode: 'all', speaking_mode: 'auto',
+const room = (id: string) => ({ id, kind: 'group', name: `Room ${id.slice(-1)}`, state: 'joined', response_mode: 'all', speaking_mode: 'auto',
   created_at: '2026-10-03T00:00:00Z', updated_at: '2026-10-03T00:00:00Z', revision: 1, archived: false });
 const message = { id: '50000000-0000-4000-8000-000000000001', seq: '1', authorId: selfId, author: { kind: 'human', name: 'Me' },
   content: [{ type: 'text', text: 'hello' }], createdAt: '2026-10-03T00:00:00Z', deleted: false, threadRootId: null };
@@ -165,6 +165,7 @@ describe('Chat Server group open latency (simulated 100ms per request)', () => {
     fixture.sockets[0].emit('message', JSON.stringify({ type: 'ready' }));
     expect(sent()).toContainEqual({ type: 'subscribe', scope: `conversation:${rooms[0]}`, after: '58' });
     // A reconnect still re-reads every followed room once.
+    await vi.advanceTimersByTimeAsync(0);
     expect(onChanged).toHaveBeenCalledWith({ groupId: rooms[0], change: 'messages' }, undefined);
   });
 
@@ -219,7 +220,9 @@ describe('Chat Server group open latency (simulated 100ms per request)', () => {
     // Two successes and one failure settle inside one window: one re-read shows their states.
     expect(onChanged.mock.calls.filter(([payload]) => payload.groupId === rooms[0])).toHaveLength(1);
     const settled = await timed(() => service.getGroup(rooms[0]));
-    expect(settled.value.ok && settled.value.group.messages[0].attachments.map(item => item.id)).toEqual([ids[0], ids[2]]);
+    // Every media block keeps its slot in message order; the failed one says so instead of vanishing.
+    expect(settled.value.ok && settled.value.group.messages[0].attachments.map(item => [item.id, item.state ?? 'ready']))
+      .toEqual([[ids[0], 'ready'], [ids[1], 'unavailable'], [ids[2], 'ready']]);
     // A failed file is not retried during its backoff, then is retried by the next read.
     expect(fixture.download).toHaveBeenCalledTimes(3);
     secondFails = false;
@@ -230,7 +233,8 @@ describe('Chat Server group open latency (simulated 100ms per request)', () => {
     await vi.advanceTimersByTimeAsync(1000);
     expect(onChanged.mock.calls.filter(([payload]) => payload.groupId === rooms[0])).toHaveLength(1);
     const recovered = await timed(() => service.getGroup(rooms[0]));
-    expect(recovered.value.ok && recovered.value.group.messages[0].attachments.map(item => item.id)).toEqual(ids);
+    expect(recovered.value.ok && recovered.value.group.messages[0].attachments.map(item => [item.id, item.state ?? 'ready']))
+      .toEqual(ids.map(mediaId => [mediaId, 'ready']));
   });
 
   it('notifies again for an attachment that settles after a coalesced re-read was sent', async () => {
@@ -283,7 +287,10 @@ describe('Chat Server group open latency (simulated 100ms per request)', () => {
       expect(Math.max(...notices)).toBeGreaterThanOrEqual(Math.max(...settled));
       expect(notices.length).toBeLessThan(settled.length);
       const read = await timed(() => service.getGroup(rooms[0]));
-      expect(read.value.ok && read.value.group.messages[0].attachments).toHaveLength(lastFails ? 7 : 8);
+      // Eight slots either way; a failed last download is shown as unavailable, not dropped.
+      const attachments = read.value.ok ? read.value.group.messages[0].attachments : [];
+      expect(attachments).toHaveLength(8);
+      expect(attachments.map(item => item.state ?? 'ready')).toEqual([...Array(7).fill('ready'), lastFails ? 'unavailable' : 'ready']);
     });
 
     it('re-reads again when a download settles while the previous refresh is still in flight', async () => {

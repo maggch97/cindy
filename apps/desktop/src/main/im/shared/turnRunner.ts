@@ -166,7 +166,8 @@ import {
   tokenRateFromStatus,
   type TurnActivityState,
 } from './turnActivity';
-import { terminalErrorText, turnRetryNotice } from './turnRetryNotice';
+import { isQuotaExhaustionFailure, terminalErrorText, turnRetryNotice } from './turnRetryNotice';
+import { resolveSessionProviderLabel } from './sessionProviderLabel';
 import { createTurnPresenter, DEFAULT_PRESENTER_POLICY, type TurnPresenter } from './turnPresenter';
 import {
   toCoreAgentKind,
@@ -3543,7 +3544,7 @@ export function createTurnRunner(
     // 或内部英文 SDK 串——从本地化文案回归英文实现细节(review #844 codex P1)。
     // hook runner 与调度转播共用同一个 helper，三条渠道链路口径一致；上游原文留在
     // 本地日志。
-    const msg = terminalErrorText(errData);
+    let msg = terminalErrorText(errData);
     if (turn) clearSilentStopSettleWait(turn);
     if (turn) clearActivityTicker(turn);
     if (turn) {
@@ -3568,6 +3569,14 @@ export function createTurnRunner(
       } catch {
         // 建卡失败 → 下面按"没有输出面"处理(另发一条消息)。
       }
+    }
+    // 额度类失败要说清是哪个供应商: 名字只在这里按需读一次(尽力而为, 读不到退回「当前供应商」)。
+    if (isQuotaExhaustionFailure(errData)) {
+      msg = terminalErrorText(errData, {
+        providerLabel: await resolveSessionProviderLabel(state.makerSession.id),
+        surface: 'personal',
+        supportsModelCommand: richIm !== null,
+      });
     }
     if (turn?.streamingHandle) {
       const view = composeStreamingView(turn);

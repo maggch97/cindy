@@ -64,12 +64,12 @@ import {
   type BotGroupSpeaker,
   type BotGroupSpeakingMode,
   type BotGroupSummary,
+  type BotGroupTaskCard,
 } from '../../shared/botGroupChat.js';
 
 /** docs/product-rules/bot-group-chat.md §4.2 — enforced here, never by prompt. */
 const MAX_CIRCLES_PER_ROUND = 3;
 const MAX_BOT_MESSAGES_PER_ROUND = 10;
-const MEMBER_TURN_TIMEOUT_MS = 5 * 60_000;
 const MAX_DELTA_MESSAGES = 30;
 /** Attachments sent with one member turn; the newest win when unseen messages carry more. */
 const MAX_TURN_ATTACHMENTS = 40;
@@ -79,6 +79,11 @@ const PREVIEW_CHARS = 80;
 const MAX_ID_CHARS = 128;
 /** docs/product-rules/bot-group-chat.md §7.4: a step may run long; time waiting on the user is not counted. */
 const STEP_TURN_TIMEOUT_MS = 2 * 60 * 60_000;
+/**
+ * docs/product-rules/bot-group-chat.md §4.4: an ordinary reply may run tools and tests for as long
+ * as a step; a hung lane is caught by the session's own idle watchdog, not by this wall clock.
+ */
+const MEMBER_TURN_TIMEOUT_MS = STEP_TURN_TIMEOUT_MS;
 const MAX_PLAN_RECENT_MESSAGES = 12;
 const MAX_PROJECT_DIR_CHARS = 4_096;
 
@@ -160,6 +165,8 @@ export interface BotGroupChatServiceDeps {
   captureOwnerScope?: () => DataOwnerBroadcastScope;
   isOwnerScopeCurrent?: (scope: DataOwnerBroadcastScope) => boolean;
   onChanged?: (payload: BotGroupChangedPayload, ownerScope?: DataOwnerBroadcastScope) => void;
+  /** Cloud companions (cloud-companions.md); absent keeps the Chat Server per-computer only. */
+  companionCloud?: import('../companion-cloud/runtime.js').CompanionCloudHost;
   now?: () => number;
   createId?: () => string;
   memberTurnTimeoutMs?: number;
@@ -2163,9 +2170,28 @@ export function createBotGroupChatService(deps: BotGroupChatServiceDeps) {
     retryPlan: (input: unknown) => planAction('retry', input),
     editPlanStep,
     settleLaneTurn,
+    /** Only a server room has a message channel a teammate can post into outside a turn. */
+    postCompanionTaskMessage: async (_input: BotGroupTaskPostInput): Promise<BotGroupTaskPostResult> =>
+      ({ ok: false, errorCode: 'GROUP_CHANNEL_UNAVAILABLE', retryable: false }),
+    hasCompanionTaskChannel: async (_groupId: string): Promise<boolean> => false,
     dispose,
   };
 }
+
+/** One message a teammate posts into its group about an independent task (bot-group-chat.md §10). */
+export interface BotGroupTaskPostInput {
+  groupId: string;
+  botId: string;
+  /** Idempotent per event: retries return the message the server already stored. */
+  clientId: string;
+  text: string;
+  card: BotGroupTaskCard;
+  /** Delivered files, uploaded as this teammate's attachments; unreadable ones are skipped. */
+  files?: Array<{ absolutePath: string }>;
+}
+export type BotGroupTaskPostResult =
+  | { ok: true; messageId: string }
+  | { ok: false; errorCode: string; retryable: boolean };
 
 export type BotGroupChatService = ReturnType<typeof createBotGroupChatService> & {
   chatServer?: import('../../shared/botGroupChat.js').ChatServerApi;

@@ -146,6 +146,8 @@ export interface BotSessionProjection {
   updatedAt: number;
   status?: 'active' | 'archived' | 'deleted';
   role?: 'canonical' | 'delegation' | 'history' | 'group';
+  /** Group-lane only: the group whose chat owns this hidden Session. */
+  groupId?: string;
   profileVersion?: number;
   runtimeSnapshot?: {
     profileVersion: number;

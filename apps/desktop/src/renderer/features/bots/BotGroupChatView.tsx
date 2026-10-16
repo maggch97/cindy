@@ -1,3 +1,4 @@
+import { RemoveChatFromListButton } from './RemoveChatFromListButton';
 import type { ReactNode } from 'react';
 /**
  * 群聊页：顶栏（成员头像、群名、成员名单、群设置入口）+ 多作者时间线 + 输入框。
@@ -16,21 +17,21 @@ import type { ReactNode } from 'react';
  * 附件（§3.1）：托盘状态（`useAttachments`）由页面持有，文件拖到页面任意位置都进托盘，
  * 与普通任务的整区拖入一致；用户消息上的图片与文件复用普通聊天用户气泡的图片视图与
  * 附件 chip。
+ *
+ * 自己刚发的消息先由发件箱（botGroupOutbox.ts）接在时间线末尾显示，main 读到它后由
+ * 真实消息替换；没发出去的显示「没发出去」与重试、编辑。
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent } from 'react';
-import { ArrowLeft, CircleAlert, RefreshCcw, Settings2, Sparkles } from 'lucide-react';
+import { ArrowLeft, CircleAlert, CornerDownRight, RefreshCcw, Settings2, Sparkles } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 
 import { attachGhostMediaToSession, getGhostMediaHandoverFromDataTransfer } from '@/cindy-brain/ghostMediaHandover';
-import { ChatImageView } from '@/components/chat/ChatImageView';
 import { MarkdownRenderer } from '@/components/chat/MarkdownRenderer';
 import { ShareSelectionBar } from '@/components/chat/ShareSelectionBar';
 import { ShareMessageCheckbox } from '@/components/chat/ShareMessageCheckbox';
 import { shareSelectionStore, useShareSelectionActive } from '@/components/chat/shareSelectionStore';
 import { SHARE_SESSION_ATTR, SHARE_MESSAGE_ATTR } from '@/lib/shareConversationImage';
-import { TextLightbox } from '@/components/chat/TextLightbox';
-import { UserAttachmentChip } from '@/components/chat/UserAttachmentChip';
 import { CHAT_BODY_CLASS } from '@/components/chat/chatChrome';
 import { WINDOW_NO_DRAG_STYLE } from '@/components/layout/windowDrag';
 import { Button } from '@/components/ui/button';
@@ -70,13 +71,16 @@ import { useRegisterContentHeader } from '../feature-context';
 import { BotAvatar } from './BotAvatar';
 import { BotGenerationLabel } from './BotGenerationLabel';
 import { BotGroupAvatarStack } from './BotGroupAvatars';
-import { botGroupAttachmentScope, splitBotGroupMessageAttachments } from './botGroupAttachments';
+import { botGroupAttachmentScope, refreshPendingBotGroupAttachments } from './botGroupAttachments';
+import { BotGroupMessageAttachments } from './BotGroupMessageAttachments';
 import { BotGroupComposer } from './BotGroupComposer';
 import { BotGroupQuoteBlock } from './BotGroupQuote';
-import { ChatInviteButton, ChatMessageActions } from './ChatServerControls';
+import { ChatInviteButton, ChatMessageActions, messageReactionRevision } from './ChatServerControls';
 import { animateThreadPanelWidth, ChatThreadPanel } from './ChatThreadPanel';
+import { BotGroupThreadPreview, BotGroupThreadShareQuote, botGroupThreadShareLabel, findThreadMessageElement, flashThreadTarget } from './BotGroupThreadViews';
 import { BotGroupPendingInteraction } from './BotGroupPendingInteraction';
 import { BotGroupRuntimeFailureNotice } from './BotGroupRuntimeFailureNotice';
+import { BotGroupTaskCard } from './BotGroupTaskCard';
 import { isBotGroupRuntimeFailureCode } from '../../../shared/botGroupChat';
 import {
   BotGroupHandoffFiles,
@@ -102,6 +106,20 @@ import {
   openBotGroupPlan,
 } from './botGroupPresentation';
 import { botGroupApi, editBotGroupPlanStep, runBotGroupPlanAction, useBotGroupSummary } from './botGroupStore';
+import {
+  beginBotGroupTimelineRead,
+  discardBotGroupOutbox,
+  editBotGroupSend,
+  getBotGroupOutboxClaims,
+  getBotGroupOutboxPreviews,
+  interleaveBotGroupOutbox,
+  mergeBotGroupLocalAttachments,
+  noteBotGroupTimeline,
+  projectBotGroupOutbox,
+  retryBotGroupSend,
+  useBotGroupOutbox,
+  type BotGroupOutboxEntry,
+} from './botGroupOutbox';
 import { botGroupReadKey, markBotRead } from './botReadState';
 import { collectBotMessageTimeGroups, formatBotMessageGroupTime } from './botConversationTimeline';
 
@@ -115,6 +133,8 @@ type GroupViewState =
       /** Plans referenced by the older pages; the latest read wins on overlap. */
       olderPlans: BotGroupPlanView[];
       olderHasMore: boolean;
+      /** Outbox read token of the read that produced `group` (see beginBotGroupTimelineRead). */
+      readToken: number;
     }
   | { kind: 'missing' }
   | { kind: 'error' };
@@ -216,6 +236,12 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
   useEffect(() => {
     let cancelled = false;
     let requestVersion = 0;
+    // The composer queues under the group's own id, which an older local route may not match.
+    const discardOutbox = () => {
+      const shown = stateRef.current;
+      discardBotGroupOutbox(groupId);
+      if (shown.kind === 'ready' && shown.group.id !== groupId) discardBotGroupOutbox(shown.group.id);
+    };
     const load = async (additionalSources: string[] = []) => {
       const version = ++requestVersion;
       const owner = getDataOwnerGeneration();
@@ -226,23 +252,30 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
         if (isCurrent()) setState({ kind: groupId ? 'error' : 'missing' });
         return;
       }
+      const readToken = beginBotGroupTimelineRead();
       try {
         const displayed = stateRef.current;
-        const sourceMessageIds = [...new Set([...(displayed.kind === 'ready' && displayed.group.id === groupId
+        const shown = displayed.kind === 'ready' && displayed.group.id === groupId;
+        const sourceMessageIds = [...new Set([...(shown
           ? mergeBotGroupMessages(displayed.older, displayed.group.messages).map(message => message.id) : []), ...additionalSources])];
-        const result = sourceMessageIds.length ? await api.getBotGroup(groupId, { sourceMessageIds }) : await api.getBotGroup(groupId);
+        // Older pages are not re-read, so their shares ask for the reply's current state.
+        const shownShares = shown ? botGroupShownShares(displayed.older) : [];
+        const result = sourceMessageIds.length || shownShares.length
+          ? await api.getBotGroup(groupId, { sourceMessageIds, ...(shownShares.length ? { shownShares } : {}) })
+          : await api.getBotGroup(groupId);
         if (!isCurrent()) return;
         if (result.ok) {
           readOwner.current = owner;
           setState((previous) =>
             previous.kind === 'ready'
-              ? { ...previous, group: result.group }
+              ? { ...previous, group: result.group, older: applyBotGroupThreadShareUpdates(previous.older, result.group), readToken }
               : {
                   kind: 'ready',
                   group: result.group,
                   older: [],
                   olderPlans: [],
                   olderHasMore: result.group.hasMoreBefore,
+                  readToken,
                 },
           );
           const shown = stateRef.current;
@@ -250,7 +283,22 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
             const targets = quotedOlderOriginals(shown.older, result.group.messages);
             if (targets.length > 0) void recheckQuotedOriginals(api, targets, isCurrent);
           }
+          if (displayed.kind === 'ready' && displayed.group.id === groupId && result.group.messages.length > 0) {
+            const latestFrom = Math.min(...result.group.messages.map((message) => message.sequence));
+            const refreshed = await refreshPendingBotGroupAttachments(displayed.older, latestFrom, async (before) => {
+              const page = await api.getBotGroup(groupId, { beforeSequence: before });
+              return page.ok && isCurrent() ? page.group.messages : null;
+            });
+            if (refreshed && isCurrent()) {
+              const fresh = new Map(refreshed.map((message) => [message.sequence, message]));
+              setState((previous) => previous.kind === 'ready' && previous.group.id === groupId
+                ? { ...previous, older: previous.older.map((message) => fresh.get(message.sequence) ?? message) }
+                : previous);
+            }
+          }
         } else if (result.errorCode === 'NOT_FOUND') {
+          // Gone for this account (deleted, archived or left): nothing of it is left to send.
+          discardOutbox();
           setState({ kind: 'missing' });
         } else {
           // Keep a timeline that is already on screen; only a first read fails loudly.
@@ -303,12 +351,16 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
     void load();
     const unsubscribe =
       botGroupApi()?.onBotGroupChanged?.((payload, ownerStamp) => {
-        if (!isDataOwnerPushCurrent(ownerStamp) || payload.groupId !== groupId) return;
-        if (payload.change === 'deleted') {
+        if (cancelled || !isDataOwnerPushCurrent(ownerStamp) || payload.groupId !== groupId) return;
+        if (payload.change === 'deleted' || (payload.change === 'list' && payload.listState?.hidden)) {
           requestVersion += 1;
           // Unsent attachments go with the group (staged copies included).
           discardDraft(botGroupAttachmentScope(groupId));
+          discardOutbox();
           setState({ kind: 'missing' });
+          // The authoritative hide can unmount the drawer before its IPC reply.
+          // This mounted page owns selection, so clear the route here as well.
+          if (payload.change === 'list') navigate('/bots');
           return;
         }
         void load();
@@ -319,7 +371,16 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
       loadRef.current = () => {};
       unsubscribe();
     };
-  }, [groupId, reloadVersion]);
+  }, [groupId, reloadVersion, navigate]);
+
+  // An older page may land across a refresh. Recheck that set once per version; source
+  // and attachment completion pushes then refresh every displayed share together.
+  // The derived key stays unchanged if a read cannot confirm a source, avoiding a loop.
+  const staleSharesKey = state.kind === 'ready' && staleBotGroupShares(state.older, state.group.threadShareVersion).length
+    ? JSON.stringify([state.group.threadShareVersion, staleBotGroupShares(state.older, state.group.threadShareVersion).map(message => message.id)]) : '';
+  useEffect(() => {
+    if (staleSharesKey) loadRef.current();
+  }, [staleSharesKey]);
 
   const group = state.kind === 'ready' ? state.group : null;
   // Until the timeline arrives, the header comes from the group's sidebar row (same account).
@@ -329,6 +390,38 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
     () => (state.kind === 'ready' ? projectBotGroupExecutionFailures(mergeBotGroupMessages(state.older, state.group.messages), state.group.executionFailures) : []),
     [state],
   );
+  /** Thread replies already in the loaded main chat, with the share to reveal. */
+  const sharedReplies = useMemo(() => {
+    const shares = new Map<string, { messageId: string; bySelf: boolean }>();
+    for (const message of messages) {
+      const share = message.threadShare;
+      // Only a share the server resolved inside its claimed thread stands for that reply.
+      if (share?.status !== 'available') continue;
+      const bySelf = message.authorKind === 'user' && message.isSelf !== false;
+      // Prefer the reader's own share: it is the one a repeat would return.
+      if (!shares.has(share.messageId) || bySelf) shares.set(share.messageId, { messageId: message.id, bySelf });
+    }
+    return shares;
+  }, [messages]);
+  // The composer sends under the group's own id; an older local route can still lead here.
+  const outboxGroupId = group?.id ?? groupId;
+  const outbox = useBotGroupOutbox(outboxGroupId);
+  // Settle receipts only once the read that shows them is on screen, so a pending bubble
+  // never disappears a frame before its real message appears. Older pages count too: a
+  // message pushed off the latest page settles its previews once 查看更早的消息 shows it.
+  // A receipt for a message the timeline already shows settles when it comes back.
+  useLayoutEffect(() => {
+    if (state.kind === 'ready') noteBotGroupTimeline(outboxGroupId, mergeBotGroupMessages(state.older, state.group.messages), state.readToken);
+  }, [outboxGroupId, state, outbox]);
+  const { pending: pendingSends, localAttachments } = useMemo(
+    () => projectBotGroupOutbox(outbox, messages, getBotGroupOutboxClaims(outboxGroupId), getBotGroupOutboxPreviews(outboxGroupId)),
+    [outboxGroupId, messages, outbox],
+  );
+  // A receipt the timeline does not show yet: read again so the real message takes its place.
+  const unreadReceipts = pendingSends.flatMap((entry) => (entry.status === 'sent' && entry.messageId ? [entry.messageId] : [])).join(',');
+  useEffect(() => {
+    if (unreadReceipts) loadRef.current();
+  }, [unreadReceipts]);
   // Quotes resolve against verified copies only; an unverified original falls back to the snapshot.
   const quoteSources = useMemo(
     () => (unverifiedOriginals.size > 0 ? messages.filter((message) => !unverifiedOriginals.has(message.id)) : messages),
@@ -361,6 +454,8 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
 
   const separator = t('bots.groupChat.memberSeparator');
   const [threadRootId, setThreadRootId] = useState<string | null>(null);
+  /** A reply to bring into view when a main-chat share opens its thread. */
+  const [threadFocus, setThreadFocus] = useState<{ messageId: string; nonce: number } | null>(null);
   const threadOpenerRef = useRef<HTMLElement | null>(null);
   const threadLayoutRef = useRef<HTMLDivElement>(null);
   const threadHeaderRef = useRef<HTMLDivElement>(null);
@@ -394,6 +489,28 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
     threadCloseAnimationRef.current?.cancel();
     threadCloseAnimationRef.current = null;
   }, [threadRootId]);
+  const openThread = useCallback((rootId: string, focusMessageId?: string) => {
+    threadOpenerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    if (threadCloseAnimationRef.current) {
+      threadCloseAnimationRef.current.cancel();
+      threadCloseAnimationRef.current = null;
+      const panel = threadLayoutRef.current?.querySelector('aside');
+      if (panel) panel.inert = false;
+      if (rootId === threadRootId) {
+        (panel?.querySelector<HTMLTextAreaElement>('textarea:not(:disabled)') ?? panel?.querySelector<HTMLButtonElement>('header button'))?.focus();
+      }
+    }
+    setThreadFocus(focusMessageId ? { messageId: focusMessageId, nonce: Date.now() } : null);
+    setThreadRootId(rootId);
+  }, [threadRootId]);
+  /** From a thread reply back to where it was shared in the main chat. */
+  const revealMainMessage = useCallback((messageId: string) => {
+    const target = findThreadMessageElement(contentRef.current, messageId);
+    if (!target) return false;
+    stickToBottomRef.current = false;
+    flashThreadTarget(target);
+    return true;
+  }, []);
   useEffect(() => {
     if (!group?.serverBacked || !threadRootId) return;
     const onKeyDown = (event: KeyboardEvent) => {
@@ -461,7 +578,7 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
       return;
     }
     if (stickToBottomRef.current) element.scrollTop = element.scrollHeight;
-  }, [lastSequence, speakingKey, messages.length, hasControlledBanner, controlledBannerCollapsed]);
+  }, [lastSequence, speakingKey, messages.length, pendingSends.length, hasControlledBanner, controlledBannerCollapsed]);
 
   // Markdown, code blocks and avatars finish layout after the first paint; keep a reader
   // who is at the bottom pinned there while the content grows.
@@ -713,6 +830,7 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
               <ArrowLeft size={14} />
               {t('bots.backToBot')}
             </Button>
+            {!failed && groupId && <RemoveChatFromListButton key={groupId} groupId={groupId} onRemoved={() => navigate('/bots')} />}
             {failed ? (
               <Button
                 variant="cta"
@@ -739,10 +857,29 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
   const openPlan = openBotGroupPlan({ openPlan: group.openPlan, plans });
   const followUp = botGroupPlanFollowUp(openPlan);
   const continueId = continuableRoundEndId(messages, group.round);
-  const timeGroups = collectBotMessageTimeGroups(
-    messages.map((message) => ({ clientId: message.id, createdAt: message.createdAt })),
-  );
   const mentionLabels = [t('bots.groupChat.mention.all'), ...group.members.flatMap((member) => [member.name, member.nickname || member.displayName || member.name])];
+  // Messages still in the outbox stay where they were sent, between the timeline's own.
+  const rows = interleaveBotGroupOutbox(messages, pendingSends);
+  const timeGroups = collectBotMessageTimeGroups(rows.map((row) => row.entry
+    ? { clientId: outboxKey(row.entry), createdAt: row.entry.createdAt }
+    : { clientId: row.message.id, createdAt: row.message.createdAt }));
+  const renderOutboxEntry = (entry: BotGroupOutboxEntry) => {
+    const groupTime = timeGroups.get(outboxKey(entry));
+    return (
+      <div key={outboxKey(entry)} className="flex flex-col gap-4">
+        {groupTime !== undefined ? (
+          <p className="select-none text-center text-12 text-[var(--text-tertiary)]">
+            {formatBotMessageGroupTime(groupTime, i18n.language)}
+          </p>
+        ) : null}
+        <BotGroupOutboxItem entry={entry} mentionLabels={mentionLabels} readOnly={Boolean(group.archived || group.dissolvedAt)}
+          quote={entry.quote ? (
+            <BotGroupQuoteBlock display={resolveBotGroupQuote(entry.quote, quoteSources)}
+              onLocate={() => void locateQuoted(entry.quote!)} align="right" />
+          ) : null} />
+      </div>
+    );
+  };
   const running = group.round.status === 'running';
   const speakers = running
     ? group.round.speakers.flatMap((speaker) => {
@@ -805,7 +942,7 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
               </Button>
             </div>
           ) : null}
-          {messages.length === 0 && !running ? (
+          {messages.length === 0 && pendingSends.length === 0 && !running ? (
             <div className="py-12 text-center">
               <p className="text-13 font-medium text-[var(--text-secondary)]">
                 {t('bots.groupChat.timeline.emptyTitle')}
@@ -815,8 +952,15 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
               </p>
             </div>
           ) : null}
-          {messages.map((message) => {
-            const groupTime = timeGroups.get(message.id);
+          {rows.map((row) => {
+            if (row.entry) return renderOutboxEntry(row.entry);
+            const timelineMessage = row.message;
+            const groupTime = timeGroups.get(timelineMessage.id);
+            // My own message just confirmed: keep the local attachment previews until the server copies are usable.
+            const local = localAttachments.get(timelineMessage.id);
+            const message = local && timelineMessage.isSelf !== false && !timelineMessage.deleted
+              ? { ...timelineMessage, attachments: mergeBotGroupLocalAttachments(timelineMessage.attachments, local) }
+              : timelineMessage;
             return (
               <div key={message.id} className="flex flex-col gap-4">
                 {groupTime !== undefined ? (
@@ -840,24 +984,16 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
                   quoteDisplay={message.quote ? resolveBotGroupQuote(message.quote, quoteSources) : undefined}
                   onLocateQuote={message.quote ? () => void locateQuoted(message.quote!) : undefined}
                   actions={message.kind === 'message' ? <ChatMessageActions
-                    groupId={group.serverBacked ? group.id : undefined} shareScope={shareScope} message={message}
+                    groupId={group.serverBacked ? group.id : undefined} shareScope={shareScope} message={message} members={group.members} reactionRevision={messageReactionRevision(group, message.id)}
                     align={message.authorKind === 'user' && message.isSelf !== false ? 'right' : 'left'}
-                    onQuote={group.serverBacked && !group.archived && isBotGroupMessageQuotable(message)
+                    onQuote={group.serverBacked && !group.archived && !group.dissolvedAt && isBotGroupMessageQuotable(message)
                       ? () => setQuoteDraft(botGroupQuoteFromMessage(message)) : undefined}
-                    onReply={group.serverBacked ? () => {
-                      threadOpenerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-                      if (threadCloseAnimationRef.current) {
-                        threadCloseAnimationRef.current.cancel();
-                        threadCloseAnimationRef.current = null;
-                        const panel = threadLayoutRef.current?.querySelector('aside');
-                        if (panel) panel.inert = false;
-                        if (message.id === threadRootId) {
-                          (panel?.querySelector<HTMLTextAreaElement>('textarea:not(:disabled)') ?? panel?.querySelector<HTMLButtonElement>('header button'))?.focus();
-                        }
-                      }
-                      setThreadRootId(message.id);
-                    } : undefined}
+                    onReply={group.serverBacked ? () => openThread(message.id) : undefined}
+                    replyCountShown={group.serverBacked && (message.replyCount ?? 0) > 0}
+                    // A share copies the server's reply, never the card's fallback text.
+                    copyText={message.threadShare ? message.threadShare.status === 'available' ? message.threadShare.content : '' : undefined}
                     onChanged={() => loadRef.current()} /> : undefined}
+                  onOpenThread={group.serverBacked ? (rootId, focusMessageId) => openThread(rootId, focusMessageId) : undefined}
                   member={message.authorBotId ? memberById.get(message.authorBotId) : undefined}
                   members={group.members}
                   mentionLabels={mentionLabels}
@@ -918,7 +1054,7 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
         </div>
       )}
       {sharing ? <ShareSelectionBar sessionId={shareScope} barWidth="100%"
-        getContentWidth={() => contentRef.current?.querySelector('article')?.getBoundingClientRect().width ?? 760} /> : group.archived ? <p className="border-t border-[var(--border-default)] p-4 text-center text-13 text-[var(--text-tertiary)]">{t('bots.groupChat.server.settings.archived')}</p> : <BotGroupComposer
+        getContentWidth={() => contentRef.current?.querySelector('article')?.getBoundingClientRect().width ?? 760} /> : group.archived || group.dissolvedAt ? <p className="border-t border-[var(--border-default)] p-4 text-center text-13 text-[var(--text-tertiary)]">{t(group.dissolvedAt ? 'bots.groupChat.lifecycle.dissolved' : 'bots.groupChat.server.settings.archived')}</p> : <BotGroupComposer
         groupId={group.id}
         members={group.members}
         running={running}
@@ -928,9 +1064,8 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
         dragOver={dragOver}
         quote={quoteDraft ? { view: quoteDraft, display: resolveBotGroupQuote(quoteDraft, quoteSources) } : null}
         onQuoteChange={setQuoteDraft}
-        onSent={() => {
+        onSending={() => {
           stickToBottomRef.current = true;
-          loadRef.current();
         }}
       />}
       {group.migrationPending && <p role="status" className="px-4 py-2 text-13 text-[var(--text-secondary)]">{t('bots.groupChat.migrationPending')}</p>}
@@ -946,9 +1081,42 @@ function BotGroupChatContent({ groupId }: { groupId: string }) {
         />
       ) : null}
     </main>
-    {group.serverBacked && threadRootId && <ChatThreadPanel key={`${group.id}:${threadRootId}`} group={group} rootId={threadRootId} quoteSources={quoteSources} onClose={closeThread} />}
+    {group.serverBacked && threadRootId && <ChatThreadPanel key={`${group.id}:${threadRootId}`} group={group} rootId={threadRootId} quoteSources={quoteSources}
+      focus={threadFocus} sharedReplies={sharedReplies} onRevealShare={revealMainMessage} onClose={closeThread} />}
     </div>
   );
+}
+
+/** Older shares checked before the latest edit, deletion or reset: they may be out of date. */
+function staleBotGroupShares(older: readonly BotGroupMessageView[], version: number | undefined) {
+  return older.filter(message => message.threadShare && version !== undefined && (message.threadShare.version ?? 0) < version);
+}
+
+/** One refresh covers all loaded references, including pending sources and attachments. */
+function botGroupShownShares(older: readonly BotGroupMessageView[]) {
+  return older.filter(message => message.threadShare).map(message => ({
+    id: message.id, messageId: message.threadShare!.messageId, threadRootId: message.threadShare!.threadRootId,
+    ...(message.authorBotId ? { sharerId: message.authorBotId } : {}) }));
+}
+
+/**
+ * Apply the refreshed older shares. One this refresh could not check that is older than the
+ * latest version stops quoting its old text until a later refresh confirms it.
+ */
+function applyBotGroupThreadShareUpdates(older: BotGroupMessageView[], group: Pick<BotGroupDetail, 'threadShareUpdates' | 'threadShareVersion'>) {
+  const { threadShareUpdates: updates, threadShareVersion: version } = group;
+  if (!updates && version === undefined) return older;
+  let changed = false;
+  const next = older.map(message => {
+    const share = message.threadShare;
+    if (!share) return message;
+    const update = updates?.[message.id];
+    if (update) { changed = true; return { ...message, threadShare: update }; }
+    if (version === undefined || (share.version ?? 0) >= version || share.status !== 'available') return message;
+    changed = true;
+    return { ...message, threadShare: { ...share, status: 'loading' as const, authorName: '', authorBotId: null, content: '', attachments: [], edited: false } };
+  });
+  return changed ? next : older;
 }
 
 function BotGroupTimelineLoading() {
@@ -997,6 +1165,7 @@ function BotGroupTimelineItem({
   planPending,
   onPlanAction,
   onEditStep,
+  onOpenThread,
 }: {
   message: BotGroupMessageView;
   shareScope: string;
@@ -1005,6 +1174,8 @@ function BotGroupTimelineItem({
   quoteDisplay?: BotGroupQuoteDisplay;
   onLocateQuote?: () => void;
   actions?: ReactNode;
+  /** Server groups: open a thread, optionally bringing one of its replies into view. */
+  onOpenThread?: (rootId: string, focusMessageId?: string) => void;
   member: BotGroupMemberView | undefined;
   members: readonly BotGroupMemberView[];
   mentionLabels: readonly string[];
@@ -1047,36 +1218,46 @@ function BotGroupTimelineItem({
     const text = key ? t(key, { name }) : message.content;
     return <p className="text-center text-12 text-[var(--text-tertiary)]">{text}</p>;
   }
-  if (message.kind === 'message' && message.authorKind === 'user' && message.isSelf !== false) {
-    // An attachment-only message shows just its attachments, without an empty bubble.
-    const hasText = message.content.trim().length > 0;
+  const selfMessage = message.kind === 'message' && message.authorKind === 'user' && message.isSelf !== false;
+  const threadPreview = onOpenThread && message.kind === 'message' && (message.replyCount ?? 0) > 0 ? (
+    <BotGroupThreadPreview message={message} members={members} align={selfMessage ? 'right' : 'left'}
+      onOpen={() => onOpenThread(message.id)} />
+  ) : null;
+  const share = message.kind === 'message' ? message.threadShare : undefined;
+  const shareBody = share && onOpenThread ? (
+    <>
+      <p className="flex min-w-0 select-none items-center gap-1 text-12 text-[var(--text-tertiary)]">
+        <CornerDownRight size={12} aria-hidden className="shrink-0" />
+        <span className="min-w-0 truncate">{botGroupThreadShareLabel(share, t)}</span>
+      </p>
+      <BotGroupThreadShareQuote share={share} members={members}
+        attachments={<BotGroupMessageAttachments attachments={share.attachments} align="start" />}
+        onOpenThread={() => onOpenThread(share.threadRootId, share.messageId)} />
+    </>
+  ) : null;
+  if (selfMessage && shareBody) {
     return (
       <article {...{ [SHARE_SESSION_ATTR]: shareScope, [SHARE_MESSAGE_ATTR]: message.id }}
         className={`relative flex justify-end ${sharing ? 'ml-10' : ''}`}>
         {sharing && <ShareMessageCheckbox clientId={message.id} />}
-        <div className="flex min-w-0 max-w-[72%] flex-col items-end gap-2">
-          {quoteDisplay ? <BotGroupQuoteBlock display={quoteDisplay} onLocate={onLocateQuote} align="right" /> : null}
-          <BotGroupUserAttachments attachments={message.attachments} />
-          {hasText ? (
-            <div
-              className={`max-w-full whitespace-pre-wrap break-words rounded-xl border border-[var(--msg-user-border)] bg-[var(--msg-user-bg)] px-3.5 py-2.5 text-[var(--msg-user-text)] ${CHAT_BODY_CLASS}`}
-            >
-              {splitBotGroupMentionSegments(message.content, mentionLabels).map((segment, index) =>
-                segment.mention ? (
-                  <span
-                    key={index}
-                    className="rounded-full bg-[var(--surface-chip)] px-1.5 font-medium"
-                  >
-                    {segment.text}
-                  </span>
-                ) : (
-                  <span key={index}>{segment.text}</span>
-                ),
-              )}
-            </div>
-          ) : null}
+        <div className="flex min-w-0 w-[72%] max-w-[560px] flex-col items-end gap-1.5">
+          {shareBody}
+          {threadPreview}
           {actions}
         </div>
+      </article>
+    );
+  }
+  if (selfMessage) {
+    return (
+      <article {...{ [SHARE_SESSION_ATTR]: shareScope, [SHARE_MESSAGE_ATTR]: message.id }}
+        className={`relative flex justify-end ${sharing ? 'ml-10' : ''}`}>
+        {sharing && <ShareMessageCheckbox clientId={message.id} />}
+        <BotGroupSelfBubble content={message.content} attachments={message.attachments} mentionLabels={mentionLabels}
+          quote={quoteDisplay ? <BotGroupQuoteBlock display={quoteDisplay} onLocate={onLocateQuote} align="right" /> : null}>
+          {threadPreview}
+          {actions}
+        </BotGroupSelfBubble>
       </article>
     );
   }
@@ -1116,13 +1297,19 @@ function BotGroupTimelineItem({
         ) : (
           <>
             {quoteDisplay ? <BotGroupQuoteBlock display={quoteDisplay} onLocate={onLocateQuote} /> : null}
-            {hasText ? (
+            {/* A task this teammate started from the group; mine is live where it runs, another owner's is
+                a snapshot. An author no longer in the group is unknown: its task may run on another
+                computer, so it stays a snapshot rather than a lookup on this one. */}
+            {message.task ? <BotGroupTaskCard task={message.task} owned={member !== undefined && member.isOwned !== false}
+              botId={member?.botId ?? null} /> : null}
+            {shareBody ? <div className="flex min-w-0 flex-col gap-1.5">{shareBody}</div> : hasText ? (
               <div className={`min-w-0 text-[var(--msg-assistant-text)] ${CHAT_BODY_CLASS}`}>
                 <MarkdownRenderer workingDir="" content={message.content} allowPrivilegedLinks={false} />
               </div>
             ) : null}
-            <BotGroupUserAttachments attachments={message.attachments} />
+            {shareBody ? null : <BotGroupMessageAttachments attachments={message.attachments} align="start" />}
             <BotGroupHandoffFiles files={message.files} workDir={plan?.workDir ?? null} />
+            {threadPreview ? <div className="mt-1 flex min-w-0">{threadPreview}</div> : null}
             {actions}
           </>
         )}
@@ -1131,46 +1318,122 @@ function BotGroupTimelineItem({
   );
 }
 
-/**
- * A user message's images and files, drawn like a task's user bubble: each image as the
- * same attached-image view (click for the lightbox, right-click to copy or reveal), files
- * as the same chips (text preview or the system app, right-click menu).
- */
-function BotGroupUserAttachments({ attachments }: { attachments: readonly BotGroupAttachment[] }) {
-  const [textPreview, setTextPreview] = useState<{ path: string; name: string } | null>(null);
-  const chipRef = useRef<HTMLElement | null>(null);
-  const { images, files } = splitBotGroupMessageAttachments(attachments);
-  if (images.length === 0 && files.length === 0) return null;
+/** The current user's own message: attachments, then the text bubble, then what goes under it. */
+function BotGroupSelfBubble({
+  content,
+  attachments,
+  mentionLabels,
+  quote,
+  children,
+}: {
+  content: string;
+  attachments: readonly BotGroupAttachment[];
+  mentionLabels: readonly string[];
+  /** The 引用回复 block above the message. */
+  quote?: ReactNode;
+  children?: ReactNode;
+}) {
+  // An attachment-only message shows just its attachments, without an empty bubble.
+  const hasText = content.trim().length > 0;
   return (
-    <>
-      {images.map((image) => (
-        <ChatImageView key={image.id} src={image.url} filename={image.name} variant="user-attached" />
-      ))}
-      {files.length > 0 ? (
-        <div className="flex flex-wrap items-end justify-end gap-1.5">
-          {files.map((file) => (
-            <UserAttachmentChip
-              key={file.id}
-              file={{ name: file.name, path: file.path }}
-              onOpenTextPreview={(chip) => {
-                chipRef.current = chip;
-                setTextPreview({ path: file.path, name: file.name });
-              }}
-            />
-          ))}
+    <div className="flex min-w-0 max-w-[72%] flex-col items-end gap-2">
+      {quote}
+      <BotGroupMessageAttachments attachments={attachments} align="end" />
+      {hasText ? (
+        <div
+          className={`max-w-full whitespace-pre-wrap break-words rounded-xl border border-[var(--msg-user-border)] bg-[var(--msg-user-bg)] px-3.5 py-2.5 text-[var(--msg-user-text)] ${CHAT_BODY_CLASS}`}
+        >
+          {splitBotGroupMentionSegments(content, mentionLabels).map((segment, index) =>
+            segment.mention ? (
+              <span
+                key={index}
+                className="rounded-full bg-[var(--surface-chip)] px-1.5 font-medium"
+              >
+                {segment.text}
+              </span>
+            ) : (
+              <span key={index}>{segment.text}</span>
+            ),
+          )}
         </div>
       ) : null}
-      {textPreview ? (
-        <TextLightbox
-          filePath={textPreview.path}
-          fileName={textPreview.name}
-          triggerRef={chipRef}
-          onClose={() => setTextPreview(null)}
-        />
-      ) : null}
-    </>
+      {children}
+    </div>
   );
 }
+
+function outboxKey(entry: BotGroupOutboxEntry): string {
+  return `outbox:${entry.input.clientId}`;
+}
+
+/** Wait this long before saying 发送中, so a quick send never flashes a status. */
+const BOT_GROUP_SENDING_HINT_DELAY_MS = 600;
+
+/**
+ * A message the user just sent, shown before main has it in the timeline. Not yet a
+ * timeline message: no share checkbox, reply or reactions until the real one replaces it.
+ */
+function BotGroupOutboxItem({
+  entry,
+  mentionLabels,
+  readOnly,
+  quote,
+}: {
+  entry: BotGroupOutboxEntry;
+  mentionLabels: readonly string[];
+  readOnly: boolean;
+  quote?: ReactNode;
+}) {
+  const { t } = useTranslation();
+  const sending = entry.status === 'sending';
+  const [slow, setSlow] = useState(false);
+  useEffect(() => {
+    if (!sending) {
+      setSlow(false);
+      return;
+    }
+    const timer = window.setTimeout(() => setSlow(true), BOT_GROUP_SENDING_HINT_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [sending]);
+  return (
+    <article data-testid="bot-group-outbox" data-status={entry.status} className="relative flex justify-end">
+      <BotGroupSelfBubble content={entry.input.text} attachments={entry.attachments} mentionLabels={mentionLabels} quote={quote}>
+        {sending && slow ? (
+          <p role="status" className="select-none text-12 leading-[1.33] text-[var(--text-tertiary)]">
+            {t('bots.groupChat.outbox.sending')}
+          </p>
+        ) : null}
+        {entry.status === 'failed' ? (
+          <div role="alert" className="flex flex-wrap items-center justify-end gap-2">
+            <span className="flex select-none items-center gap-1 text-12 leading-[1.33] text-[var(--text-danger)]">
+              <CircleAlert size={13} aria-hidden className="shrink-0" />
+              {t('bots.groupChat.outbox.failed')}
+            </span>
+            <Button
+              variant="secondary"
+              size="sm"
+              compact
+              type="button"
+              disabled={readOnly}
+              onClick={() => {
+                if (!editBotGroupSend(entry.input.groupId, entry.input.clientId)) toast.warning(t('bots.groupChat.outbox.editBlocked'));
+              }}
+            >
+              {t('bots.groupChat.outbox.edit')}
+            </Button>
+            {entry.retryable !== false ? (
+              <Button variant="secondary" size="sm" compact type="button" disabled={readOnly} onClick={() => retryBotGroupSend(entry.input.groupId, entry.input.clientId)}>
+                <RefreshCcw size={13} />
+                {t('bots.retry')}
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
+      </BotGroupSelfBubble>
+    </article>
+  );
+}
+
 
 function BotGroupSpeakingRow({
   speaker,

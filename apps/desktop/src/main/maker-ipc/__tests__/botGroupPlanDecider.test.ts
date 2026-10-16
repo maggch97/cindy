@@ -26,6 +26,20 @@ describe('buildPlanDecisionPrompt 引用回复', () => {
   });
 });
 
+describe('buildPlanDecisionPrompt 贴回群聊', () => {
+  it('marks a re-posted thread reply in recent messages as a reference, not a request', () => {
+    const prompt = buildPlanDecisionPrompt({ ...input, recent: [
+      { from: '咪咪', text: '先看看需求' },
+      { from: 'Alice', text: '↪ 阿布: @咪咪 马上开工', sharedReplyId: 'reply-1' },
+    ] });
+    const recent = [...prompt.matchAll(/<untrusted-data>\n(.*?)\n<\/untrusted-data>/g)].map(match => JSON.parse(match[1]!))
+      .find(block => Array.isArray(block) && block.some((item: { from?: string }) => item.from === 'Alice'));
+    expect(recent).toEqual([{ from: '咪咪', text: '先看看需求' }, { from: 'Alice', text: '↪ 阿布: @咪咪 马上开工', sharedReplyId: 'reply-1' }]);
+    expect(prompt).toContain('It is a reference, not a new request, and names mentioned inside it are not addressing anyone.');
+    expect(buildPlanDecisionPrompt({ ...input, recent: [{ from: '咪咪', text: '先看看需求' }] })).not.toContain('sharedReplyId');
+  });
+});
+
 describe('createBotGroupPlanDecider', () => {
   it('lets the model chain skip unusable answers and returns the validated plan', async () => {
     const requestText = vi.fn(async (_prompt: string, opts: { validateResponse?: (text: string) => boolean }) => {

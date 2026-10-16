@@ -97,6 +97,8 @@ interface MessageActionBarProps {
   replyAction?: { onClick: () => void; label: string; count?: number };
   /** Quote this message into the current timeline's composer (group 引用回复); never opens a Thread. */
   quoteAction?: { onClick: () => void; label: string };
+  /** Extra More-menu items owned by the caller, listed before link copy. */
+  menuActions?: Array<{ key: string; label: string; icon: ReactNode; onSelect: () => void; disabled?: boolean }>;
   /** The caller owns reaction persistence; the toolbar owns its trigger and placement. */
   reactionAction?: { label: string; open: boolean; onOpenChange: (open: boolean) => void; disabled?: boolean; content: ReactNode };
   /** When provided, the More menu exposes single-message deletion. The
@@ -153,6 +155,7 @@ export function MessageActionBar({
   onShareAsImage,
   replyAction,
   quoteAction,
+  menuActions,
   reactionAction,
   onDelete,
   onEdit,
@@ -570,7 +573,7 @@ export function MessageActionBar({
   // 面板/行几何遵守 12px container + 8px inner-control 两档圆角。
   const canRewind = Boolean(onRewind);
   const addToChatInMenu = simplifiedBotConversation ? undefined : onAddToChat;
-  const moreMenu = (addToChatInMenu || copyLinkText || canRewind || onDelete) && (
+  const moreMenu = (addToChatInMenu || menuActions?.length || copyLinkText || canRewind || onDelete) && (
     <DropdownMenu key="more" open={menuOpen} onOpenChange={setMenuOpen}>
       <DropdownMenuTrigger asChild>
         <Tip text={t('chat.messageActionBar.moreActions')}>
@@ -628,6 +631,20 @@ export function MessageActionBar({
             {t('chat.quote.addToChat')}
           </DropdownMenuItem>
         )}
+        {menuActions?.map((action) => (
+          <DropdownMenuItem
+            key={action.key}
+            disabled={action.disabled}
+            onSelect={(event) => {
+              event.stopPropagation();
+              action.onSelect();
+            }}
+            className={MENU_ITEM_CLASS}
+          >
+            {action.icon}
+            {action.label}
+          </DropdownMenuItem>
+        ))}
         {copyLinkText && (
           <DropdownMenuItem
             onSelect={(event) => {
@@ -655,7 +672,7 @@ export function MessageActionBar({
         )}
         {onDelete && (
           <>
-            {(addToChatInMenu || copyLinkText || canRewind) && (
+            {(addToChatInMenu || menuActions?.length || copyLinkText || canRewind) && (
               <DropdownMenuSeparator />
             )}
             <DropdownMenuItem

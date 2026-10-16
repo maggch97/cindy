@@ -121,6 +121,8 @@ import {
 } from '../im/shared/openChannelSession.js';
 import { describeInteractionSource } from '../im/shared/interactionSource';
 import { hookAutoReviewReferences } from '../im/shared/autoReviewReferences.js';
+import { isQuotaExhaustionFailure, terminalErrorText } from '../im/shared/turnRetryNotice.js';
+import { resolveSessionProviderLabel } from '../im/shared/sessionProviderLabel.js';
 import { groupLaneOf } from './groupWindow';
 
 import {
@@ -1467,7 +1469,14 @@ export function createMakerHookSessionRunner(deps: {
             session.id, turnTextsFor(observer), extraImageAbsPaths, allowedFileRoots, log,
           )
           : { finalText: '' };
-        return { ...fail(err instanceof Error ? err.message : String(err)), ...collected };
+        // 额度类失败要说清是哪个供应商: 名字只在这里按需读一次(读不到退回「当前供应商」)。
+        const message = isQuotaExhaustionFailure(observer.errorData)
+          ? terminalErrorText(observer.errorData, {
+            providerLabel: await resolveSessionProviderLabel(session.id),
+            surface: 'official',
+          })
+          : err instanceof Error ? err.message : String(err);
+        return { ...fail(message), ...collected };
       } finally {
         // 无论正常收口还是超时/错误,未决交互都按默认收口并释放中央 route
         finalizeInteractions();
