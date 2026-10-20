@@ -1,4 +1,7 @@
+import { hasRichAnswer, richAnswerText } from '@cindy/maker-shared/rich-answer';
 import { BotLearningFooter } from '@/features/bots/BotLearningFooter';
+import { BotStarterOptions } from '@/features/bots/BotStarterOptions';
+import { stripStarterOptionList } from '../../../shared/botStarterOptions';
 import { BotSessionTaskResultCard } from '@/features/bots/BotSessionTaskResultCard';
 import { botTaskResultKey, type BotCollaborationMeta } from '@cindy/maker-shared/botCollaboration';
 /**
@@ -141,6 +144,7 @@ const StreamingBody = memo(function StreamingBody({
     <>
       {committedText && (
         <MarkdownRenderer
+            renderRichAnswers
           workingDir={workingDir}
           content={committedText}
           isStreaming
@@ -197,7 +201,11 @@ interface AssistantMessageProps {
   showActionBar?: boolean;
   /** 伙伴对话使用常显、无费用、无 Fork 的轻量消息操作栏。 */
   simplifiedBotConversation?: boolean;
+  failedSamplingAttempt?: boolean;
   botLearning?: unknown;
+  /** Market opening: starter choices rendered as buttons; hidden once the user has written in this task. */
+  botStarterOptions?: string[];
+  starterOptionsLocked?: boolean;
   botTaskResults?: BotCollaborationMeta[];
   /** Per-turn 费用 (USD) — 仅该轮最后一条 assistant 有值, action bar 时间旁显示。 */
   turnMoney?: RegionalMoney;
@@ -226,6 +234,7 @@ export const AssistantMessage = memo(function AssistantMessage({
   currentSessionId,
   currentSessionTitle,
   content,
+  failedSamplingAttempt,
   isStreaming,
   createdAt,
   messageClientId,
@@ -237,6 +246,8 @@ export const AssistantMessage = memo(function AssistantMessage({
   simplifiedBotConversation = false,
   botTaskResults,
   botLearning,
+  botStarterOptions,
+  starterOptionsLocked,
   turnMoney,
   turnCostUsd,
   turnCostIsEstimate,
@@ -315,7 +326,7 @@ export const AssistantMessage = memo(function AssistantMessage({
 
   // /goal:隐藏助手输出末尾由 goal 协议要求模型吐出的裁决 JSON 块(仅显示层剥离,
   // 原文仍保留在 DB / transcript)。pattern:末尾的 ```json {...goal_status...} ``` 围栏块。
-  const displayContent = stripGoalVerdictBlock(content);
+  const displayContent = stripStarterOptionList(stripGoalVerdictBlock(content), botStarterOptions ?? []);
   const streamFadeKey = messageClientId
     ? `${currentSessionId ?? ''}\u0000${messageClientId}`
     : undefined;
@@ -336,6 +347,11 @@ export const AssistantMessage = memo(function AssistantMessage({
           'text-[var(--msg-assistant-text)]',
         )}
       >
+        {failedSamplingAttempt && (
+          <div className="mb-1 text-13 font-normal leading-[1.384615]" style={{ color: 'var(--text-secondary)' }}>
+            {t('chat.failedSamplingAttempt')}
+          </div>
+        )}
         {ghostRenderCard && messageClientId && !showOriginal ? (
           // 出口钩子自绘:意识卡片替换气泡(净化后的静态 HTML,沙箱 iframe)。
           // 复用 GhostToolCard(自带主机身份头 + 主题注入 + 沙箱),turn 级无
@@ -350,7 +366,7 @@ export const AssistantMessage = memo(function AssistantMessage({
             running={false}
             sessionId={currentSessionId}
           />
-        ) : isStreaming && USE_LINE_COMMIT_STREAMING ? (
+        ) : isStreaming && USE_LINE_COMMIT_STREAMING && !hasRichAnswer(content) ? (
           <StreamingBody
             workingDir={workingDir}
             content={displayContent}
@@ -365,6 +381,7 @@ export const AssistantMessage = memo(function AssistantMessage({
           // MarkdownRenderer。isStreaming 透传 — true 时 MarkdownRenderer 内部启用
           // 100ms throttle, false 时无节流, 行为和该文件性能优化前完全一致。
           <MarkdownRenderer
+            renderRichAnswers
             workingDir={workingDir}
             content={displayContent}
             isStreaming={isStreaming}
@@ -410,9 +427,11 @@ export const AssistantMessage = memo(function AssistantMessage({
           </div>
         )}
       </div>
+      {simplifiedBotConversation && !isStreaming && content.trim() && botStarterOptions?.length
+        ? <BotStarterOptions options={botStarterOptions} locked={starterOptionsLocked === true} /> : null}
       {simplifiedBotConversation && !isStreaming && content.trim() && <BotLearningFooter receipts={botLearning} />}
       {simplifiedBotConversation && !isStreaming && botTaskResults?.length ? (
-        <div className="w-full max-w-[440px] min-w-0 space-y-2" data-bot-task-results>
+        <div className="w-full max-w-[560px] min-w-0" data-bot-task-results>
           {botTaskResults.map(card => <BotSessionTaskResultCard key={botTaskResultKey(card)}
             data={{ ...card }} sessionId={currentSessionId} attached />)}
         </div>
@@ -422,7 +441,7 @@ export const AssistantMessage = memo(function AssistantMessage({
       {!isStreaming && showActionBar && (
         <MessageActionBar
           createdAt={createdAt}
-          copyText={content}
+          copyText={richAnswerText(content)}
           copyLinkText={messageDeepLink}
           align="left"
           hovered={hovered}

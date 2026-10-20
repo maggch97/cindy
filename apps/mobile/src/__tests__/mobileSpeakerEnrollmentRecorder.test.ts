@@ -135,4 +135,57 @@ describe('speaker enrollment microphone lifecycle', () => {
     expect(audio.get).not.toHaveBeenCalled();
     expect(audio.start).not.toHaveBeenCalled();
   });
+
+  it('keeps only captured audio when the user finishes early, ignoring late chunks', async () => {
+    const finish = new AbortController();
+    const progress = vi.fn();
+    const recording = recordMobileSpeakerClip({ durationMs: 30_000, stopSignal: finish.signal, onProgress: progress });
+    await flush();
+    const pcm = new Int16Array(12 * 16_000).fill(1234);
+    audio.start.mock.calls[0][0].onChunk({ pcm16: pcm.buffer });
+    finish.abort();
+    emit(16_000);
+    const clip = await recording;
+    expect(new Int16Array(clip)).toEqual(pcm);
+    expect(progress).toHaveBeenCalledExactlyOnceWith(0.4);
+    expect(stop).toHaveBeenCalledOnce();
+  });
+
+  it('continues beyond six seconds and automatically caps the clip at thirty seconds', async () => {
+    const resolved = vi.fn();
+    const recording = recordMobileSpeakerClip({ durationMs: 30_000 }).then((clip) => { resolved(); return clip; });
+    await flush();
+    emit(6 * 16_000);
+    await flush();
+    expect(resolved).not.toHaveBeenCalled();
+    emit(25 * 16_000);
+    expect((await recording).byteLength).toBe(30 * 16_000 * 2);
+    expect(stop).toHaveBeenCalledOnce();
+  });
+
+  it('does not create an empty clip when stopped before audio arrives', async () => {
+    const finish = new AbortController();
+    const recording = recordMobileSpeakerClip({ durationMs: 30_000, stopSignal: finish.signal });
+    const rejected = expect(recording).rejects.toBeInstanceOf(MobileSpeakerEnrollmentNoAudioError);
+    await flush();
+    finish.abort();
+    await rejected;
+    expect(stop).toHaveBeenCalledOnce();
+  });
+
+  it('cancellation still discards a manually finished clip while the microphone is stopping', async () => {
+    const finish = new AbortController();
+    const cancel = new AbortController();
+    const stopping = deferred<void>();
+    stop.mockReturnValueOnce(stopping.promise);
+    const recording = recordMobileSpeakerClip({ durationMs: 30_000, stopSignal: finish.signal, signal: cancel.signal });
+    const rejected = expect(recording).rejects.toBeInstanceOf(MobileSpeakerEnrollmentAbortedError);
+    await flush();
+    emit(16_000);
+    finish.abort();
+    await flush();
+    cancel.abort();
+    stopping.resolve();
+    await rejected;
+  });
 });

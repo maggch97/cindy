@@ -92,6 +92,11 @@
 - 新增或修改任何界面、组件、布局、样式、动效或 UI 文案前，必须先读权威设计规范
   `docs/design-rules/DESIGN.md`；设计文档索引见
   `docs/design-rules/cindy-design-system.md`。
+- 改完 Desktop renderer 界面（组件、样式、布局、文案、深浅色、多语言）后自检，先运行
+  `pnpm ui:check --changed --theme all` 并查看输出的 `overview.png`，无需为此启动完整
+  Desktop；输出中 `UNCOVERED` 的文件未被验证。发 PR 时运行 `pnpm ui:check:publish`，把输出的
+  带图内容写进「UI 变化」。按改动类型选择验证方式见
+  `docs/dev-rules/desktop-development.md`「按改动选择验证方式」。
 - 新增或修改 Mobile（`apps/mobile`）界面上的文字前，必须先查
   `apps/mobile/docs/mobile-design-guide.md` §3「文字规范速查」：先定角色，再整行照抄字号、
   行高、字重、字色；五档中性字色、浅色字不配粗字重、11 档字号、必须配行高四条由
@@ -156,6 +161,15 @@
 - 新增或修改 Desktop 日志、IPC 错误处理、main 侧业务逻辑与测试、跨平台（macOS／
   Windows）行为，或任何 UI 文案的 i18n 落地前，必须先读
   `docs/dev-rules/engineering-conventions.md`。
+- 新增或改写任一测试前，必须先读
+  `docs/dev-rules/engineering-conventions.md` §3.2「新增测试的价值门槛」。测试必须通过
+  真实生产入口验证可观察结果，并说明 Bug／规则依据、现有覆盖缺口、最小失败输入和 tier；
+  没有新的结果、错误、权限、持久化、协议或时序差异时停止增加用例。纯跨文件安全、
+  权限、协议或设计契约才进入 guard；不得为了覆盖率、测试数量或复制常量／JSX／CSS／
+  源码字面量而新增测试。同时遵守该节「性能预算」：新文件单独运行本机 5 秒内并在 PR
+  填实测耗时；被测模块只加载一次，不在 `beforeEach`／逐用例 helper 里 `vi.resetModules()`；
+  不做 ≥100ms 真实等待；同一模块的用例并入已有文件。`pnpm check:test-hygiene` 在 CI
+  阻断违规，基线只减不增，不得手改基线放行。
 - 修改客户端日志采集／脱敏／上报链路（`apps/desktop/src/main/log-upload/**`）、`logger.ts`
   的 main 日志行格式、崩溃判定或待补传标记前，必须先读
   `docs/dev-rules/log-upload-and-redaction.md`。其中三条是**不变量**：**记录边界**（写侧

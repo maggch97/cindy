@@ -6,6 +6,7 @@
  * base64，main 会拒收），而 main 的图片缓存并不按 scope 落盘——所以给每个群一个
  * 稳定、不会与真实任务 id 撞上的 scope，同时用作输入框草稿键。
  */
+import type { JSONContent } from '@tiptap/core';
 import { serializeAttachedFiles } from '@/lib/messageAttachmentPayload';
 import { categorizeFile, extractExt, type AttachedFile } from '@/lib/fileTypes';
 import type { BotGroupAttachment, BotGroupAttachmentInput, BotGroupMessageView } from '../../../shared/botGroupChat';
@@ -13,6 +14,43 @@ import type { BotGroupAttachment, BotGroupAttachmentInput, BotGroupMessageView }
 /** Attachment cache scope and composer draft key of one group (never a task id). */
 export function botGroupAttachmentScope(groupId: string): string {
   return `bot-group:${groupId}`;
+}
+
+/** Draft key of a 话题's reply box; text only (thread replies carry no attachments). */
+export function botGroupThreadDraftKey(groupId: string, rootId: string): string {
+  return `${botGroupAttachmentScope(groupId)}:thread:${rootId}`;
+}
+
+/**
+ * The group composer is a plain textarea, so its draft text is stored in the shared draft
+ * store as one paragraph per line — a document the store understands (draft presence, owner
+ * scoping) and that reads back to exactly the same text.
+ */
+export function botGroupDraftDoc(text: string): JSONContent {
+  return {
+    type: 'doc',
+    content: text.split('\n').map((line) => (line ? { type: 'paragraph', content: [{ type: 'text', text: line }] } : { type: 'paragraph' })),
+  };
+}
+
+export function botGroupDraftText(doc: JSONContent | null | undefined): string {
+  if (!doc) return '';
+  const textOf = (node: JSONContent): string =>
+    node.type === 'text' ? node.text ?? '' : node.type === 'hardBreak' ? '\n' : (node.content ?? []).map(textOf).join('');
+  return (doc.content ?? []).map(textOf).join('\n');
+}
+
+/** A tray file as the optimistic copy of a message shows it before main has it. */
+export function botGroupAttachmentPreview(file: AttachedFile): BotGroupAttachment {
+  return {
+    id: file.id,
+    name: file.name,
+    category: file.category,
+    mimeType: file.mimeType,
+    size: file.size,
+    url: file.url ?? null,
+    path: file.path || null,
+  };
 }
 
 /** The tray's files in the shape `sendBotGroupMessage` takes. */

@@ -26,6 +26,8 @@ import { ArrowRight } from 'lucide-react';
 import { visibleAskOptions } from '@cindy/maker-shared';
 
 import { InteractionPromptCardShell } from '@/components/interaction-portal';
+import { ChatSessionFileProvider, useChatSessionFile, useChatSessionFileValue } from '@/components/chat/ChatSessionFileContext';
+import { QuestionReferenceText } from '@/components/chat/MarkdownRenderer';
 import { Tip } from '@/components/ui/tooltip';
 import { useAutoResize } from '@/hooks/useAutoResize';
 import { shouldCardShortcutYield } from '@/lib/editableKeyboardTarget';
@@ -71,6 +73,9 @@ function AutoGrowingAnswerTextarea({
 // ---------------------------------------------------------------------------
 
 interface AskUserQuestionPromptProps {
+  sessionId?: string;
+  workingDir?: string;
+  remoteHostId?: string | null;
   pending: PendingAskUser;
   onAnswer: (requestId: string, answers: Record<string, string>) => void;
   /**
@@ -105,8 +110,14 @@ interface AskUserQuestionPromptProps {
 
 export function AskUserQuestionPrompt({
   sessionId,
+  workingDir,
+  remoteHostId,
   ...props
-}: AskUserQuestionPromptProps & { sessionId: string | undefined }) {
+}: AskUserQuestionPromptProps) {
+  const inheritedFileContext = useChatSessionFile();
+  const ownFileContext = useChatSessionFileValue(sessionId, workingDir ?? '', remoteHostId);
+  const fileContext = workingDir === undefined && inheritedFileContext.sessionId === sessionId
+    ? inheritedFileContext : ownFileContext;
   // Match the store's content comparison, including option order and metadata.
   // Fixed field order avoids treating JSON property order as a new question;
   // absent and empty options are equivalent, as in the reducer.
@@ -119,7 +130,9 @@ export function AskUserQuestionPrompt({
   const formKey = JSON.stringify([sessionId, props.pending.requestId, questionsIdentity]);
   // Repeated snapshots keep this form mounted. A changed session, request or
   // question starts from its own draft (cleared by the store on content changes).
-  return <AskUserQuestionForm key={formKey} {...props} />;
+  return <ChatSessionFileProvider value={fileContext}>
+    <AskUserQuestionForm key={formKey} {...props} />
+  </ChatSessionFileProvider>;
 }
 
 function AskUserQuestionForm({
@@ -133,6 +146,7 @@ function AskUserQuestionForm({
   const { t } = useTranslation();
   const { requestId, questions } = pending;
   const totalQuestions = questions.length;
+  const [referencePreviewOpen, setReferencePreviewOpen] = useState(false);
 
   // ── Wizard state ──
   // F-AUQ-DRAFT: lazy-init from the per-session store so a remount caused by
@@ -153,10 +167,18 @@ function AskUserQuestionForm({
     draft && draft.requestId === requestId ? draft.answers : {},
   );
   // Multi-select: set of selected labels for current question
-  const [selectedLabels, setSelectedLabels] = useState<Set<string>>(new Set());
+  const [selectedLabels, setSelectedLabels] = useState<Set<string>>(() => new Set(draft?.selectedLabels ?? []));
   // Custom input
-  const [customInput, setCustomInput] = useState('');
-  const [showCustomInput, setShowCustomInput] = useState(false);
+  const [customInput, setCustomInput] = useState(draft?.customInput ?? '');
+  const [showCustomInput, setShowCustomInput] = useState(draft?.showCustomInput ?? false);
+  const startedRef = useRef(draft?.started === true);
+  const draftRef = useRef<AskUserDraft>({ requestId, currentIndex, answers });
+  draftRef.current = { requestId, currentIndex, answers, customInput, showCustomInput,
+    selectedLabels: [...selectedLabels], started: startedRef.current };
+  const markStarted = useCallback(() => {
+    startedRef.current = true;
+    onDraftChange({ ...draftRef.current, started: true });
+  }, [onDraftChange]);
   const cardRef = useRef<HTMLElement | null>(null);
   const setCardNode = useCallback((node: HTMLElement | null) => {
     cardRef.current = node;
@@ -220,25 +242,20 @@ function AskUserQuestionForm({
   );
 
   // ── Restore multi-select state when navigating back ──
+  const restoredIndexRef = useRef(currentIndex);
   useEffect(() => {
+    if (draft?.customInput !== undefined && restoredIndexRef.current === currentIndex) return;
+    restoredIndexRef.current = currentIndex;
     const result = computeSelectionForIndex(currentIndex, answers);
     setSelectedLabels(result.labels);
     setCustomInput(result.custom);
     setShowCustomInput(result.showCustom);
   }, [currentIndex, computeSelectionForIndex, answers]);
 
-  // ── F-AUQ-DRAFT: write wizard progress back to the per-session store on
-  // every change so a session-switch unmount doesn't lose it. The store has
-  // an equality short-circuit (same requestId + currentIndex + answers
-  // identity) so the first effect run after a hydrating mount is a no-op
-  // (we initialized from the very same draft object). Derived state
-  // (selectedLabels / customInput / showCustomInput) is intentionally NOT
-  // persisted — `computeSelectionForIndex` rebuilds it from `answers` on
-  // mount via the effect above, so persisting it would create a second
-  // source of truth that could drift. ──
+  // Save the unfinished field as well as completed answers across unmounts.
   useEffect(() => {
-    onDraftChange({ requestId, currentIndex, answers });
-  }, [requestId, currentIndex, answers, onDraftChange]);
+    onDraftChange(draftRef.current);
+  }, [requestId, currentIndex, answers, customInput, selectedLabels, showCustomInput, onDraftChange]);
 
   // ── Snapshot current buttons before animation starts ──
   const snapshotButtons = useCallback(() => {
@@ -274,12 +291,12 @@ function AskUserQuestionForm({
         <div className={skipClass}>{t('chat.askUserQuestion.skip')}</div>
         {showNext && (
           <div className={nextClass}>
-            {isLastQuestion ? t('chat.askUserQuestion.submit') : t('chat.askUserQuestion.next')}
+            {isLastQuestion ? t(pending.resumeOnSubmit ? 'chat.askUserQuestion.sendAndContinue' : 'chat.askUserQuestion.submit') : t('chat.askUserQuestion.next')}
           </div>
         )}
       </>
     );
-  }, [currentIndex, isMultiSelect, isLastQuestion, existingAnswer, selectedLabels, customInput, t]);
+  }, [currentIndex, isMultiSelect, isLastQuestion, existingAnswer, selectedLabels, customInput, pending.resumeOnSubmit, t]);
 
   // ── Advance to next question or submit all ──
   const advance = useCallback(
@@ -324,20 +341,22 @@ function AskUserQuestionForm({
   // ── Single-select: click option -> advance ──
   const handleSingleSelect = useCallback(
     (label: string) => {
+      markStarted();
       advance(label);
     },
-    [advance],
+    [advance, markStarted],
   );
 
   // ── Multi-select: toggle checkbox ──
   const handleToggle = useCallback((label: string) => {
+    markStarted();
     setSelectedLabels((prev) => {
       const next = new Set(prev);
       if (next.has(label)) next.delete(label);
       else next.add(label);
       return next;
     });
-  }, []);
+  }, [markStarted]);
 
   // ── Multi-select: Next button → encode as JSON array string ──
   const handleNext = useCallback(() => {
@@ -391,8 +410,8 @@ function AskUserQuestionForm({
       return;
     }
     advance(trimmed);
-    setCustomInput('');
-    setShowCustomInput(false);
+    // advance restores the next page when navigating. On the final page keep
+    // this field retryable until the host confirms and removes the card.
   }, [customInput, isMultiSelect, advance]);
 
   // ── Direct free-text answer when no option rows render ──
@@ -407,6 +426,9 @@ function AskUserQuestionForm({
   // ── Keyboard shortcuts ──
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      // File previews can keep focus on their question link. Their keys must
+      // never select or skip an answer, including during the closing fade.
+      if (referencePreviewOpen) return;
       // F-AUQ-MIN-5: minimized 时数字键 1-N / 回车 / N+1 全部透传，
       // 避免"无视觉反馈地选中选项"。Escape 仍保留——满足 F-AUQ-MIN-5 的取消语义。
       if (viewerState === 'minimized' && e.key !== 'Escape') return;
@@ -464,6 +486,7 @@ function AskUserQuestionForm({
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
   }, [
+    referencePreviewOpen,
     viewerState,
     options,
     showCustomInput,
@@ -483,6 +506,12 @@ function AskUserQuestionForm({
 
   const footerActions = (
     <div className="flex gap-2.5">
+      {pending.delivery === 'async' && startedRef.current && (
+        <Button variant="secondary" palette="confirmation" size="lg" compact
+          type="button" onClick={() => onAnswer(requestId, {})}>
+          {t('chat.askUserQuestion.close')}
+        </Button>
+      )}
       {isAnimating ? (
         buttonsSnapshotRef.current
       ) : (
@@ -535,7 +564,7 @@ function AskUserQuestionForm({
                   : existingAnswer === undefined
               }
             >
-              {isLastQuestion ? t('chat.askUserQuestion.submit') : t('chat.askUserQuestion.next')}
+              {isLastQuestion ? t(pending.resumeOnSubmit ? 'chat.askUserQuestion.sendAndContinue' : 'chat.askUserQuestion.submit') : t('chat.askUserQuestion.next')}
             </Button>
           )}
         </>
@@ -581,7 +610,8 @@ function AskUserQuestionForm({
             <AutoGrowingAnswerTextarea
               textareaRef={inputRef}
               value={customInput}
-              onChange={(e) => setCustomInput(e.target.value)}
+              onCompositionStart={markStarted}
+              onChange={(e) => { markStarted(); setCustomInput(e.target.value); }}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
                   e.preventDefault();
@@ -620,7 +650,7 @@ function AskUserQuestionForm({
                   )}
                 >
                   {isLastQuestion ? (
-                    t('chat.askUserQuestion.submit')
+                    t(pending.resumeOnSubmit ? 'chat.askUserQuestion.sendAndContinue' : 'chat.askUserQuestion.submit')
                   ) : (
                     <ArrowRight size={15} strokeWidth={2} aria-hidden="true" />
                   )}
@@ -689,8 +719,8 @@ function AskUserQuestionForm({
         {/* Question Row (header chip moved to top header bar above) */}
         <div className="flex flex-col gap-2">
           <div className="flex items-center justify-between">
-            <span className="text-15 font-medium text-[var(--ask-header-text)]">
-              {currentQ?.question}
+            <span className="min-w-0 break-words text-15 font-medium text-[var(--ask-header-text)]">
+              <QuestionReferenceText text={currentQ?.question ?? ''} onPreviewOpenChange={setReferencePreviewOpen} />
             </span>
             {pageIndicator && (
               <span className="ml-4 shrink-0 text-13 text-[var(--ask-page-text)]">
@@ -773,7 +803,8 @@ function AskUserQuestionForm({
             <AutoGrowingAnswerTextarea
               textareaRef={inputRef}
               value={customInput}
-              onChange={(e) => setCustomInput(e.target.value)}
+              onCompositionStart={markStarted}
+              onChange={(e) => { markStarted(); setCustomInput(e.target.value); }}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
                   e.preventDefault();
@@ -808,7 +839,7 @@ function AskUserQuestionForm({
                 )}
               >
                 {isLastQuestion ? (
-                  t('chat.askUserQuestion.submit')
+                  t(pending.resumeOnSubmit ? 'chat.askUserQuestion.sendAndContinue' : 'chat.askUserQuestion.submit')
                 ) : (
                   <ArrowRight size={17} strokeWidth={2} aria-hidden="true" />
                 )}

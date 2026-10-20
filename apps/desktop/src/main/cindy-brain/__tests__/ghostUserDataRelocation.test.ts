@@ -192,7 +192,7 @@ it('completes source replacement and another plugin uninstall without reversing 
   const archive = '_ns__cindy-archive-00000000-0000-4000-8000-000000000002__helper';
   const service = createPluginTaskService({
     store: tasks, assertCurrent: () => {}, assertAuthorized: vi.fn(), readPermissionMode: vi.fn(),
-    resolveRoute: vi.fn(), createSession: vi.fn(), readSession: vi.fn(), readLiveSession: vi.fn(),
+    readModelPreference: vi.fn(), resolveRoute: vi.fn(), createSession: vi.fn(), readSession: vi.fn(), readLiveSession: vi.fn(),
     dispatch: vi.fn(), inspect: vi.fn(), cancel: vi.fn(),
   });
   let entered!: () => void, finish!: () => void;
@@ -217,14 +217,19 @@ it('completes source replacement and another plugin uninstall without reversing 
   const code = ts.transpileModule(`return (async () => { ${source.slice(start, end)} })();`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022 },
   }).outputText;
-  const remove = new Function('activeOwnerScopeKey', 'pluginTaskUninstaller', 'storagePart', 'manager', 'relId', 'throwUninstallError', code);
+  const remove = new Function('activeOwnerScopeKey', 'pluginTaskUninstaller', 'storagePart', 'manager', 'relId', 'throwUninstallError', 'currentPluginUsageService', 'log', 'options', code);
+  const detach = vi.fn(async () => {});
+  const log = { warn: vi.fn() };
   const removing = remove(() => scope.dir, (id: string, callback: () => Promise<void>) => service.withUninstall(id, callback),
-    '_root__other', manager, '_ns/_root/other', (failure: { reason: string }) => { throw new Error(failure.reason); });
+    '_root__other', manager, '_ns/_root/other', (failure: { reason: string }) => { throw new Error(failure.reason); },
+    () => ({ detach }), log, {});
   await new Promise<void>(resolve => setImmediate(resolve));
   finish();
   const [updated] = await Promise.all([updating, removing]);
   expect(updated).toMatchObject({ ghost: { manifest: { version: '2.0.0' } } });
   expect(manager.list().some(ghost => ghost.manifest.id === 'other')).toBe(false);
+  expect(detach).toHaveBeenCalledExactlyOnceWith('_root__other');
+  expect(log.warn).not.toHaveBeenCalled();
   expect((await tasks.get('task'))?.pluginId).toBe(archive);
 });
 

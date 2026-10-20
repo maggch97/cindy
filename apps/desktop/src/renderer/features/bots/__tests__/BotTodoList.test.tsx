@@ -1,43 +1,70 @@
 // @vitest-environment jsdom
-
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
-import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import type { ReactNode } from 'react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { TeammateTodo } from '@cindy/maker-shared/teammate-todo';
 import { TodoPanel, type TodoTransport } from '../BotTodoList';
 
 vi.mock('react-i18next', () => ({
-  useTranslation: () => ({
-    t: (key: string) => key.replace('teammateTodo.', ''),
-    i18n: { language: 'en' },
-  }),
+  useTranslation: () => ({ t: (key: string) => key, i18n: { language: 'en' } }),
+}));
+// Radix 浮层在 jsdom 里不真的开合:菜单摊平成按钮,确认框只在 open 时渲染标题与两个按钮。
+vi.mock('@/components/ui/dropdown-menu', () => {
+  const Pass = ({ children }: { children?: ReactNode }) => <>{children}</>;
+  return {
+    DropdownMenu: Pass,
+    DropdownMenuTrigger: Pass,
+    DropdownMenuContent: ({ children }: { children: ReactNode }) => <div role="menu">{children}</div>,
+    DropdownMenuItem: ({ children, onSelect }: { children: ReactNode; onSelect?: () => void }) => (
+      <button type="button" role="menuitem" onClick={onSelect}>
+        {children}
+      </button>
+    ),
+    DropdownMenuLabel: Pass,
+    DropdownMenuSeparator: () => null,
+    DropdownMenuRadioGroup: Pass,
+    DropdownMenuRadioItem: ({ children }: { children: ReactNode }) => <span>{children}</span>,
+  };
+});
+vi.mock('@/components/ui/confirm-dialog', () => ({
+  ConfirmDialog: (p: {
+    open: boolean;
+    title: string;
+    description?: string;
+    confirmText?: string;
+    cancelText?: string;
+    onConfirm?: () => void;
+    onOpenChange: (open: boolean) => void;
+  }) =>
+    p.open ? (
+      <div role="dialog" aria-label={p.title}>
+        <p>{p.description}</p>
+        <button type="button" onClick={() => p.onConfirm?.()}>
+          {p.confirmText}
+        </button>
+        <button type="button" onClick={() => p.onOpenChange(false)}>
+          {p.cancelText}
+        </button>
+      </div>
+    ) : null,
 }));
 
-beforeAll(() => {
-  // jsdom lacks the pointer and scrolling APIs used by the real Radix Select.
-  window.HTMLElement.prototype.hasPointerCapture ??= () => false;
-  window.HTMLElement.prototype.setPointerCapture ??= () => {};
-  window.HTMLElement.prototype.releasePointerCapture ??= () => {};
-  window.HTMLElement.prototype.scrollIntoView ??= () => {};
-});
-afterEach(cleanup);
-
-function todo(id: string, patch: Partial<TeammateTodo> = {}): TeammateTodo {
+function todo(patch: Partial<TeammateTodo> = {}): TeammateTodo {
   return {
-    id,
-    revision: 1,
-    key: id,
+    id: 'todo-1',
+    revision: 3,
+    key: 'user:1',
     origin: 'assigned',
-    title: id,
+    title: '回复 Dash 的部署窗口问题',
     progress: '',
     outcome: '',
     value: '',
     next: null,
-    sources: [],
+    sources: [{ kind: 'feishu', id: 'm1', label: '飞书' }] as TeammateTodo['sources'],
     associations: [],
     status: 'open',
-    createdAt: '2026-01-01T00:00:00Z',
-    updatedAt: '2026-01-01T00:00:00Z',
+    createdAt: '2026-10-01T00:00:00.000Z',
+    updatedAt: '2026-10-01T00:00:00.000Z',
     sourceDeadline: null,
     deadlineCandidate: null,
     suggestedDate: null,
@@ -48,159 +75,59 @@ function todo(id: string, patch: Partial<TeammateTodo> = {}): TeammateTodo {
   };
 }
 
-async function mount(items: TeammateTodo[]) {
-  const transport: TodoTransport = {
-    list: vi.fn(async () => ({ items })),
-    update: vi.fn(),
-    act: vi.fn(),
+let transport: TodoTransport & { update: ReturnType<typeof vi.fn> };
+beforeEach(() => {
+  transport = {
+    list: vi.fn(async () => ({ items: [todo()] })),
+    update: vi.fn(async () => todo()),
+    act: vi.fn(async () => null),
   };
-  const view = render(<TodoPanel transport={transport} />);
-  await waitFor(() => expect(screen.queryByRole('status')).toBeNull());
-  return { ...view, transport };
+});
+afterEach(cleanup);
+
+async function openRow() {
+  render(<TodoPanel transport={transport} />);
+  return within(await screen.findByRole('listitem'));
 }
 
-async function choose(label: string, option: string) {
-  const user = userEvent.setup();
-  const trigger = screen.getByRole('combobox', { name: label });
-  trigger.focus();
-  await user.keyboard('{ArrowDown}');
-  await user.click(await screen.findByRole('option', { name: option }));
-  await waitFor(() => expect(screen.queryByRole('listbox')).toBeNull());
-}
+it('shows one title line and a due · origin · source meta line, without an empty date button', async () => {
+  const row = await openRow();
+  expect(row.getByText('回复 Dash 的部署窗口问题')).toBeTruthy();
+  expect(row.getByText('teammateTodo.assigned · 飞书')).toBeTruthy();
+  expect(row.queryByRole('button', { name: 'teammateTodo.deadline' })).toBeNull();
+});
 
-describe('TodoPanel filters', () => {
-  it('uses the shared themed Select for all three filters, without native selects', async () => {
-    const { container } = await mount([]);
-    expect(container.querySelector('select')).toBeNull();
-    expect(screen.getAllByRole('combobox')).toHaveLength(3);
-    for (const [label, value] of [
-      ['open', 'open'],
-      ['origin', 'all'],
-      ['order', 'dueOrder'],
-    ]) {
-      const trigger = screen.getByRole('combobox', { name: label });
-      expect(trigger.textContent).toBe(value);
-      expect(trigger.className).toContain('cindy-button');
-      expect(trigger.className).toContain('rounded-full');
-      expect(trigger.getAttribute('data-press-feedback')).toBe('none');
-    }
-    fireEvent.keyDown(screen.getByRole('combobox', { name: 'open' }), { key: 'ArrowDown' });
-    const panel = await screen.findByRole('listbox');
-    expect(container.contains(panel)).toBe(false);
-    expect(panel.className).toContain('w-[var(--radix-select-trigger-width)]');
-    expect(panel.className).toContain('bg-[var(--surface-elevated)]');
-    expect(screen.getByRole('option', { name: 'open' }).getAttribute('aria-selected')).toBe('true');
-  });
+it.each([
+  ['delete', 'teammateTodo.deleteConfirmTitle'],
+  ['mute', 'teammateTodo.muteConfirmTitle'],
+] as const)('asks before %s and only writes after confirming', async (operation, title) => {
+  const row = await openRow();
+  fireEvent.click(row.getByRole('menuitem', { name: `teammateTodo.${operation}` }));
+  const dialog = await screen.findByRole('dialog', { name: title });
+  expect(transport.update).not.toHaveBeenCalled();
+  fireEvent.click(within(dialog).getByRole('button', { name: `teammateTodo.${operation}` }));
+  await waitFor(() =>
+    expect(transport.update).toHaveBeenCalledWith({ operation, id: 'todo-1', expectedRevision: 3 }),
+  );
+  await waitFor(() => expect(screen.queryByRole('dialog', { name: title })).toBeNull());
+});
 
-  it('switches between open and hidden todos without mutating the transport', async () => {
-    const { transport } = await mount([
-      todo('active'),
-      todo('ignored', { decision: { kind: 'muted' } }),
-    ]);
-    expect(screen.queryByRole('button', { name: 'ignored' })).toBeNull();
-    await choose('open', 'hidden');
-    expect(screen.getByRole('button', { name: 'ignored' })).toBeTruthy();
-    expect(screen.queryByRole('button', { name: 'active' })).toBeNull();
-    await choose('open', 'open');
-    expect(screen.getByRole('button', { name: 'active' })).toBeTruthy();
-    expect(transport.update).not.toHaveBeenCalled();
-    expect(transport.act).not.toHaveBeenCalled();
-  });
+it.each(['delete', 'mute'] as const)('cancelling %s writes nothing', async (operation) => {
+  const row = await openRow();
+  fireEvent.click(row.getByRole('menuitem', { name: `teammateTodo.${operation}` }));
+  const dialog = await screen.findByRole('dialog');
+  fireEvent.click(within(dialog).getByRole('button', { name: 'teammateTodo.cancel' }));
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  expect(transport.update).not.toHaveBeenCalled();
+});
 
-  it('combines origin selection with search for open and completed todos', async () => {
-    await mount([
-      todo('assigned match'),
-      todo('discovered match', { origin: 'discovered' }),
-      todo('assigned done match', { status: 'done' }),
-      todo('discovered done match', { status: 'done', origin: 'discovered' }),
-      todo('discovered other', { origin: 'discovered' }),
-    ]);
-    fireEvent.change(screen.getByRole('textbox', { name: 'search' }), {
-      target: { value: 'match' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'done · 2' }));
-    await choose('origin', 'discovered');
-    expect(screen.getByRole('button', { name: 'discovered match' })).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'discovered done match' })).toBeTruthy();
-    for (const name of ['assigned match', 'assigned done match', 'discovered other']) {
-      expect(screen.queryByRole('button', { name })).toBeNull();
-    }
-    await choose('origin', 'assigned');
-    expect(screen.getByRole('button', { name: 'assigned match' })).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'assigned done match' })).toBeTruthy();
-  });
-
-  it('reorders both open and completed lists using the existing comparators', async () => {
-    const deadline = { kind: 'date', date: '2026-12-01', timeZone: 'UTC' } as const;
-    const { container } = await mount([
-      todo('older'),
-      todo('due', { createdAt: '2026-02-01T00:00:00Z', sourceDeadline: deadline }),
-      todo('older done', { status: 'done' }),
-      todo('due done', {
-        status: 'done',
-        createdAt: '2026-02-01T00:00:00Z',
-        sourceDeadline: deadline,
-      }),
-    ]);
-    fireEvent.click(screen.getByRole('button', { name: 'done · 2' }));
-    const ids = () =>
-      Array.from(container.querySelectorAll('[data-todo-id]'), (row) =>
-        row.getAttribute('data-todo-id'),
-      );
-    expect(ids()).toEqual(['due', 'older', 'due done', 'older done']);
-    await choose('order', 'createdOrder');
-    expect(ids()).toEqual(['older', 'due', 'older done', 'due done']);
-    await choose('order', 'dueOrder');
-    expect(ids()).toEqual(['due', 'older', 'due done', 'older done']);
-  });
-
-  it.each([
-    ['open', 'hidden'],
-    ['origin', 'assigned'],
-    ['order', 'createdOrder'],
-  ])('resets both pagination controls when changing %s', async (label, option) => {
-    await mount(
-      Array.from({ length: 30 }, (_, index) => [
-        todo(`assigned ${index}`),
-        todo(`discovered ${index}`, { origin: 'discovered' }),
-        todo(`hidden ${index}`, { decision: { kind: 'muted' } }),
-        todo(`done ${index}`, { status: 'done' }),
-      ]).flat(),
-    );
-    fireEvent.click(screen.getByRole('button', { name: 'done · 30' }));
-    for (const next of screen.getAllByRole('button', { name: 'following' })) fireEvent.click(next);
-    expect(
-      screen
-        .getAllByRole<HTMLButtonElement>('button', { name: 'previous' })
-        .every((button) => !button.disabled),
-    ).toBe(true);
-    await choose(label, option);
-    expect(
-      screen
-        .getAllByRole<HTMLButtonElement>('button', { name: 'previous' })
-        .every((button) => button.disabled),
-    ).toBe(true);
-  });
-
-  it('supports keyboard selection, Escape dismissal and returning focus to the trigger', async () => {
-    await mount([]);
-    const user = userEvent.setup();
-    const trigger = screen.getByRole('combobox', { name: 'open' });
-    trigger.focus();
-    await user.keyboard('{ArrowDown}');
-    await screen.findByRole('listbox');
-    await waitFor(() =>
-      expect(document.activeElement).toBe(screen.getByRole('option', { name: 'open' })),
-    );
-    await user.keyboard('{ArrowDown}{Enter}');
-    await waitFor(() => expect(screen.queryByRole('listbox')).toBeNull());
-    expect(trigger.textContent).toBe('hidden');
-    await waitFor(() => expect(document.activeElement).toBe(trigger));
-    await user.keyboard('{Enter}');
-    await screen.findByRole('listbox');
-    await user.keyboard('{Escape}');
-    await waitFor(() => expect(screen.queryByRole('listbox')).toBeNull());
-    expect(trigger.textContent).toBe('hidden');
-    await waitFor(() => expect(document.activeElement).toBe(trigger));
-  });
+it('puts the next action first in the row menu instead of a separate pill', async () => {
+  transport.list = vi.fn(async () => ({
+    items: [todo({ next: { kind: 'advance', label: '让伙伴接着做', instruction: '回复' } as TeammateTodo['next'] })],
+  }));
+  const row = await openRow();
+  const items = row.getAllByRole('menuitem');
+  expect(items[0]!.textContent).toBe('让伙伴接着做');
+  fireEvent.click(items[0]!);
+  await waitFor(() => expect(transport.act).toHaveBeenCalledWith(expect.objectContaining({ id: 'todo-1', revision: 3 })));
 });

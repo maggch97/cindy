@@ -75,7 +75,7 @@ export function isPluginTeamPlanWithinBudget(plan: unknown): boolean {
 }
 export type PluginTaskRequest = (
   | { type: 'tasks-request'; kind: 'capabilities' | 'models' }
-  | { type: 'tasks-request'; kind: 'setModel'; taskId: string; expectedRevision: number; route: PluginTaskRoute }
+  | { type: 'tasks-request'; kind: 'setModel'; taskId: string; expectedRevision: number; route: PluginTaskRoute | 'plugin-default' }
   | {
       type: 'tasks-request';
       kind: 'create';

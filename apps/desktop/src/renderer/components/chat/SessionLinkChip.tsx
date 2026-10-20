@@ -15,8 +15,8 @@
  * inline-flex 不打断文本流;不硬编码颜色(规则 16)。
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { CornerDownRight } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState, type MouseEvent } from 'react';
+import { AppWindow, CornerDownRight } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 
@@ -28,13 +28,19 @@ import { parseSessionDeepLinkHref } from '@/lib/deepLink';
 import { getSessionRouteOwnerId, resolveSessionRoute } from '@/lib/orcaSessionIdentity';
 import { resolveSessionMessageText } from '@/lib/sessionMessageText';
 import * as sessionService from '@/lib/sessionService';
-import { remoteProjectsStore, useRemoteProjectSessions } from '@/features/device-link/remoteProjectsStore';
+import {
+  remoteProjectsStore,
+  useRemoteProjectSessions,
+} from '@/features/device-link/remoteProjectsStore';
 import {
   useSessionNavigationIntent,
   useSessionNavigationMode,
 } from '@/features/cc-agent/embeddedSessionNavigation';
 import { InlineReferenceChip } from './InlineReferenceChip';
 import { QuoteChip } from './QuoteChip';
+import { toast } from '@/lib/toast';
+import { useLinkContextMenu } from './useLinkContextMenu';
+import { activateInlineLinkFromKeyboard, isSeparateLinkActivation } from './linkInteraction';
 
 const MESSAGE_LINK_LABEL_MAX = 240;
 
@@ -110,28 +116,33 @@ export function SessionLinkChip({ href, label }: SessionLinkChipProps) {
     };
   }, [sessionId, messageClientId]);
 
-  // 深链形状不合法(理论上被 tokenizer / 渲染分支挡住,防御性兜底)→ 纯文本。
-  if (!target || !sessionId) return <span>{label ?? href}</span>;
-
   const remoteSession = remoteSessions.find((s) => s.id === sessionId) ?? null;
   const remoteTitle = fetchedTitle ? null : remoteSession?.title?.trim() || null;
-  const handleClick = () => {
+  const openTarget = async (separate: boolean) => {
+    if (!target || !sessionId) return;
     const navigationRequestVersion = ++navigationRequestVersionRef.current;
     const resolveTargetRoute = async () => {
-      if (targetDeviceId) {
-        const selfDeviceId = localDeviceId ?? await window.electronAPI.getDeviceId();
+      let deviceId = targetDeviceId ?? remoteProjectsStore.getSessionDeviceId(sessionId);
+      if (deviceId) {
+        const selfDeviceId = localDeviceId ?? (await window.electronAPI.getDeviceId());
         if (navigationRequestVersionRef.current !== navigationRequestVersion) return null;
         // 归档任务可能尚未进入远程镜像；先登记链接的归属，再由现有传输层按设备读取。
-        if (targetDeviceId !== selfDeviceId) {
-          remoteProjectsStore.pinSessionOrigin(targetDeviceId, sessionId);
+        if (deviceId !== selfDeviceId) {
+          remoteProjectsStore.pinSessionOrigin(deviceId, sessionId);
+        } else {
+          deviceId = undefined;
         }
+      }
+      if (separate) {
+        await window.electronAPI.maker.openSessionInNewWindow(sessionId, deviceId, messageClientId);
+        return null;
       }
       return resolveSessionRoute(sessionId, remoteSession);
     };
     // device-link 远程会话本地无 row,resolveSessionRoute 内部的 sessionService.get
     // 会 miss → 远程 Orca 会话被当普通会话路由,后续 redirect 会丢 searchJump 锚点。
     // 把远程镜像里的 session 对象直接传入,让 Orca 路由一步到位(Codex review P2)。
-    void resolveTargetRoute().then((route) => {
+    await resolveTargetRoute().then((route) => {
       if (!route || navigationRequestVersionRef.current !== navigationRequestVersion) return;
       reportSessionNavigation?.(sessionId, getSessionRouteOwnerId(route) ?? sessionId);
       navigate(
@@ -152,6 +163,31 @@ export function SessionLinkChip({ href, label }: SessionLinkChipProps) {
       );
     });
   };
+  const handleClick = (event: MouseEvent<HTMLElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    void openTarget(isSeparateLinkActivation(event) || navigationMode === 'sidebar-embedded').catch(
+      () => toast.error(t('chat.markdownRenderer.openLinkFailed')),
+    );
+  };
+  const linkMenu = useLinkContextMenu(href, [
+    ...(navigationMode === 'sidebar-embedded'
+      ? []
+      : [
+          {
+            label: t('chat.markdownRenderer.openInCurrentWindow'),
+            icon: <CornerDownRight className="mr-2 h-4 w-4" />,
+            run: () => openTarget(false),
+          },
+        ]),
+    {
+      label: t('ccAgent.sidebar.sessionMenu.openInNewWindow'),
+      shortcut: t('chat.markdownRenderer.shiftClick'),
+      icon: <AppWindow className="mr-2 h-4 w-4" />,
+      run: () => openTarget(true),
+    },
+  ]);
+  if (!target || !sessionId) return <span>{label ?? href}</span>;
   // 未起名会话过投影再显示:chip 直接摆在消息流里,原样会露出内部哨兵 "New Maker"。
   const resolvedTitle = fetchedTitle ?? remoteTitle;
   const display =
@@ -171,58 +207,50 @@ export function SessionLinkChip({ href, label }: SessionLinkChipProps) {
     // 发给模型的上下文范围(条数 / 是否截断)不在气泡里展示:用户无从理解也无从操作。
     const messageContent = (
       <span className="inline-flex min-w-0 max-w-[min(240px,55vw)]">
-        <QuoteChip quote={{ text: visibleMessageLabel }} />
+        <QuoteChip quote={{ text: visibleMessageLabel }} className="underline underline-offset-2" />
       </span>
     );
     // items-center 保证 pill 保持自身高度(不被 align-items: stretch 撑成椭圆)。
     const messageClass = 'inline-flex max-w-full items-center align-middle';
-    if (navigationMode === 'sidebar-embedded') {
-      return (
-        <span
+    return (
+      <>
+        <button
+          type="button"
           data-session-message-link=""
+          data-split-pane-route-action=""
+          aria-label={visibleMessageLabel}
           title={display}
-          className={cn(messageClass, 'cursor-default')}
+          onClick={handleClick}
+          onAuxClick={(event) => {
+            if (event.button === 1) handleClick(event);
+          }}
+          onKeyDown={activateInlineLinkFromKeyboard}
+          onContextMenu={linkMenu.onContextMenu}
+          className={cn(messageClass, 'cursor-pointer')}
         >
           {messageContent}
-        </span>
-      );
-    }
-    return (
-      <button
-        type="button"
-        data-session-message-link=""
-        data-split-pane-route-action=""
-        aria-label={visibleMessageLabel}
-        title={display}
-        onClick={handleClick}
-        className={cn(messageClass, 'cursor-pointer')}
-      >
-        {messageContent}
-      </button>
+        </button>
+        {linkMenu.menu}
+      </>
     );
   }
 
-  if (navigationMode === 'sidebar-embedded') {
-    return (
+  return (
+    <>
       <InlineReferenceChip
         label={display}
         icon={<CornerDownRight aria-hidden />}
         tooltip={display}
         ariaLabel={display}
-        className="relative top-[-1px] -my-[1px] max-w-[min(240px,55vw)] cursor-default align-middle"
+        onClick={handleClick}
+        onAuxClick={(event) => {
+          if (event.button === 1) handleClick(event);
+        }}
+        onContextMenu={linkMenu.onContextMenu}
+        splitPaneRouteAction
+        className="relative top-[-1px] -my-[1px] max-w-[min(240px,55vw)] align-middle"
       />
-    );
-  }
-
-  return (
-    <InlineReferenceChip
-      label={display}
-      icon={<CornerDownRight aria-hidden />}
-      tooltip={display}
-      ariaLabel={display}
-      onClick={handleClick}
-      splitPaneRouteAction
-      className="relative top-[-1px] -my-[1px] max-w-[min(240px,55vw)] align-middle"
-    />
+      {linkMenu.menu}
+    </>
   );
 }

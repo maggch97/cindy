@@ -689,6 +689,7 @@ export function createBotGroupChatService(deps: BotGroupChatServiceDeps) {
       botName: step.botName,
       task: step.task,
       status: stepStatus(step.status),
+      resultMessageId: step.resultMessageId ?? null,
     })),
     currentStep: plan.currentStep ?? null,
     workDir: plan.workDir ?? null,
@@ -737,16 +738,20 @@ export function createBotGroupChatService(deps: BotGroupChatServiceDeps) {
       .where(and(eq(botGroupMessages.groupId, groupId), eq(botGroupMessages.kind, 'message')))
       .orderBy(desc(botGroupMessages.sequence))
       .limit(1);
-    const [latestReply] = await db.select({ createdAt: botGroupMessages.createdAt })
+    // A local group's only person is its owner, so incoming messages are the Bots' messages:
+    // replies and plan cards alike. `lastReplyAt` is the newest of them, so a read position
+    // seeded from it never leaves the latest plan card looking unread.
+    const incoming = await db.select({ createdAt: botGroupMessages.createdAt })
       .from(botGroupMessages)
       .where(and(eq(botGroupMessages.groupId, groupId), eq(botGroupMessages.authorKind, 'bot'),
-        eq(botGroupMessages.kind, 'message')))
-      .orderBy(desc(botGroupMessages.sequence)).limit(1);
-    return { latest, latestSpoken, lastReplyAt: latestReply?.createdAt ?? 0 };
+        inArray(botGroupMessages.kind, ['message', 'plan'])))
+      .orderBy(desc(botGroupMessages.sequence)).limit(99);
+    return { latest, latestSpoken, lastReplyAt: incoming[0]?.createdAt ?? 0,
+      incomingMessageTimes: incoming.reverse().map((row) => new Date(row.createdAt).toISOString()) };
   };
 
   const summarize = async (group: GroupRow): Promise<BotGroupSummary> => {
-    const [members, { latestSpoken, lastReplyAt }, openPlan] = await Promise.all([
+    const [members, { latestSpoken, lastReplyAt, incomingMessageTimes }, openPlan] = await Promise.all([
       readMembers(group.id),
       latestMessages(group.id),
       readOpenPlan(group.id),
@@ -776,6 +781,7 @@ export function createBotGroupChatService(deps: BotGroupChatServiceDeps) {
         : null,
       planningBotId: planning && !planning.cancelled ? planning.organizerBotId : null,
       lastReplyAt,
+      incomingMessageTimes,
       lastMessage: latestSpoken
         ? {
             authorKind: latestSpoken.authorKind,

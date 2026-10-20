@@ -13,6 +13,7 @@ import type { ProviderGroupBinding, ProviderGroupRef } from '../bindings';
 import type { ProviderGroupDirectory, ResolvedMemberState, ResolvedProviderGroupMember } from '../directory';
 import { createProviderGroupGuestSwitch, PROVIDER_GROUP_SWITCH_OFFER_TTL_MS } from '../guestSwitch';
 import { createProviderGroupRouter, PROVIDER_GROUP_DEFAULT_COOLDOWN_MS } from '../router';
+import { providerGroupCodexUsageSnapshot, type ProviderGroupCodexUsageSnapshot } from '../usage';
 import {
   createProviderGroupService,
   PROVIDER_GROUP_PRE_SEND_FAILED_TTL_MS,
@@ -55,6 +56,7 @@ function harness(options: {
   /** 这些组内电脑上的同名模型不能用于新会话(停用、退役、需要付费)。 */
   unusableModel?: Record<string, Record<string, unknown>>;
   usage?: Record<string, ClaudeSubscriptionUsageSnapshot>;
+  codexUsage?: Record<string, ProviderGroupCodexUsageSnapshot>;
 } = {}) {
   let now = 1_000_000;
   const config: ProviderGroupConfig = {
@@ -75,7 +77,8 @@ function harness(options: {
     async resolveMembers(_providerId, current) {
       return current.members.map((m): ResolvedProviderGroupMember => offline.has(m.key)
         ? { member: m, label: m.key, state: 'offline' }
-        : { member: m, label: `${m.key}-name`, state: 'ok', view: view(m.providerId, options.unusableModel?.[m.key]), claudeUsage: options.usage?.[m.key] });
+        : { member: m, label: `${m.key}-name`, state: 'ok', view: view(m.providerId, options.unusableModel?.[m.key]),
+          claudeUsage: options.usage?.[m.key], codexUsage: options.codexUsage?.[m.key] });
     },
     async listCandidates() {
       return [];
@@ -451,7 +454,8 @@ describe('onTurnError (automatic switch)', () => {
     }));
     expect(h.deps.fallback).not.toHaveBeenCalled();
     // 撞到用量上限的那台进入冷却，新任务不会分到它。
-    expect(h.router.coolingUntil('anthropic', 'local')).toBe(1_000_000 + PROVIDER_GROUP_DEFAULT_COOLDOWN_MS);
+    expect(h.router.coolingUntil('anthropic', 'local', MODEL)).toBe(1_000_000 + PROVIDER_GROUP_DEFAULT_COOLDOWN_MS);
+    expect(h.router.coolingUntil('anthropic', 'local', 'claude-sonnet-5')).toBeNull();
   });
 
   it('switches back to this computer with its provider when a remote member fails', async () => {
@@ -506,7 +510,7 @@ describe('onTurnError (automatic switch)', () => {
     const h = harness({ row: { sdkSessionId: 'native-1' } });
     h.service.onTurnError('s1', { sdkError: 'rate_limit' }, 7);
     await flush();
-    expect(h.router.coolingUntil('anthropic', 'local')).not.toBeNull();
+    expect(h.router.coolingUntil('anthropic', 'local', MODEL)).not.toBeNull();
     expect(h.deps.switchAgentLocation).toHaveBeenCalledWith(
       's1',
       expect.objectContaining({ agentDeviceId: 'mini', providerId: MINI.providerId }),
@@ -685,7 +689,7 @@ describe('onTurnError (automatic switch)', () => {
     h.bindings.set('s1', { providerId: 'anthropic', memberKey: MINI.key, at: 1 });
     h.service.onTurnError('s1', { sdkError: 'rate_limit' }, 1);
     await flush();
-    expect(h.router.coolingUntil('anthropic', 'local')).not.toBeNull();
+    expect(h.router.coolingUntil('anthropic', 'local', MODEL)).not.toBeNull();
     expect(h.router.coolingUntil('anthropic', MINI.key)).toBeNull();
     expect(h.deps.switchAgentLocation).toHaveBeenCalledWith(
       's1',
@@ -1157,6 +1161,29 @@ describe('beforeSend', () => {
     await h.service.beforeSend('s1');
     expect(h.row.agentDeviceId).toBe('mini');
     expect(h.router.coolingUntil('anthropic', 'local')).toBeNull();
+  });
+
+  // Unit: beforeSend must use the task's bridge quota, not the unrelated native Codex bucket.
+  // Router-only coverage cannot detect dropping agentKind between the session and this check.
+  it.each([[100, 20, 'mini'], [20, 100, null]])('checks the OpenAI bridge quota before sending (web=%s, native=%s)', async (web, native, device) => {
+    const bucket = (usedPercent: number) => ({ updatedAt: 1_000_000, primary: { usedPercent, resetsAt: 3_000 } });
+    const h = harness({ members: [LOCAL, MINI], codexUsage: { local: providerGroupCodexUsageSnapshot({
+      appServerBuckets: { codex: bucket(native) }, webSnapshot: bucket(web),
+    })! } });
+    h.bindings.set('s1', { providerId: 'anthropic', memberKey: 'local', at: 1_000_000 });
+    await h.service.beforeSend('s1');
+    expect(h.row.agentDeviceId).toBe(device);
+  });
+
+  it('only moves before sending when the cooldown covers this task’s model', async () => {
+    const h = harness({ row: { sdkSessionId: 'native' } });
+    h.bindings.set('s1', { providerId: 'anthropic', memberKey: 'local', at: 1 });
+    h.router.markCooling('anthropic', 'local', 2_000_000, 'claude-fable-5');
+    await h.service.beforeSend('s1');
+    expect(h.deps.switchAgentLocation).not.toHaveBeenCalled();
+    h.router.markCooling('anthropic', 'local', 2_000_000, MODEL);
+    await h.service.beforeSend('s1');
+    expect(h.bindings.get('s1')?.memberKey).toBe(MINI.key);
   });
 
   it('moves a task off a computer that is cooling down', async () => {

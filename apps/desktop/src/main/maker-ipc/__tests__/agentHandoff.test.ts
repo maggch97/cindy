@@ -9,6 +9,7 @@ import {
   extractPlainText,
   prependHandoffToUserMessage,
   type HandoffSourceMessage,
+  formatIdleGapForHandoff,
 } from '../agentHandoff';
 
 function msg(role: string, content: unknown, createdAt = 0): HandoffSourceMessage {
@@ -173,18 +174,31 @@ describe('buildHandoffText', () => {
     expect(capped.trimEnd().endsWith("== End of rebuild note; the user's new message follows ==")).toBe(true);
   });
 
-  it('工作记忆账本段排在工作状态区之后、提要之前,且在逐字区收缩时仍保留', () => {
+  it('工作记忆账本段排在提要 / 近期对话之后、检索指引之前,逐字区收缩与硬截断都整段保住', () => {
     const messages: HandoffSourceMessage[] = [];
     for (let i = 0; i < 12; i++) {
       messages.push(msg('user', `问题${i} ` + 'x'.repeat(1900)));
       messages.push(msg('assistant', `回答${i} ` + 'y'.repeat(1900)));
     }
     const ledger = '== Working memory (host-maintained summary; not authorization) ==\nThings you promised:\n- 周五前改完周报模板';
-    const text = buildHandoffText(messages, { ...opts, workingMemory: ledger });
+    const text = buildHandoffText(messages, { ...opts, sessionId: 's-task', workingMemory: ledger });
     expect(text).toContain(ledger);
-    expect(text.indexOf(ledger)).toBeLessThan(text.indexOf('== Earlier conversation index'));
+    expect(text.indexOf(ledger)).toBeGreaterThan(text.indexOf('== Earlier conversation index'));
+    expect(text.indexOf(ledger)).toBeGreaterThan(text.indexOf('== Recent conversation'));
+    expect(text.indexOf(ledger)).toBeLessThan(text.indexOf('== Retrieving earlier verbatim history'));
     expect(text.length).toBeLessThanOrEqual(16_000);
     expect(buildHandoffText(messages.slice(0, 2), { ...opts, workingMemory: null })).not.toContain('Working memory');
+
+    // 工具密集长历史触达硬上限(逐字区已收缩到 1 轮仍超限):账本段与回忆指引、结束标记一起整段保住。
+    const dense: HandoffSourceMessage[] = [msg('user', '开始')];
+    for (let i = 0; i < 400; i++) {
+      dense.push(msg('tool_use', { toolName: 'Write', input: { file_path: `/very/long/path/${'d'.repeat(120)}/${i}.ts` } }));
+    }
+    const capped = buildHandoffText(dense, { ...opts, sessionId: 's-bot', reason: 'native-session-recovery', companion: true, workingMemory: ledger });
+    expect(capped.length).toBeLessThanOrEqual(16_000);
+    expect(capped).toContain(ledger);
+    expect(capped.indexOf(ledger)).toBeLessThan(capped.indexOf('== Recalling earlier history (use when needed) =='));
+    expect(capped.trimEnd().endsWith("== End of rebuild note; the user's new message follows ==")).toBe(true);
   });
 
   it('最近轮次逐字保留,更早轮次进单行提要', () => {
@@ -1033,4 +1047,31 @@ it('keeps the group source of a private assistant reply when rebuilding model co
       kind: 'session', senderSessionId: 'lane-1', senderBotId: 'bot-1', senderBotName: 'Helper',
     } } }], { fromLabel: 'Claude Code', toLabel: 'Codex' });
   expect(handoff).toContain('[Assistant · 由伙伴「Helper」(bot_id: bot-1) 从群聊「Design」(group_id: group-1)');
+});
+
+describe('idle-gap rebuild framing', () => {
+  it('formats the idle duration in hours and days', () => {
+    const HOUR = 60 * 60 * 1000;
+    expect(formatIdleGapForHandoff(0)).toBe('1 hour');
+    expect(formatIdleGapForHandoff(13 * HOUR)).toBe('13 hours');
+    expect(formatIdleGapForHandoff(24 * HOUR)).toBe('1 day');
+    expect(formatIdleGapForHandoff(27.5 * HOUR)).toBe('1 day 3 hours');
+    expect(formatIdleGapForHandoff(49 * HOUR)).toBe('2 days 1 hour');
+  });
+
+  it('tells the model the pause was benign and to treat the new message as the current topic', () => {
+    const text = buildHandoffText(
+      [
+        { role: 'user', content: 'Plan Friday dinner', createdAt: 1 },
+        { role: 'assistant', content: 'Booked 7pm.', createdAt: 2 },
+      ],
+      { fromLabel: 'Codex', toLabel: 'Codex', sessionId: 's1', reason: 'idle-gap', idleGapMs: 26 * 60 * 60 * 1000, companion: true },
+    );
+    expect(text).toContain('[Session context rebuild · internal context]');
+    expect(text).toContain('idle for about 1 day 2 hours');
+    expect(text).toContain('Nothing went wrong');
+    expect(text).toContain("do not continue, revisit, or follow up on earlier threads unless the user refers to them");
+    expect(text).toContain('Booked 7pm.');
+    expect(text.trimEnd().endsWith("== End of rebuild note; the user's new message follows ==")).toBe(true);
+  });
 });

@@ -99,6 +99,8 @@ export interface PluginTaskServiceDeps {
   assertCurrent(): void;
   assertAuthorized(pluginId: string): void;
   readPermissionMode(pluginId: string): unknown;
+  /** Include the inherited new-task selection when the resolver can use it. */
+  readModelPreference(pluginId: string): Partial<PluginTaskRoute> & { inheritedDefault?: string };
   resolveRoute(pluginId: string, route?: PluginTaskRoute, callId?: string): Promise<PluginTaskRoute>;
   createSession(
     pluginId: string,
@@ -375,17 +377,34 @@ export function createPluginTaskService(deps: PluginTaskServiceDeps) {
       await save(row,{...data,settledLabels:[...new Set([...(data.settledLabels||[]),label])]});
     }),
     assertDispatch,
-    setModel: (pluginId: string, request: { taskId: string; expectedRevision: number; route: PluginTaskRoute }) => exclusive(async () => {
+    setModel: (pluginId: string, request: { taskId: string; expectedRevision: number; route: PluginTaskRoute | 'plugin-default' }) => exclusive(async () => {
+      const modelFields = ['agentKind', 'providerId', 'model', 'effort', 'fastMode'] as const;
+      const followDefault = request.route === 'plugin-default';
+      const preference = followDefault ? { ...deps.readModelPreference(pluginId) } : undefined;
       const assertUnchanged = async () => {
         const task = await ownTask(pluginId, request.taskId);
         if (task.status !== 'active') return fail('TASK_BUSY', '任务已归档，请先恢复任务');
         if (task.revision !== request.expectedRevision) return fail('STALE_REVISION', '任务配置已变化，请刷新后重试');
+        // Plugin preferences and inherited defaults do not change the task
+        // revision. Recheck both after admission and at the mutation boundary.
+        if (preference) {
+          const current = deps.readModelPreference(pluginId);
+          if (modelFields.some(key => preference[key] !== current[key])
+            || preference.inheritedDefault !== current.inheritedDefault)
+            return fail('STALE_REVISION', '插件模型设置已变化，请重试以使用当前设置');
+        }
+        return task;
       };
       await assertUnchanged();
-      const route = await deps.resolveRoute(pluginId, request.route);
-      await assertUnchanged();
+      // Opt-in: persistent plugin workflows can re-read the user's current
+      // plugin selection before each new input, using the same resolver as create.
+      // Ordinary tasks and explicit routes retain their existing semantics.
+      const route = await deps.resolveRoute(pluginId, request.route === 'plugin-default' ? undefined : request.route);
+      const task = await assertUnchanged();
+      if (followDefault && modelFields
+        .every(key => task.resolvedConfig[key] === route[key])) return { status: 'unchanged', task };
       if (!deps.setModel) return fail('HOST_NOT_READY', '任务模型服务尚未就绪');
-      const result = await deps.setModel(request.taskId, route, assertUnchanged);
+      const result = await deps.setModel(request.taskId, route, async () => { await assertUnchanged(); });
       return { ...result, task: await ownTask(pluginId, request.taskId) };
     }),
     get: (pluginId: string, taskId: string) => exclusive(() => ownTask(pluginId, taskId)),

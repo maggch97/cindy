@@ -9,7 +9,8 @@ import { readFile as readMedia } from '../cindy-media/blobStore.js';
 import { getAccessToken, refresh } from '../authManager.js';
 import { retryAfterDeadline } from '@cindy/auth-client';
 import { parseChatInvitationToken } from '@cindy/device-link';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, promises as fsp } from 'node:fs';
+import { MIRROR_ATTACHMENT_MAX_BYTES } from '../companion-cloud/mirror.js';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { migrateLocalGroups, type ChatContentBlock } from './chatServerMigration.js';
@@ -36,7 +37,7 @@ import {
   readBotGroupExecutionFailure, type BotGroupExecutionFailureView,
   buildBotGroupThreadShareCard, botGroupThreadShareOperationId, readBotGroupThreadShareCard,
   type BotGroupThreadShareView,
-  type BotGroupDetail, type BotGroupPlanView, type BotGroupFailure, type BotGroupMessageView, type BotGroupAttachment, type ChatServerApi,
+  type BotGroupDetail, type BotGroupSpeaker, type BotGroupPlanView, type BotGroupFailure, type BotGroupMessageView, type BotGroupAttachment, type ChatServerApi,
   botGroupQuoteAttachmentName, botGroupQuoteExcerpt, botGroupQuoteFromMessage, buildBotGroupQuoteCard, readBotGroupQuote, readBotGroupQuoteCard, type BotGroupQuoteView,
   readBotGroupTaskCard, botGroupMessageSummaryText,
 } from '../../shared/botGroupChat.js';
@@ -95,6 +96,43 @@ const CHAT_AUTH_RETRY_MS = 60_000;
 /** Main-group messages kept as background for a Thread request (the Thread itself is read separately). */
 const THREAD_BACKGROUND_LIMIT = 30;
 const ATTACHMENT_REFRESH_COALESCE_MS = 200;
+/**
+ * One push per change: notices for the same group inside this window (a local write and its
+ * WebSocket echo, an execution and its message, several change batches) leave one broadcast at
+ * the window's end, so the renderer re-reads once, after the burst. Bounded: never postponed further.
+ */
+const CHANGE_COALESCE_MS = 150;
+/** A realtime notice of newly queued work claims it this soon instead of on the next 2s tick. */
+const CLAIM_TRIGGER_MS = 250;
+/** A room snapshot reused for a send while its realtime subscription reports no change since. */
+const SNAPSHOT_REUSE_MS = 30_000;
+/** A sidebar summary reused while the room's change head is unchanged; names can change elsewhere. */
+const SUMMARY_REUSE_MS = 60_000;
+/** Parallel execution-failure batches (100 source IDs each) for one read. */
+const FAILURE_BATCH_CONCURRENCY = 4;
+/** Sidebar summaries read at once. */
+const SUMMARY_CONCURRENCY = 8;
+/** Attachment downloads at once while a Bot prepares its turn. */
+const TURN_DOWNLOAD_CONCURRENCY = 4;
+/** Settles every item a few at a time, in input order; never rejects. */
+async function settleBounded<T, R>(items: readonly T[], limit: number, run: (item: T) => Promise<R>): Promise<Array<PromiseSettledResult<R>>> {
+  const results: Array<PromiseSettledResult<R>> = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await run(items[index]!).then(value => ({ status: 'fulfilled' as const, value }), reason => ({ status: 'rejected' as const, reason }));
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+/** The values in order, or the first failure in input order (the former serial order). */
+function settledValues<R>(results: Array<PromiseSettledResult<R>>): R[] {
+  const failed = results.find(result => result.status === 'rejected');
+  if (failed) throw (failed as PromiseRejectedResult).reason;
+  return results.map(result => (result as PromiseFulfilledResult<R>).value);
+}
 /** Messages per group with their own reaction version; past this the group re-versions as a whole, like a reset. */
 export const REACTION_REVISION_MESSAGE_LIMIT = 500;
 // Room reaction versions come from one process-wide sequence, so they never repeat across chat runtimes.
@@ -122,6 +160,8 @@ type ExecutionContext = { kind: 'message' } | { kind: 'member.joined'; trigger: 
 /** Only `group` rooms are bot groups; direct companion chats, channels and later kinds are not. */
 const isGroupRoom = (room: Pick<Room, 'kind'>) => room.kind === 'group';
 const ordinaryExecution = (execution: Execution) => execution.trigger === undefined && execution.trigger_type == null;
+/** Realtime change types that can never end or revoke an execution lease. */
+const CHATTER_CHANGES = new Set(['message.created', 'message.updated', 'reaction.changed', 'pin.changed', 'read.changed']);
 const groupInput = z.object({ name: z.string().trim().min(1).max(40), botIds: z.array(z.string().min(1)).max(6) });
 // A recognized quote card is shown as the quote, not as body text; unknown revisions keep their fallback.
 // A task card is the message's task only on a teammate's own message; a human may not post one for it.
@@ -302,7 +342,8 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
     planning.get(roomId)?.controller.abort(); planning.delete(roomId);
     planIntents.delete(roomId); pendingPlanCancels.delete(roomId);
   }
-  async function replacePlanIntent(roomId: string, version = ++nextIntentVersion) {
+  /** The synchronous half: a newer intent replaces the room's pending decision at once. */
+  function installPlanIntent(roomId: string, version: number) {
     acceptedIntentVersions.set(roomId, version);
     const pending = planning.get(roomId);
     pending?.controller.abort();
@@ -311,8 +352,42 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
     const previous = planIntents.get(roomId);
     const intent: PlanIntent = {};
     planIntents.set(roomId, intent);
-    if (previous?.sourceId) await cancelPlanning(roomId, previous.sourceId);
+    return { intent, previousSourceId: previous?.sourceId };
+  }
+  /** Cancels the replaced decision's deferred message and any cancel that failed before. */
+  async function flushPlanCancels(roomId: string, previousSourceId?: string) {
+    if (previousSourceId) await cancelPlanning(roomId, previousSourceId);
     for (const [sourceId, failed] of pendingPlanCancels.get(roomId) ?? []) await cancelPlanning(roomId, sourceId, failed);
+  }
+  /**
+   * A failed cancel stays pending and is retried once here, then with backoff until it lands
+   * (the next intent flushes it too): nothing else would release the deferred message.
+   */
+  async function cancelPlanningWithRetry(roomId: string, cancel: () => Promise<void>) {
+    try { await cancel(); }
+    catch (error) {
+      deps.log?.warn('Group arrangement cancel will retry', { groupId: roomId, ...chatErrorDiagnostic(error) });
+      await flushPlanCancels(roomId).catch(retryError => {
+        deps.log?.warn('Group arrangement cancel failed', { groupId: roomId, ...chatErrorDiagnostic(retryError) });
+        schedulePlanCancelRetry(roomId);
+      });
+    }
+  }
+  const planCancelRetries = new Map<string, ReturnType<typeof setTimeout>>();
+  function schedulePlanCancelRetry(roomId: string, attempt = 1) {
+    if (planCancelRetries.has(roomId) || !current()) return;
+    planCancelRetries.set(roomId, setTimeout(() => {
+      planCancelRetries.delete(roomId);
+      if (!current() || !pendingPlanCancels.get(roomId)?.size) return;
+      void flushPlanCancels(roomId).catch(error => {
+        deps.log?.warn('Group arrangement cancel failed', { groupId: roomId, ...chatErrorDiagnostic(error) });
+        schedulePlanCancelRetry(roomId, attempt + 1);
+      });
+    }, Math.min(60_000, 1_000 * 2 ** Math.min(attempt, 6))));
+  }
+  async function replacePlanIntent(roomId: string, version = ++nextIntentVersion) {
+    const { intent, previousSourceId } = installPlanIntent(roomId, version);
+    await flushPlanCancels(roomId, previousSourceId);
     return intent;
   }
   // Old servers strictly reject unknown claim fields. Downgrade only after that
@@ -341,13 +416,38 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
   let authRefreshPromise: Promise<boolean> | undefined;
   let authRefreshRetryAt = 0;
   let upgradedGroups = new Map<string, string>();
+  /**
+   * Per room, bumped by every local or realtime change notice. A reused snapshot or sidebar
+   * summary is only valid for the generation it was read in.
+   */
+  const generations = new Map<string, number>();
+  const generation = (roomId: string) => generations.get(roomId) ?? 0;
+  let snapshotConnection = 0;
+  const snapshots = new Map<string, { value: Snapshot; generation: number; at: number }>();
+  const summaries = new Map<string, { key: string; value: BotGroupDetail; at: number }>();
+  const invalidate = (roomId: string) => {
+    generations.set(roomId, generation(roomId) + 1);
+    snapshots.delete(roomId);
+    summaries.delete(roomId);
+  };
+  // Local writes always notify: HTTP can finish before the server handles subscribe,
+  // even on an open socket. Nearby realtime echoes join the same bounded window.
+  const pendingChanges = new Map<string, ReturnType<typeof setTimeout>>();
   const changed = (roomId: string) => {
     if (!current()) return;
-    deps.onChanged?.({ groupId: roomId, change: 'messages' }, scope);
-    // A restored route may still contain the local ID until the user navigates.
-    for (const [sourceId, targetId] of upgradedGroups)
-      if (targetId === roomId) deps.onChanged?.({ groupId: sourceId, change: 'messages' }, scope);
+    invalidate(roomId);
+    if (pendingChanges.has(roomId)) return;
+    pendingChanges.set(roomId, setTimeout(() => {
+      pendingChanges.delete(roomId);
+      if (!current()) return;
+      deps.onChanged?.({ groupId: roomId, change: 'messages' }, scope);
+      // A restored route may still contain the local ID until the user navigates.
+      for (const [sourceId, targetId] of upgradedGroups)
+        if (targetId === roomId) deps.onChanged?.({ groupId: sourceId, change: 'messages' }, scope);
+    }, CHANGE_COALESCE_MS));
   };
+  /** Live transport used for snapshot reuse; sending subscribe is not a server acknowledgement. */
+  const hasLiveSubscription = (roomId: string) => connected && socket?.readyState === WebSocket.OPEN && rooms.has(roomId);
   // TLS for production; explicit loopback is only enabled by the isolated fixture.
   // Redirects are never followed and every retry remains in the captured account.
   function refreshRejectedToken(token: string): Promise<boolean> {
@@ -513,12 +613,18 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
     return result.groups.filter(group => !mirrors.has(group.id) && !workspaces().read(group.id));
   }
   /**
+   * Final group → room answers of this account/endpoint: a server room stays a server room and an
+   * upgraded history keeps its room. A pending upgrade is never cached, so it is asked again.
+   */
+  const resolvedGroups = new Map<string, string>();
+  /**
    * The server room a task started from `groupId` posts into: the upgraded room of an old
    * local group, or the id itself for a server room. Before returning `null` for a local source,
    * recover its account-scoped migration receipt; background migration may not have run yet.
    */
   const taskRoomFor = async (groupId: string): Promise<string | null> => {
-    if (upgradedGroups.has(groupId)) return upgradedGroups.get(groupId)!;
+    const known = resolvedGroups.get(groupId) ?? upgradedGroups.get(groupId);
+    if (known) return known;
     if (!id.safeParse(groupId).success) return null;
     const [localRow] = await getDbClient().drizzle.select({ id: botGroups.id }).from(botGroups).where(eq(botGroups.id, groupId)).limit(1);
     if (localRow && (await localSources()).some(group => group.id === groupId)) {
@@ -534,7 +640,9 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
     return groupId;
   };
   const resolveGroup = async (groupId: string) => {
-    await register();
+    const known = resolvedGroups.get(groupId);
+    if (known) { void ensureRegistered(); return known; }
+    await ensureRegistered();
     if (upgradedGroups.has(groupId)) return upgradedGroups.get(groupId)!;
     // A server room has no local row; only an existing local history may still need its upgrade.
     const [localRow] = await getDbClient().drizzle.select({ id: botGroups.id }).from(botGroups).where(eq(botGroups.id, groupId)).limit(1);
@@ -542,7 +650,9 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
       await ensureUpgrade();
       if (!upgradedGroups.has(groupId)) throw new Error('IMPORT_PENDING');
     }
-    return upgradedGroups.get(groupId) ?? groupId;
+    const room = upgradedGroups.get(groupId) ?? groupId;
+    if (current()) resolvedGroups.set(groupId, room);
+    return room;
   };
   /** Publish one companion's name and avatar to its actor (home copy only). */
   async function publishActorProfile(profile: typeof profiles[number], found: Actor) {
@@ -564,6 +674,19 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
     await api(`/actors/${found.id}/profile`, 'POST', { name: profile.displayName, avatar, avatarSource: source });
     Object.assign(found, { name: profile.displayName, avatar, avatarSource: source });
   }
+  /**
+   * Read and send paths use the registration they already have and refresh it in the background
+   * (same five-second throttle, 60-second profile refresh and auth backoff as before); only the
+   * first registration of this account is awaited. Management paths that map local companions to
+   * actors still await `register()`.
+   */
+  function ensureRegistered(): Promise<void> {
+    if (!selfId) return register();
+    void register().catch(() => undefined);
+    return Promise.resolve();
+  }
+  /** Changes to names, avatars or local companions alter every projection, including reused summaries. */
+  let registryKey = '';
   async function register() {
     if (refreshActors) return refreshActors;
     if (Date.now() - registeredAt < 5000 && !actorsStale) return;
@@ -602,6 +725,15 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
       }
       profileFailures = failures;
       registeredAt = Date.now();
+      const key = JSON.stringify([selfId, actors.map(a => [a.id, a.kind, a.externalId, a.name, a.avatar ?? null]),
+        profiles.map(p => [p.id, p.status, p.displayName, p.avatar, p.avatarColor])]);
+      if (key !== registryKey) {
+        const replaced = registryKey !== '';
+        registryKey = key; summaries.clear(); snapshots.clear();
+        // A list or room read may have finished on the old registry while this ran (a background
+        // refresh, or actor.changed racing its own list notice): tell them to read again.
+        if (replaced) { changed(''); for (const roomId of rooms.keys()) changed(roomId); }
+      }
     })().finally(() => { refreshActors = undefined; });
     return refreshActors;
   }
@@ -620,7 +752,14 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
     companion ??= startCompanionCloud({ api, host, endpoint: config.baseUrl, humanActorId: selfId, selfDeviceId: self, current, log: deps.log,
       bots: () => actors.filter(a => a.kind === 'bot' && !a.disabled && a.homeDeviceId === self && localBot(a.id)?.status === 'active'
         && !companion?.isShadowed(a.externalId)).map(a => ({ botId: a.externalId, actorId: a.id, name: a.name })),
-      actors: () => actors, refresh: refreshHomes, publish: publishHomes, syncProfile: syncActorProfiles });
+      paused: botId => profiles.find(p => p.id === botId)?.status === 'paused',
+      actors: () => actors, refresh: refreshHomes, publish: publishHomes, syncProfile: syncActorProfiles,
+      // The owner's attachments go with the conversation; other devices download them from the room.
+      media: { upload: async (room, source, files, author) => {
+        // The conversation mirror is not a file backup: large files stay a name in the room.
+        for (const file of files) if (file.path && (await fsp.stat(file.path)).size > MIRROR_ATTACHMENT_MAX_BYTES) throw new Error('ATTACHMENT_TOO_LARGE');
+        return media.upload(room, source, files, author);
+      }, download: (room, mediaId) => media.download(room, mediaId) } });
     const runtime = companion;
     await registerCompanionHomes({ api, selfDeviceId: self, actors, log: deps.log,
       botIds: profiles.filter(p => p.status === 'active').map(p => p.id), isDemoted: botId => runtime.state.isDemoted(botId) });
@@ -682,6 +821,11 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
           memberJoinedClaims = true;
           reconnectDelay = 500; connected = true;
           threads.reset();
+          // Replay and list sync may lag behind ready. Fence all snapshot reads,
+          // including rooms whose first read has not reached subscribe yet.
+          snapshotConnection += 1;
+          snapshots.clear();
+          for (const roomId of rooms.keys()) invalidate(roomId);
           ws.send(JSON.stringify({ type: 'subscribe', scope: `actor:${selfId}`, after: '0' }));
           for (const [roomId, cursor] of rooms) ws.send(JSON.stringify({ type: 'subscribe', scope: `conversation:${roomId}`, after: cursor }));
           void syncPersonalList(true).then(() => { if (current() && socket === ws) { for (const roomId of rooms.keys()) changed(roomId); changed(''); } }).catch(() => ws.close());
@@ -697,7 +841,13 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
               if (change.type === 'reaction.changed' && typeof change.entityId === 'string') bumpMessageReactions(roomId, change.entityId);
             }
             changed(roomId);
-            for (const run of running.values()) if (run.execution.conversation_id === roomId) void checkLease(run);
+            const changes: unknown[] = Array.isArray(event.changes) ? event.changes : [];
+            const types = changes.map(change => (change as { type?: unknown } | null)?.type);
+            // Lease renewals append no change; ordinary chatter cannot revoke a lease, so it does
+            // not renew one either. Any other or unknown change re-checks the room's running work.
+            if (!types.length || types.some(type => typeof type !== 'string' || !CHATTER_CHANGES.has(type)))
+              for (const run of running.values()) if (run.execution.conversation_id === roomId) void checkLease(run);
+            if (changes.some(queuedForThisDevice)) triggerClaim();
           }
           else {
             for (const change of event.changes ?? []) {
@@ -749,15 +899,34 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
     });
   }
   async function readSnapshot(roomId: string) {
-    id.parse(roomId); await register();
+    id.parse(roomId); await ensureRegistered();
+    const read = generation(roomId);
+    const connection = snapshotConnection;
     const value = await api<Snapshot>(`/conversations/${roomId}/snapshot`);
     if (value.room.dissolved_at) retirePlanning(roomId);
+    // A prior connection or room change makes this answer ineligible for reuse.
+    if (current() && snapshotConnection === connection && generation(roomId) === read)
+      snapshots.set(roomId, { value, generation: read, at: Date.now() });
     return value;
   }
   async function snapshot(roomId: string) {
     const value = await readSnapshot(roomId);
     subscribe(roomId, value.cursor);
     return value;
+  }
+  /**
+   * The last snapshot when the room's subscription is live and has reported nothing since,
+   * else a fresh read. The server still validates every write against its current state.
+   */
+  function recentSnapshot(roomId: string, groupOnly = false) {
+    id.parse(roomId);
+    const known = snapshots.get(roomId);
+    if (known && hasLiveSubscription(roomId) && known.generation === generation(roomId) && Date.now() - known.at < SNAPSHOT_REUSE_MS) {
+      if (groupOnly && !isGroupRoom(known.value.room)) return Promise.reject(new Error('NOT_A_GROUP'));
+      void ensureRegistered();
+      return Promise.resolve(known.value);
+    }
+    return groupOnly ? groupSnapshot(roomId) : readSnapshot(roomId);
   }
   /** A room read through a bot-group entry point; any other kind answers as a missing group and is never subscribed. */
   async function groupSnapshot(roomId: string) {
@@ -817,12 +986,28 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
       mentions: { all: false, botIds: [] }, noticeCode: null, planId: typeof planCard?.data?.planId === 'string' ? planCard.data.planId : null, files: [], attachments: [], createdAt: Date.parse(m.createdAt) };
   }
   /**
+   * When the newest (up to 99) messages from someone else arrived, oldest first: Bots and other
+   * people, not this account, notices or system events, nor deleted messages. Derived from the
+   * snapshot already read (its newest 100 messages), so it costs no request.
+   */
+  function incomingMessageTimes(messages: Message[], members: Member[]): string[] {
+    const times: Array<{ at: number; iso: string }> = [];
+    for (const m of messages) {
+      if (m.deleted || m.origin === 'system' || m.authorId === selfId) continue;
+      const view = messageView(m, members);
+      if (view.isSelf || view.authorKind === 'system' || (view.kind !== 'message' && view.kind !== 'plan')) continue;
+      const at = Date.parse(m.createdAt);
+      if (Number.isFinite(at)) times.push({ at, iso: new Date(at).toISOString() });
+    }
+    return times.sort((a, b) => b.at - a.at).slice(0, 99).reverse().map(time => time.iso);
+  }
+  /**
    * The quoted message as this member reads it from the server: the room scopes the read,
    * so another group's or an invisible message is a 404. Only a live main-timeline chat
    * message can be quoted; the snapshot never comes from the controller's input. A thread
    * share's own text is only its card's fallback, so a share is not quotable either.
    */
-  async function quoteSnapshot(roomId: string, messageId: string, members: Member[]): Promise<BotGroupQuoteView> {
+  async function quoteSnapshot(roomId: string, messageId: string, members: Promise<Member[]>): Promise<BotGroupQuoteView> {
     let quoted: Message;
     try {
       quoted = await api<Message>(`/conversations/${roomId}/messages/${messageId}`);
@@ -830,7 +1015,7 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
       if (error instanceof ChatResponseError && [403, 404].includes(error.status)) throw new Error('QUOTE_UNAVAILABLE');
       throw error;
     }
-    const view = messageView(quoted, members);
+    const view = messageView(quoted, await members);
     if (quoted.id !== messageId || quoted.deleted || quoted.threadRootId !== null || quoted.origin === 'system'
       || view.kind !== 'message' || view.authorKind === 'system' || readBotGroupThreadShareCard(quoted)) throw new Error('QUOTE_UNAVAILABLE');
     return botGroupQuoteFromMessage({ ...view, content: quotedText(quoted),
@@ -885,7 +1070,7 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
     shownShares: Array<{ id: string; messageId: string; threadRootId: string; sharerId?: string }> = []) {
     // Taken before reading, so a change while this read is in progress marks it stale.
     const version = threads.version(roomId);
-    const previews = withPreviews ? threads.previews(roomId, page, snapshot) : new Map<string, Message[]>();
+    const previews = withPreviews ? threads.previews(roomId, page, snapshot) : new Map<string, { replies: Message[]; responders: Message[] }>();
     const sources = threads.sources(roomId, [...page.flatMap(m => readBotGroupThreadShareCard(m)?.messageId ?? []),
       ...shownShares.map(share => share.messageId)], [...snapshot, ...page]);
     const shareable = [...sources.values()].filter((m): m is Message => !!m && isShareableThreadReply(m));
@@ -904,13 +1089,18 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
     for (const view of views) {
       const message = byId.get(view.id);
       if (!message) continue;
-      const replies = previews.get(message.id)?.flatMap(reply => {
+      const preview = previews.get(message.id);
+      const replies = preview?.replies.flatMap(reply => {
         const replyView = messageView(reply, members);
         return replyView.kind === 'message' ? [{ id: reply.id, authorKind: replyView.authorKind, authorBotId: replyView.authorBotId,
           authorName: replyView.authorName, isSelf: replyView.isSelf, text: threadPreviewText(reply),
           attachments: threadPreviewAttachments(reply, attachmentName), createdAt: replyView.createdAt }] : [];
       });
-      if (replies?.length) view.threadPreview = { replies };
+      if (replies?.length) view.threadPreview = { replies, responders: preview!.responders.flatMap(reply => {
+        const author = messageView(reply, members);
+        return author.kind === 'message' ? [{ id: reply.id, authorKind: author.authorKind,
+          authorBotId: author.authorBotId, authorName: author.authorName }] : [];
+      }) };
       const card = readBotGroupThreadShareCard(message);
       if (card) view.threadShare = shareView(card, message.authorId);
     }
@@ -946,9 +1136,13 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
     const workspace = workspaces().read(roomId);
     const plans = serverPlans.map(plan => planView(plan, s.members, workspace));
     const open = plans.find(p => ['proposed', 'running', 'waiting'].includes(p.status));
-    const speakers = executions.filter(e => e.status === 'running').map(e => ({
+    const speakers: BotGroupSpeaker[] = executions.filter(e => e.status === 'running').map(e => ({
       botId: localBot(e.bot_id)?.id ?? e.bot_id, sessionId: running.get(e.bot_id)?.sessionId ?? null, activity: e.plan_id ? 'step' as const : 'reply' as const,
     }));
+    // The organizer is visibly 「正在看」 while this device decides whether to arrange (§7.2),
+    // as the local service showed it. It works on the auxiliary model, not in a lane session.
+    const deciding = planning.get(roomId);
+    if (deciding) speakers.push({ botId: deciding.botId, sessionId: null, activity: 'planning' });
     // Sidebar refresh must not download every attachment in every group's history.
     const messages = summaryOnly ? [] : await messageViews(roomId, page, s.members);
     const shares = summaryOnly ? undefined : await decorateThreads(roomId, messages, page, s.messages, s.members, true, o.shownShares);
@@ -975,10 +1169,11 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
       } : null, speakingBotIds: speakers.map(s => s.botId), planningBotId: planning.get(roomId)?.botId ?? null, openPlan: open ? { id: open.id, status: open.status, currentStep: open.currentStep, stepCount: open.steps.length, currentBotName: open.steps[open.currentStep ?? 0]?.botName ?? null, currentStepStatus: open.steps[open.currentStep ?? 0]?.status ?? null } : null,
       lastReplyAt: s.messages.reduce((latest, m) => !m.deleted && m.origin !== 'system' && m.authorId !== selfId
         ? Math.max(latest, Date.parse(m.createdAt)) : latest, 0),
+      incomingMessageTimes: incomingMessageTimes(s.messages, s.members),
       createdAt: Date.parse(s.room.created_at), updatedAt: Date.parse(s.room.updated_at ?? s.room.created_at),
       messages, executionFailures, ...(threadShareUpdates && Object.keys(threadShareUpdates).length ? { threadShareUpdates } : {}),
       ...(shares ? { threadShareVersion: shares.version } : {}), hasMoreBefore: page.length === (o.limit ?? 100), plans,
-      round: { status: executions.some(e => ['queued', 'running'].includes(e.status)) ? 'running' : 'idle', speakers, canContinue: !open && !planning.has(roomId) && (executions.some(e => !e.plan_id && ordinaryExecution(e)) || s.messages.some(discussionSource)) && !executions.some(e => ['queued','running','stopping'].includes(e.status)) } };
+      round: { status: deciding || executions.some(e => ['queued', 'running'].includes(e.status)) ? 'running' : 'idle', speakers, canContinue: !open && !planning.has(roomId) && (executions.some(e => !e.plan_id && ordinaryExecution(e)) || s.messages.some(discussionSource)) && !executions.some(e => ['queued','running','stopping'].includes(e.status)) } };
   }
   function planView(plan: ServerPlan, members: Member[], workspace: ReturnType<ReturnType<typeof chatServerWorkspaces>['read']>): BotGroupPlanView {
     return { id: plan.id, status: plan.status, organizerBotId: localBot(plan.organizer_id)?.id ?? plan.organizer_id,
@@ -1057,11 +1252,13 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
     const sources = new Set(sourceIds);
     let rows: unknown[] = [];
     try {
-      for (const batch of botGroupExecutionFailureBatches(sourceIds)) {
+      // Batches are read a few at a time; the first failing batch in order decides, as serially.
+      const pages = settledValues(await settleBounded(botGroupExecutionFailureBatches(sourceIds), FAILURE_BATCH_CONCURRENCY, async batch => {
         const page = await api<unknown[]>(`/conversations/${roomId}/execution-failures?sourceIds=${batch.join(',')}`);
         if (!Array.isArray(page)) throw new Error('INVALID_CHAT_RESPONSE');
-        rows.push(...page);
-      }
+        return page;
+      }));
+      for (const page of pages) rows.push(...page);
     }
     catch (error) {
       // Only a missing route may use the old server's bounded execution list.
@@ -1146,6 +1343,7 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
       if (running.get(run.execution.bot_id) === run) {
         run.releaseToolAuthority?.();
         running.delete(run.execution.bot_id);
+        // Refresh both delivered results and local failures without waiting for an echo.
         changed(run.execution.conversation_id);
       }
     })();
@@ -1174,7 +1372,18 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
         || execution.trigger_type != null && execution.trigger_type !== 'member.joined'
         || run.context.trigger.messageId !== execution.source_message_id
         || run.context.trigger.actorId !== execution.requester_id)) throw new Error('INVALID_EXECUTION_TRIGGER');
-      const s = await readSnapshot(execution.conversation_id);
+      const roomId = execution.conversation_id;
+      const contextBefore = BigInt(execution.context_seq) + 1n;
+      // Reads that depend only on the claim start together. Each is awaited where the serial
+      // version read it, so a failure still surfaces at the same step (an unreadable history
+      // still follows lane creation and is settled with the lane aborted).
+      const snapshotRead = recentSnapshot(roomId);
+      const historyRead = api<Message[]>(`/conversations/${roomId}/messages?all=true&limit=100&before=${contextBefore}`);
+      const planRead = execution.plan_id ? api<ServerPlan[]>(`/conversations/${roomId}/plans?ids=${execution.plan_id}`) : undefined;
+      const trigger = run.context.kind === 'member.joined' ? run.context.trigger : undefined;
+      const eventSourceRead = trigger ? api<Message>(`/conversations/${roomId}/messages/${trigger.messageId}`) : undefined;
+      for (const read of [historyRead, planRead, eventSourceRead]) read?.catch(() => undefined);
+      const s = await snapshotRead;
       // A companion's own 1:1 room is not a group: hand the message to its main task instead.
       const joined = new Set(s.members.filter(m => m.state === 'joined').map(m => m.id));
       const ownDirectRoom = companionHome && (companion?.isDirectRoom(s.room.id)
@@ -1186,9 +1395,8 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
       // Claim metadata and the persisted source must agree before creating a lane.
       // Reading this exact ID also covers sources outside the bounded history page.
       let eventSource: Message | undefined;
-      if (run.context.kind === 'member.joined') {
-        const trigger = run.context.trigger;
-        eventSource = await api<Message>(`/conversations/${s.room.id}/messages/${trigger.messageId}`);
+      if (trigger && eventSourceRead) {
+        eventSource = await eventSourceRead;
         const card = eventSource.content?.find(block => block.type === 'card' && block.namespace === 'cindy.membership'
           && block.schemaRevision === 1 && block.data?.type === trigger.type
           && block.data.actorId === trigger.actorId && block.data.displayName === trigger.displayName);
@@ -1199,128 +1407,162 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
       }
       if (!current() || running.get(execution.bot_id) !== run) throw new Error('STALE_EXECUTOR');
       if (ownDirectRoom) { await runDirectExecution(run, bot.id, s.room.id); return; }
-      // Metadata only: the server remains the sole message store and scheduler.
-      if (!metadata.has(s.room.id)) metadata.set(s.room.id, (async () => {
-        const client = getDbClient();
-        const [localRow] = await client.drizzle.select({ id: botGroups.id }).from(botGroups).where(eq(botGroups.id, s.room.id)).limit(1);
-        const botIds = s.members.filter(m => m.state === 'joined').map(m => localBot(m.id)?.id).filter((v): v is string => !!v);
-        if (!current()) throw new Error('OWNER_CHANGED');
-        if (!localRow) await client.tx('botGroups.create', { groupId: s.room.id, name: s.room.name, botIds, now: Date.now() });
-      })().catch(error => { metadata.delete(s.room.id); throw error; }));
-      await metadata.get(s.room.id);
-      // A member may bring another owned companion after this room was first cached.
-      await getDbClient().drizzle.insert(botGroupMembers).values({ groupId: s.room.id, botId: bot.id, position: 0, lastSeenSequence: 0, joinedAt: Date.now() }).onConflictDoNothing();
-      if (execution.plan_id) {
-        run.plan = (await api<ServerPlan[]>(`/conversations/${s.room.id}/plans?ids=${execution.plan_id}`)).find(p => p.id === execution.plan_id);
-        if (!run.plan) throw new Error('PLAN_CLOSED');
-        if (execution.access_mode !== 'chat') {
-          const settings = workspaces().read(s.room.id) ?? { projectDir: null, plans: {} };
-          // Each grant has its own workspace. Revoked grants cannot reuse private context.
-          const key = `${run.plan.id}:${execution.access_mode}:${execution.access_revision}`;
-          run.workspace = settings.plans[key] ?? (execution.access_mode === 'owner' ? settings.plans[run.plan.id] : undefined);
-          if (!run.workspace) {
-            const prepared = await deps.workDir?.prepare({ groupId: s.room.id, projectDir: settings.projectDir });
-            if (!prepared?.ok) throw new Error('WORKDIR_UNAVAILABLE');
-            run.workspace = prepared;
-            settings.plans[key] = prepared; settings.plans[run.plan.id] = prepared;
-            if (!current()) throw new Error('OWNER_CHANGED');
-            workspaces().save(s.room.id, settings);
+      // Lane setup and context metadata reads run together; attachment bytes wait for setup
+      // to succeed so a failed setup cannot leave downloads running after settlement.
+      const laneSetup = (async () => {
+        // Metadata only: the server remains the sole message store and scheduler.
+        if (!metadata.has(s.room.id)) metadata.set(s.room.id, (async () => {
+          const client = getDbClient();
+          const [localRow] = await client.drizzle.select({ id: botGroups.id }).from(botGroups).where(eq(botGroups.id, s.room.id)).limit(1);
+          const botIds = s.members.filter(m => m.state === 'joined').map(m => localBot(m.id)?.id).filter((v): v is string => !!v);
+          if (!current()) throw new Error('OWNER_CHANGED');
+          if (!localRow) await client.tx('botGroups.create', { groupId: s.room.id, name: s.room.name, botIds, now: Date.now() });
+        })().catch(error => { metadata.delete(s.room.id); throw error; }));
+        await metadata.get(s.room.id);
+        // A member may bring another owned companion after this room was first cached.
+        await getDbClient().drizzle.insert(botGroupMembers).values({ groupId: s.room.id, botId: bot.id, position: 0, lastSeenSequence: 0, joinedAt: Date.now() }).onConflictDoNothing();
+        if (execution.plan_id && planRead) {
+          run.plan = (await planRead).find(p => p.id === execution.plan_id);
+          if (!run.plan) throw new Error('PLAN_CLOSED');
+          if (execution.access_mode !== 'chat') {
+            const settings = workspaces().read(s.room.id) ?? { projectDir: null, plans: {} };
+            // Each grant has its own workspace. Revoked grants cannot reuse private context.
+            const key = `${run.plan.id}:${execution.access_mode}:${execution.access_revision}`;
+            run.workspace = settings.plans[key] ?? (execution.access_mode === 'owner' ? settings.plans[run.plan.id] : undefined);
+            if (!run.workspace) {
+              const prepared = await deps.workDir?.prepare({ groupId: s.room.id, projectDir: settings.projectDir });
+              if (!prepared?.ok) throw new Error('WORKDIR_UNAVAILABLE');
+              run.workspace = prepared;
+              settings.plans[key] = prepared; settings.plans[run.plan.id] = prepared;
+              if (!current()) throw new Error('OWNER_CHANGED');
+              workspaces().save(s.room.id, settings);
+            }
+            run.beforeFiles = await deps.workDir?.snapshot(run.workspace.workDir);
           }
-          run.beforeFiles = await deps.workDir?.snapshot(run.workspace.workDir);
         }
-      }
-      const lane = await deps.ensureLane({ botId: bot.id, groupId: s.room.id, title: s.room.name,
-        chatAccess: { mode: execution.access_mode, revision: execution.access_revision },
-        ...(run.plan ? { plan: { planId: run.plan.id, workDir: run.workspace?.workDir ?? '', sessionId: run.workspace?.ownerSessionId ?? undefined } } : {}) });
-      if (!lane.ok) throw new Error(lane.errorCode);
-      run.sessionId = lane.sessionId;
-      run.releaseToolAuthority = registerGroupToolAuthority(lane.sessionId, {
-        botId: bot.id, mode: execution.access_mode,
-        sourceGroup: { groupId: s.room.id, name: s.room.name },
-        isCurrent: () => current() && running.get(execution.bot_id) === run && !run.settlement,
-        validate: async () => {
-          // Recheck metadata and the execution lease at the actual tool boundary.
-          // Group administrators cannot grant access to someone else's companion.
-          try {
-            const members = await api<Member[]>(`/conversations/${s.room.id}/members`);
-            const companion = members.find(m => m.id === execution.bot_id && m.kind === 'bot' && m.state === 'joined');
-            const requester = members.find(m => m.id === execution.requester_id && m.state === 'joined');
-            if (!companion || companion.ownerActorId !== selfId || !requester
-              || companion.accessRevision !== execution.access_revision
-              || (execution.access_mode === 'owner' ? requester.ownerActorId !== selfId : companion.guestAccess !== 'tools'))
-              throw new GroupToolAuthorizationError();
-            await updateExecution(run, 'heartbeat');
-          } catch (error) {
-            if (error instanceof ChatResponseError && [401, 403, 404, 409, 410].includes(error.status))
-              throw new GroupToolAuthorizationError();
-            throw error;
-          }
-        },
-      });
-      if (run.plan && run.workspace?.ownerSessionId) {
-        const settings = workspaces().read(s.room.id)!;
-        const key = `${run.plan.id}:${execution.access_mode}:${execution.access_revision}`;
-        run.workspace = { ...run.workspace, ownerSessionId: null };
-        settings.plans[key] = run.workspace; settings.plans[run.plan.id] = run.workspace;
-        workspaces().save(s.room.id, settings);
-      }
-      await deps.syncLanePermission?.(lane.sessionId, bot.id);
-      // A lease may have been superseded during lane setup; revalidate before Agent work.
-      await updateExecution(run, 'heartbeat');
+        const lane = await deps.ensureLane({ botId: bot.id, groupId: s.room.id, title: s.room.name,
+          chatAccess: { mode: execution.access_mode, revision: execution.access_revision },
+          ...(run.plan ? { plan: { planId: run.plan.id, workDir: run.workspace?.workDir ?? '', sessionId: run.workspace?.ownerSessionId ?? undefined } } : {}) });
+        if (!lane.ok) throw new Error(lane.errorCode);
+        run.sessionId = lane.sessionId;
+        run.releaseToolAuthority = registerGroupToolAuthority(lane.sessionId, {
+          botId: bot.id, mode: execution.access_mode,
+          sourceGroup: { groupId: s.room.id, name: s.room.name },
+          isCurrent: () => current() && running.get(execution.bot_id) === run && !run.settlement,
+          validate: async () => {
+            // Recheck metadata and the execution lease at the actual tool boundary.
+            // Group administrators cannot grant access to someone else's companion.
+            try {
+              const members = await api<Member[]>(`/conversations/${s.room.id}/members`);
+              const companion = members.find(m => m.id === execution.bot_id && m.kind === 'bot' && m.state === 'joined');
+              const requester = members.find(m => m.id === execution.requester_id && m.state === 'joined');
+              if (!companion || companion.ownerActorId !== selfId || !requester
+                || companion.accessRevision !== execution.access_revision
+                || (execution.access_mode === 'owner' ? requester.ownerActorId !== selfId : companion.guestAccess !== 'tools'))
+                throw new GroupToolAuthorizationError();
+              await updateExecution(run, 'heartbeat');
+            } catch (error) {
+              if (error instanceof ChatResponseError && [401, 403, 404, 409, 410].includes(error.status))
+                throw new GroupToolAuthorizationError();
+              throw error;
+            }
+          },
+        });
+        if (run.plan && run.workspace?.ownerSessionId) {
+          const settings = workspaces().read(s.room.id)!;
+          const key = `${run.plan.id}:${execution.access_mode}:${execution.access_revision}`;
+          run.workspace = { ...run.workspace, ownerSessionId: null };
+          settings.plans[key] = run.workspace; settings.plans[run.plan.id] = run.workspace;
+          workspaces().save(s.room.id, settings);
+        }
+        await deps.syncLanePermission?.(lane.sessionId, bot.id);
+        return lane;
+      })();
+      const contextRead = (async () => {
+        const history = await historyRead;
+        let page = [...history];
+        if (eventSource && !history.some(message => message.id === eventSource.id)) history.push(eventSource);
+        const plan = planRead ? (await planRead).find(p => p.id === execution.plan_id) : undefined;
+        if (plan) {
+          const missing = [...new Set([plan.source_message_id, ...plan.steps.flatMap(step => step.resultMessageId ? [step.resultMessageId] : []), ...(plan.note_message_ids ?? [])])]
+            .filter(messageId => !history.some(message => message.id === messageId));
+          history.push(...settledValues(await settleBounded(missing, TURN_DOWNLOAD_CONCURRENCY,
+            messageId => api<Message>(`/conversations/${s.room.id}/messages/${id.parse(messageId)}`))));
+        }
+        // The request is identified by the execution, not by recency. The mixed
+        // room page carries no Thread structure, so a Thread request also reads its
+        // root and replies explicitly, even when they predate the bounded page.
+        const source = run.context!.kind === 'message'
+          ? history.find(message => message.id === execution.source_message_id) ?? await readMessage(s.room.id, execution.source_message_id)
+          : undefined;
+        if (source?.origin === 'system') throw new Error('INVALID_EXECUTION_TRIGGER');
+        const threadRootId = source?.threadRootId ?? null;
+        let thread: { root?: Message; replies: Message[]; earlierRepliesOmitted: boolean; background: Message[] } | undefined;
+        if (threadRootId) {
+          const repliesRead = api<Message[]>(`/conversations/${s.room.id}/messages?threadRootId=${id.parse(threadRootId)}&limit=100&before=${contextBefore}`);
+          // Read the main timeline on its own: busy Threads can fill the mixed page.
+          const backgroundRead = api<Message[]>(`/conversations/${s.room.id}/messages?limit=${THREAD_BACKGROUND_LIMIT + 1}&before=${contextBefore}`);
+          const rootRead = readMessage(s.room.id, threadRootId);
+          for (const read of [backgroundRead, rootRead]) read.catch(() => undefined);
+          const replies = await repliesRead;
+          const background = await backgroundRead;
+          thread = { root: await rootRead, replies, earlierRepliesOmitted: replies.length >= 100,
+            background: background.filter(message => message.id !== threadRootId).slice(0, THREAD_BACKGROUND_LIMIT) };
+          if (source && !replies.some(message => message.id === source.id)) replies.push(source);
+        }
+        const focusMessages = [source, thread?.root, ...(thread?.replies ?? [])].flatMap(message => message ? [message] : []);
+        const focus = new Set(focusMessages.map(message => message.id));
+        // Text stays bounded, but unseen attachments may precede the latest text page.
+        // The server watermark is scoped to this bot/grant/plan step and advances only on success.
+        const attachmentHistory = [...history, ...[...focusMessages, ...(thread?.background ?? [])].filter(message => !history.some(known => known.id === message.id))];
+        const after = BigInt(execution.attachment_after_seq ?? '0');
+        while (execution.attachment_after_seq !== undefined && page.length === 100) {
+          const before = page.reduce((min, m) => BigInt(m.seq) < min ? BigInt(m.seq) : min, contextBefore);
+          if (before <= after + 1n) break;
+          page = await api<Message[]>(`/conversations/${s.room.id}/messages?all=true&limit=100&before=${before}`);
+          attachmentHistory.push(...page);
+        }
+        // Downloads share the media cache with other consumers. Start them only after the
+        // lane is ready, rather than cancelling a shared download on setup failure.
+        await laneSetup;
+        const attachments: BotGroupAttachment[] = [];
+        const missingAttachments: string[] = [];
+        // Attach a bounded newest set, and retain the names of older files in context.
+        // The request and its Thread come first so the cap cannot drop the files under discussion.
+        // A Thread request never carries other Threads' files, and its own Thread's files are
+        // offered again regardless of the watermark, which only records a successful turn.
+        const mediaDelivery = new Map<string, 'included' | 'not-included'>();
+        const order = (message: Message) => focus.has(message.id) ? 1 : 0;
+        const candidates: Array<{ mediaId: string; name: string }> = [];
+        for (const message of attachmentHistory.sort((a, b) => order(b) - order(a) || (BigInt(a.seq) < BigInt(b.seq) ? 1 : -1))) for (const block of message.content) {
+          if (thread && message.threadRootId && !focus.has(message.id)) continue;
+          if (message.deleted || block.type !== 'media' || !block.mediaId || mediaDelivery.has(block.mediaId)) continue;
+          if (BigInt(message.seq) <= after && !(thread && focus.has(message.id))) continue;
+          mediaDelivery.set(block.mediaId, 'not-included');
+          candidates.push({ mediaId: block.mediaId, name: block.caption ?? block.mediaId });
+        }
+        // The first 40 files in that order that download are attached, as when they were read
+        // one by one; a few download at once. A failed file frees its place for the next one.
+        let next = 0;
+        while (next < candidates.length && attachments.length < 40) {
+          const batch = candidates.slice(next, next + 40 - attachments.length);
+          next += batch.length;
+          const results = await settleBounded(batch, TURN_DOWNLOAD_CONCURRENCY, async candidate => {
+            return media.download(s.room.id, id.parse(candidate.mediaId));
+          });
+          results.forEach((result, index) => {
+            if (result.status === 'fulfilled') { attachments.push(result.value); mediaDelivery.set(batch[index]!.mediaId, 'included'); }
+            else missingAttachments.push(batch[index]!.name);
+          });
+        }
+        for (const candidate of candidates.slice(next)) missingAttachments.push(candidate.name);
+        return { history, source, threadRootId, thread, focusMessages, attachments, missingAttachments, mediaDelivery };
+      })();
+      // Observed here so a read that fails after a failed setup is not an unhandled rejection.
+      contextRead.catch(() => undefined);
+      const lane = await laneSetup;
+      const { history, source, threadRootId, thread, focusMessages, attachments, missingAttachments, mediaDelivery } = await contextRead;
       if (!current()) throw new Error('OWNER_CHANGED');
-      const history = await api<Message[]>(`/conversations/${s.room.id}/messages?all=true&limit=100&before=${BigInt(execution.context_seq) + 1n}`);
-      let page = [...history];
-      if (eventSource && !history.some(message => message.id === eventSource.id)) history.push(eventSource);
-      if (run.plan) for (const messageId of new Set([run.plan.source_message_id, ...run.plan.steps.flatMap(step => step.resultMessageId ? [step.resultMessageId] : []), ...(run.plan.note_message_ids ?? [])])) {
-        if (!history.some(message => message.id === messageId)) history.push(await api<Message>(`/conversations/${s.room.id}/messages/${id.parse(messageId)}`));
-      }
-      // The request is identified by the execution, not by recency. The mixed
-      // room page carries no Thread structure, so a Thread request also reads its
-      // root and replies explicitly, even when they predate the bounded page.
-      const source = run.context.kind === 'message'
-        ? history.find(message => message.id === execution.source_message_id) ?? await readMessage(s.room.id, execution.source_message_id)
-        : undefined;
-      if (source?.origin === 'system') throw new Error('INVALID_EXECUTION_TRIGGER');
-      const threadRootId = source?.threadRootId ?? null;
-      let thread: { root?: Message; replies: Message[]; earlierRepliesOmitted: boolean; background: Message[] } | undefined;
-      if (threadRootId) {
-        const before = BigInt(execution.context_seq) + 1n;
-        const replies = await api<Message[]>(`/conversations/${s.room.id}/messages?threadRootId=${id.parse(threadRootId)}&limit=100&before=${before}`);
-        // Read the main timeline on its own: busy Threads can fill the mixed page.
-        const background = await api<Message[]>(`/conversations/${s.room.id}/messages?limit=${THREAD_BACKGROUND_LIMIT + 1}&before=${before}`);
-        thread = { root: await readMessage(s.room.id, threadRootId), replies, earlierRepliesOmitted: replies.length >= 100,
-          background: background.filter(message => message.id !== threadRootId).slice(0, THREAD_BACKGROUND_LIMIT) };
-        if (source && !replies.some(message => message.id === source.id)) replies.push(source);
-      }
-      const focusMessages = [source, thread?.root, ...(thread?.replies ?? [])].flatMap(message => message ? [message] : []);
-      const focus = new Set(focusMessages.map(message => message.id));
-      // Text stays bounded, but unseen attachments may precede the latest text page.
-      // The server watermark is scoped to this bot/grant/plan step and advances only on success.
-      const attachmentHistory = [...history, ...[...focusMessages, ...(thread?.background ?? [])].filter(message => !history.some(known => known.id === message.id))];
-      const after = BigInt(execution.attachment_after_seq ?? '0');
-      while (execution.attachment_after_seq !== undefined && page.length === 100) {
-        const before = page.reduce((min, m) => BigInt(m.seq) < min ? BigInt(m.seq) : min, BigInt(execution.context_seq) + 1n);
-        if (before <= after + 1n) break;
-        page = await api<Message[]>(`/conversations/${s.room.id}/messages?all=true&limit=100&before=${before}`);
-        attachmentHistory.push(...page);
-      }
-      const attachments: BotGroupAttachment[] = [];
-      const missingAttachments: string[] = [];
-      // Attach a bounded newest set, and retain the names of older files in context.
-      // The request and its Thread come first so the cap cannot drop the files under discussion.
-      // A Thread request never carries other Threads' files, and its own Thread's files are
-      // offered again regardless of the watermark, which only records a successful turn.
-      const mediaDelivery = new Map<string, 'included' | 'not-included'>();
-      const order = (message: Message) => focus.has(message.id) ? 1 : 0;
-      for (const message of attachmentHistory.sort((a, b) => order(b) - order(a) || (BigInt(a.seq) < BigInt(b.seq) ? 1 : -1))) for (const block of message.content) {
-        if (thread && message.threadRootId && !focus.has(message.id)) continue;
-        if (message.deleted || block.type !== 'media' || !block.mediaId || mediaDelivery.has(block.mediaId)) continue;
-        if (BigInt(message.seq) <= after && !(thread && focus.has(message.id))) continue;
-        mediaDelivery.set(block.mediaId, 'not-included');
-        if (attachments.length >= 40) { missingAttachments.push(block.caption ?? block.mediaId); continue; }
-        try { attachments.push(await media.download(s.room.id, id.parse(block.mediaId))); mediaDelivery.set(block.mediaId, 'included'); }
-        catch { missingAttachments.push(block.caption ?? block.mediaId); }
-      }
       // A quote resolves against every message this run read; otherwise its card snapshot stands.
       const readMessages = [...history, ...focusMessages, ...(thread?.background ?? [])];
       const promptMessage = (m: Message) => {
@@ -1421,6 +1663,68 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
   let polling = false;
   let pollRetryAt = 0;
   let pollFailures = 0;
+  /** The same backoff for the two-second poll and realtime-triggered claims (auth recovery rules). */
+  function pollFailed(error: unknown) {
+    if (error instanceof ChatResponseError && (error.status === 401 || error.status === 429)) {
+      pollRetryAt = Math.max(Date.now() + CHAT_AUTH_RETRY_MS, error.retryAt ?? 0);
+    } else if (!(error instanceof ChatResponseError) || error.status >= 500) {
+      pollFailures += 1;
+      pollRetryAt = Date.now() + Math.min(60_000, 2_000 * 2 ** Math.min(pollFailures - 1, 5));
+    }
+  }
+  const ownedActiveBot = (actorId: string) => actors.some(a => a.id === actorId && a.kind === 'bot' && localBot(a.id)?.status === 'active');
+  /** A realtime change announcing work this device may claim: newly queued, for one of its companions or unspecified. */
+  function queuedForThisDevice(change: unknown) {
+    const value = change as { type?: unknown; data?: { status?: unknown; botId?: unknown } } | null;
+    return value?.type === 'execution.changed' && value.data?.status === 'queued'
+      && (typeof value.data.botId !== 'string' || ownedActiveBot(value.data.botId));
+  }
+  /** One claim per idle owned companion, all at once; the first failure in companion order is reported. */
+  async function claimOnce() {
+    const idle = actors.filter(a => a.kind === 'bot' && localBot(a.id)?.status === 'active' && !running.has(a.id)
+      // Only the registered home runs a companion: skip while the home is elsewhere or not yet
+      // registered (an unset home would let any copy of the owner claim it).
+      && !(companionHome && a.homeDeviceId !== selfDeviceId)
+      // Shadowed here (demoted, or run by another installation on this device), or this
+      // installation is not yet confirmed to run it (the server only tells devices apart): never claim.
+      && !(companionHome && (companion?.isShadowed(a.externalId) || !companion?.installConfirmed(a.externalId))));
+    settledValues(await settleBounded(idle, idle.length, async actor => {
+      let claim: { execution: Execution | null };
+      const payload = { operationId: randomUUID(), executorId, accessPolicyVersion: 1, planVersion: 1, ...(directRoomClaims ? { directRoomVersion: 1 } : {}) };
+      // Parallel claims may see another companion's downgrade; each judges the request it sent.
+      const withEvents = memberJoinedClaims;
+      try {
+        claim = await api('/executions/claim', 'POST', { ...payload, ...(withEvents ? { memberJoinedVersion: 1 } : {}) }, actor.id);
+      } catch (error) {
+        if (!withEvents || !(error instanceof ChatResponseError) || error.status !== 400 || error.message !== 'INVALID_INPUT') throw error;
+        memberJoinedClaims = false;
+        claim = await api('/executions/claim', 'POST', payload, actor.id);
+      }
+      const { execution } = claim;
+      if (execution) void runExecution(execution);
+    }));
+  }
+  // Claims never overlap: two claims for one companion could each lease work only one can run.
+  let claiming: Promise<void> | undefined;
+  let claimAgain = false;
+  function claimAll(): Promise<void> {
+    claiming ??= (async () => {
+      do { claimAgain = false; await claimOnce(); } while (claimAgain && current());
+    })().finally(() => { claiming = undefined; });
+    return claiming;
+  }
+  let claimTrigger: ReturnType<typeof setTimeout> | undefined;
+  /** Claims newly queued work shortly after its realtime notice; the two-second poll stays the fallback. */
+  function triggerClaim() {
+    if (claimTrigger || !current()) return;
+    claimTrigger = setTimeout(() => {
+      claimTrigger = undefined;
+      if (!current() || !selfId || Date.now() < pollRetryAt) return;
+      // A claim already in flight runs once more; a poll about to claim covers it.
+      if (polling || claiming) { claimAgain = true; return; }
+      void claimAll().catch(pollFailed);
+    }, CLAIM_TRIGGER_MS);
+  }
   const timer = setInterval(() => {
     if (!current() || polling || Date.now() < pollRetryAt) return;
     polling = true;
@@ -1429,34 +1733,13 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
       await register();
       beginUpgrade();
       if (!socket) connect();
-      for (const actor of actors.filter(a => a.kind === 'bot' && localBot(a.id)?.status === 'active')) {
-        if (running.has(actor.id)) continue;
-        // Only the registered home runs a companion: skip while the home is elsewhere or not yet
-        // registered (an unset home would let any copy of the owner claim it).
-        if (companionHome && actor.homeDeviceId !== selfDeviceId) continue;
-        // Shadowed here (demoted, or run by another installation on this device), or this
-        // installation is not yet confirmed to run it (the server only tells devices apart): never claim.
-        if (companionHome && (companion?.isShadowed(actor.externalId) || !companion?.installConfirmed(actor.externalId))) continue;
-        let claim: { execution: Execution | null };
-        const payload = { operationId: randomUUID(), executorId, accessPolicyVersion: 1, planVersion: 1, ...(directRoomClaims ? { directRoomVersion: 1 } : {}) };
-        try {
-          claim = await api('/executions/claim', 'POST', { ...payload, ...(memberJoinedClaims ? { memberJoinedVersion: 1 } : {}) }, actor.id);
-        } catch (error) {
-          if (!memberJoinedClaims || !(error instanceof ChatResponseError) || error.status !== 400 || error.message !== 'INVALID_INPUT') throw error;
-          memberJoinedClaims = false;
-          claim = await api('/executions/claim', 'POST', payload, actor.id);
-        }
-        const { execution } = claim;
-        if (execution) void runExecution(execution);
-      }
-    })().then(() => { pollFailures = 0; pollRetryAt = 0; }).catch(error => {
-      if (error instanceof ChatResponseError && (error.status === 401 || error.status === 429)) {
-        pollRetryAt = Math.max(Date.now() + CHAT_AUTH_RETRY_MS, error.retryAt ?? 0);
-      } else if (!(error instanceof ChatResponseError) || error.status >= 500) {
-        pollFailures += 1;
-        pollRetryAt = Date.now() + Math.min(60_000, 2_000 * 2 ** Math.min(pollFailures - 1, 5));
-      }
-    }).finally(() => { polling = false; });
+      if (claiming) claimAgain = true;
+      else await claimAll();
+    })().then(() => { pollFailures = 0; pollRetryAt = 0; }).catch(pollFailed).finally(() => {
+      polling = false;
+      // A realtime notice that arrived after this poll's claims still claims promptly.
+      if (claimAgain && !claiming) { claimAgain = false; triggerClaim(); }
+    });
   }, 2000);
   const checking = new Set<Running>();
   const recheck = new Set<Running>();
@@ -1514,8 +1797,13 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
     deps.log?.warn('Chat group action failed', chatErrorDiagnostic(error));
     return chatGroupFailure(error instanceof z.ZodError ? new Error('INVALID_PARAMS') : error);
   });
+  /** A message that names nobody needs no member read: its mention list is empty either way. */
+  const namesNobody = (mentions: { all: boolean; botIds: string[] }) => !mentions.all && !mentions.botIds.length;
   async function mentionIds(roomId: string, mentions: { all: boolean; botIds: string[] }) {
-    const members = await api<Member[]>(`/conversations/${roomId}/members`);
+    if (namesNobody(mentions)) return [];
+    return resolveMentions(await api<Member[]>(`/conversations/${roomId}/members`), mentions);
+  }
+  function resolveMentions(members: Member[], mentions: { all: boolean; botIds: string[] }) {
     const joined = members.filter(m => m.state === 'joined');
     // A stale explicit target must never become an unaddressed message. Check
     // every pick, including mixed valid/stale picks, before expanding Everyone.
@@ -1598,9 +1886,14 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
     thread: input => result(async () => {
       const i = z.object({ groupId: id, rootId: id, before: z.number().int().positive().optional(), sourceMessageIds: z.array(id).optional() }).parse(input);
       i.groupId = await groupRoom(i.groupId);
-      const members = await api<Member[]>(`/conversations/${i.groupId}/members`);
-      const root = await api<Message>(`/conversations/${i.groupId}/messages/${i.rootId}`);
-      const page = await api<Message[]>(`/conversations/${i.groupId}/messages?threadRootId=${i.rootId}&limit=50${i.before ? `&before=${i.before}` : ''}`);
+      // One round trip; awaited in the former order so the same failure is reported first.
+      const membersRead = api<Member[]>(`/conversations/${i.groupId}/members`);
+      const rootRead = api<Message>(`/conversations/${i.groupId}/messages/${i.rootId}`);
+      const pageRead = api<Message[]>(`/conversations/${i.groupId}/messages?threadRootId=${i.rootId}&limit=50${i.before ? `&before=${i.before}` : ''}`);
+      for (const read of [rootRead, pageRead]) read.catch(() => undefined);
+      const members = await membersRead;
+      const root = await rootRead;
+      const page = await pageRead;
       const executionFailures = await failureSnapshot(i.groupId, members, [...(i.sourceMessageIds ?? []), root.id, ...page.map(m => m.id)]);
       // A share in the main chat can itself be a thread root.
       const rootViews = await messageViews(i.groupId, [root], members);
@@ -1708,6 +2001,22 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
    * deleted since, so the server returns the message it already stored instead of a second one.
    */
   const postedQuotes = new Map<string, BotGroupQuoteView>();
+  /**
+   * A sidebar summary. The room list carries each room's change head, which every message,
+   * execution, plan and membership change advances; a room whose head, revision and local state
+   * (planning, running turns, upgrade notices: its change generation) are unchanged is not
+   * re-read, so a push re-reads only the rooms that changed. Old servers without a head re-read.
+   */
+  async function summary(room: Room & { head?: unknown }): Promise<BotGroupDetail> {
+    const head = typeof room.head === 'string' && /^\d+$/.test(room.head) ? room.head : null;
+    const key = head === null ? null : JSON.stringify([head, room.revision, room.updated_at, generation(room.id), registryKey]);
+    const known = summaries.get(room.id);
+    if (key !== null && known?.key === key && Date.now() - known.at < SUMMARY_REUSE_MS) return known.value;
+    const value = await detail(room.id, undefined, true);
+    if (key !== null && current() && JSON.stringify([head, room.revision, room.updated_at, generation(room.id), registryKey]) === key)
+      summaries.set(room.id, { key, value, at: Date.now() });
+    return value;
+  }
   const sendMessage: BotGroupChatService['sendMessage'] = (input, origin) => safe(async () => {
     const started = Date.now();
     const i = z.object({ groupId: id, text: z.string().max(8000), clientId: z.string().min(8).max(160),
@@ -1717,11 +2026,23 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
     if (!i.text.trim() && !i.attachments?.length) throw new Error('INVALID_INPUT');
     // An attempted send must not cancel a valid decision until its message exists.
     const intentVersion = ++nextIntentVersion;
-    const s = await groupSnapshot(i.groupId);
-    // Read before preparing attachments: an unavailable quote must not stage files.
+    // The reads a send needs share one round trip (none for a snapshot the live subscription
+    // vouches for). Each is awaited in the former order, so the first failure reported is the
+    // one the serial version reported.
+    const snapshotRead = recentSnapshot(i.groupId, true);
+    // An unopened room must be confirmed as a group before reading its other resources.
+    if (!rooms.has(i.groupId)) await snapshotRead;
     const quoteKey = i.quote ? `${i.groupId}:${i.clientId}:${i.quote.messageId}` : '';
-    const quote = i.quote ? postedQuotes.get(quoteKey) ?? await quoteSnapshot(i.groupId, i.quote.messageId, s.members) : null;
-    const plans = await api<ServerPlan[]>(`/conversations/${i.groupId}/plans`);
+    const knownQuote = i.quote ? postedQuotes.get(quoteKey) : undefined;
+    const snapshotMembers = snapshotRead.then(value => value.members);
+    const quoteRead = i.quote && !knownQuote ? quoteSnapshot(i.groupId, i.quote.messageId, snapshotMembers) : undefined;
+    const plansRead = api<ServerPlan[]>(`/conversations/${i.groupId}/plans`);
+    const membersRead = namesNobody(i.mentions) ? undefined : api<Member[]>(`/conversations/${i.groupId}/members`);
+    for (const read of [snapshotMembers, quoteRead, plansRead, membersRead]) read?.catch(() => undefined);
+    const s = await snapshotRead;
+    // Read before preparing attachments: an unavailable quote must not stage files.
+    const quote = i.quote ? knownQuote ?? await quoteRead! : null;
+    const plans = await plansRead;
     const openPlan = plans.find(p => ['proposed','running','waiting'].includes(p.status));
     const proposed = openPlan?.status === 'proposed' && openPlan.creator_id === selfId;
     if (i.division && openPlan && !proposed) throw new Error('PLAN_OPEN');
@@ -1737,7 +2058,7 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
     let result: { id: string };
     let posting = false;
     try {
-      const mentions = await mentionIds(i.groupId, i.mentions);
+      const mentions = membersRead ? resolveMentions(await membersRead, i.mentions) : [];
       const uploaded = await media.upload(i.groupId, i.clientId, prepared?.ok ? prepared.attachments : [], selfId);
       // Cached only once the message may reach the server; a failure before this stored nothing.
       if (quote) {
@@ -1757,20 +2078,32 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
       throw error;
     }
     if (prepared?.ok) prepared.commit();
-    const intent = intentVersion > (acceptedIntentVersions.get(i.groupId) ?? 0)
-      ? await replacePlanIntent(i.groupId, intentVersion) : null;
-    if (shouldPlan) {
-      if (!intent || planIntents.get(i.groupId) !== intent) await cancelPlanning(i.groupId, result.id);
-      else {
-        intent.sourceId = result.id;
-        void decideArrangement(s, result.id, i.text, i.division === true, prepared?.ok ? prepared.attachments : [], intent, quote).catch(() => undefined);
-      }
-    }
     deps.log?.info?.('Chat group send confirmed', { groupId: i.groupId, messageId: result.id,
       trace: createHash('sha256').update(i.clientId).digest('hex').slice(0, 16), durationMs: Date.now() - started });
-    // Only a send that finished, bookkeeping included, has a receipt; until then a retry needs the same quote.
+    // The message exists: the send is answered now and its receipt answers any retry, so the
+    // quote snapshot is no longer needed. Arrangement bookkeeping continues after the answer.
     postedQuotes.delete(quoteKey);
-    changed(i.groupId); return { ok: true as const, messageId: result.id };
+    const roomId = i.groupId;
+    const messageId = result.id;
+    void (async () => {
+      // Installing the intent is synchronous, so a newer send or control action still
+      // supersedes this one in order; only the cancels of replaced decisions are awaited.
+      const installed = intentVersion > (acceptedIntentVersions.get(roomId) ?? 0) ? installPlanIntent(roomId, intentVersion) : null;
+      if (installed) await cancelPlanningWithRetry(roomId, () => flushPlanCancels(roomId, installed.previousSourceId));
+      const intent = installed?.intent ?? null;
+      if (shouldPlan) {
+        // Overtaken by a newer message or control action: this message must not stay deferred,
+        // so its cancel gets the same immediate retry as a replaced decision's.
+        if (!intent || planIntents.get(roomId) !== intent) await cancelPlanningWithRetry(roomId, () => cancelPlanning(roomId, messageId));
+        else {
+          intent.sourceId = messageId;
+          void decideArrangement(s, messageId, i.text, i.division === true, prepared?.ok ? prepared.attachments : [], intent, quote).catch(() => undefined);
+        }
+      }
+    })().catch(error => deps.log?.warn('Group send bookkeeping failed', { groupId: roomId, ...chatErrorDiagnostic(error) }));
+    // Acknowledge the write locally even if the room subscription has no server echo yet.
+    changed(roomId);
+    return { ok: true as const, messageId };
   });
   // A lost controller ACK must not consume the phone upload or submit the same message twice.
   const pendingSends = new Map<string, ReturnType<BotGroupChatService['sendMessage']>>();
@@ -1778,14 +2111,14 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
   return {
     chatServer,
     listGroups: () => safe(async () => {
-      await register(); await syncPersonalList(); beginUpgrade();
+      await ensureRegistered(); await syncPersonalList(); beginUpgrade();
       const groups: BotGroupDetail[] = [];
       let after: string | undefined;
       do {
-        const page = await api<Array<Room & { state: string }>>(`/conversations?limit=100${after ? `&after=${after}` : ''}`);
+        const page = await api<Array<Room & { state: string; head?: unknown }>>(`/conversations?limit=100${after ? `&after=${after}` : ''}`);
+        // Only group rooms belong in the group list.
         const joined = page.filter(r => r.state === 'joined' && isGroupRoom(r) && !personalList.hidden(r.id));
-        for (let i = 0; i < joined.length; i += 8)
-          groups.push(...await Promise.all(joined.slice(i, i + 8).map(r => detail(r.id, undefined, true))));
+        groups.push(...settledValues(await settleBounded(joined, SUMMARY_CONCURRENCY, room => summary(room))));
         after = page.length === 100 ? page.at(-1)!.id : undefined;
       } while (after);
       return { ok: true as const, groups: groups.filter(group => !personalList.hidden(group.id)) };
@@ -1833,6 +2166,7 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
       const i = z.object({ groupId: id, name: z.string().min(1).max(40).optional(), replyMode: z.enum(['all', 'mentioned']).optional(),
         speakingMode: z.enum(['auto', 'sequential']).optional(), organizerBotId: z.string().nullable().optional(), projectDir: z.string().max(4096).nullable().optional(), expectedRevision: z.number().int().positive().optional() }).parse(input);
       i.groupId = await resolveGroup(i.groupId);
+      if (i.organizerBotId) await register();
       const s = await groupSnapshot(i.groupId);
       let projectDir = i.projectDir;
       if (projectDir) { const checked = await deps.validateProjectDir?.(projectDir); if (!checked?.ok) throw new Error('INVALID_DIRECTORY'); projectDir = checked.dir; }
@@ -1943,7 +2277,7 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
     },
     setMembers: input => safe(async () => {
       const i = z.object({ groupId: id, botIds: z.array(z.string()).max(6), addOnly: z.boolean().optional() }).parse(input);
-      const room = await resolveGroup(i.groupId); const s = await groupSnapshot(room);
+      const room = await resolveGroup(i.groupId); await register(); const s = await groupSnapshot(room);
       const selected = i.botIds.map(bot => actors.find(a => a.externalId === bot)?.id ?? id.parse(bot));
       for (const m of s.members.filter(m => !i.addOnly && m.kind === 'bot' && m.state === 'joined' && !selected.includes(m.id)))
         await api(`/conversations/${room}/members`, 'POST', { operationId: randomUUID(), actorId: m.id, action: 'remove' }, managementActor(s));
@@ -1955,6 +2289,7 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
       const room = await resolveGroup(id.parse(groupId)); const s = await groupSnapshot(room);
       if (s.members.some(m => m.ownerActorId === selfId && m.role === 'owner')) await api(`/conversations/${room}`, 'PATCH', { operationId: randomUUID(), expectedRevision: s.room.revision, archived: true }, managementActor(s));
       else await api(`/conversations/${room}/members`, 'POST', { operationId: randomUUID(), actorId: selfId, action: 'leave' });
+      resolvedGroups.delete(id.parse(groupId));
       changed(room); return { ok: true as const };
     }),
     continueRound: groupId => safe(async () => {
@@ -1970,10 +2305,14 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
     continuePlan: input => safe(() => actPlan(input, 'continue')), retryPlan: input => safe(() => actPlan(input, 'retry')),
     editPlanStep: input => safe(() => actPlan(input, 'reassign')),
     dispose: () => {
-      disposed = true; threads.dispose(); clearInterval(timer); clearInterval(heartbeat); clearTimeout(reconnect); socket?.close();
+      disposed = true; threads.dispose(); clearInterval(timer); clearInterval(heartbeat); clearTimeout(reconnect); clearTimeout(claimTrigger); socket?.close();
       companion?.dispose(); companion = undefined; deps.companionCloud?.homes.reset();
       for (const refresh of attachmentRefreshes.values()) clearTimeout(refresh);
       attachmentRefreshes.clear();
+      for (const pending of pendingChanges.values()) clearTimeout(pending);
+      pendingChanges.clear();
+      for (const retry of planCancelRetries.values()) clearTimeout(retry);
+      planCancelRetries.clear();
       for (const run of running.values()) {
         run.releaseToolAuthority?.();
         if (run.sessionId) void deps.abortLane(run.sessionId).catch(() => undefined);

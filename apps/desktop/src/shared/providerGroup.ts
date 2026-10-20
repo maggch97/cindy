@@ -6,6 +6,7 @@
  * 选一台组内电脑运行 Agent。产品规则见 docs/product-rules/provider-groups.md。
  */
 import { isProviderShareAgentDeviceId, PROVIDER_SHARE_AGENT_DEVICE_PREFIX } from './providerShare.js';
+import type { ProviderManagementRequest, ProviderManagementResult } from './providerManagement';
 
 export const PROVIDER_GROUP_IPC = {
   /** Renderer → Main：全部操作走同一个命令通道。 */
@@ -173,17 +174,23 @@ export interface ProviderGroupCandidate {
   blocked?: ProviderGroupCandidateBlock;
 }
 
-export type ProviderGroupCommand =
+export type ProviderGroupLocalCommand =
   | { action: 'get'; providerId: string }
   | { action: 'candidates'; providerId: string }
   | { action: 'save'; providerId: string; config: ProviderGroupConfig }
   | { action: 'delete'; providerId: string }
+  /** 设置页按编辑时的完整配置保存；null 表示当时尚未建组。独立动作让旧端明确拒绝。 */
+  | { action: 'save-if-current'; providerId: string; config: ProviderGroupConfig; expectedConfig: ProviderGroupConfig | null }
+  | { action: 'delete-if-current'; providerId: string; expectedConfig: ProviderGroupConfig | null }
   /** 同账号另一台电脑上这个供应商的组与组内电脑状态(只读)。 */
   | { action: 'remote-view'; providerId: string; deviceId: string }
   /** 本机全部组的设置(不读远端)。 */
   | { action: 'list' }
   /** 这个任务此刻归哪个组(模型列表把它显示在组那一项下)。 */
   | { action: 'session-group'; sessionId: string };
+
+export type ProviderGroupCommand = ProviderGroupLocalCommand
+  | { action: 'remote-manage'; deviceId: string; request: ProviderManagementRequest };
 
 /**
  * 任务此刻归的组：`groupDeviceId` 为组所在电脑，null = 这台电脑自己建的组；`providerId` 是组那一项在组所在电脑上的
@@ -192,11 +199,12 @@ export type ProviderGroupCommand =
 export type ProviderGroupSessionGroup = { groupDeviceId: string | null; providerId: string } | null;
 
 export type ProviderGroupCommandResult<C extends ProviderGroupCommand> =
-  C extends { action: 'list' } ? Record<string, ProviderGroupConfig>
+  C extends { action: 'remote-manage'; request: infer R extends ProviderManagementRequest } ? ProviderManagementResult<R>
+  : C extends { action: 'list' } ? Record<string, ProviderGroupConfig>
   : C extends { action: 'get' } ? ProviderGroupView
     : C extends { action: 'candidates' } ? ProviderGroupCandidate[]
-      : C extends { action: 'save' } ? ProviderGroupView
-        : C extends { action: 'delete' } ? ProviderGroupView
+      : C extends { action: 'save' | 'save-if-current' } ? ProviderGroupView
+        : C extends { action: 'delete' | 'delete-if-current' } ? ProviderGroupView
           : C extends { action: 'remote-view' } ? ProviderGroupView
             : C extends { action: 'session-group' } ? ProviderGroupSessionGroup
               : never;
@@ -400,11 +408,11 @@ export type ProviderGroupRemoteRequest =
   /** 新任务该用组里哪台；选中即给那台记一个短暂的占用，同时开的几个任务不会全落到同一台。 */
   | { action: 'pick'; sessionId: string; providerId: string; agentKind: 'claude-code' | 'codex' | 'pi'; model: string; exclude: string[] }
   /** 那台电脑出了问题(用量上限、登录失效、服务繁忙)：组所在电脑冷却它，不再分新任务。 */
-  | { action: 'cool'; providerId: string; memberKey: string; cause: ProviderGroupRemoteCoolCause; resetAt?: number }
+  | { action: 'cool' | 'cool-model'; providerId: string; memberKey: string; cause: ProviderGroupRemoteCoolCause; resetAt?: number; model?: string }
   /** 这台电脑经组运行、正在跑的任务(整体替换上一份；seq 只增，乱序到达的旧份丢弃)。 */
   | { action: 'leases'; seq: number; entries: ProviderGroupRemoteLease[] }
   /** 组内电脑的状态(发送前检查、设置页展示)。 */
-  | { action: 'view'; providerId: string; model?: string; includeGuestSupport?: true }
+  | { action: 'view'; providerId: string; model?: string; agentKind?: 'claude-code' | 'codex' | 'pi'; includeGuestSupport?: true }
   /**
    * 这台电脑经组、在组里别的电脑上运行的用量(组所在电脑经手不到)：整体替换这台从 sinceDay 起(含；null = 全部)
    * 报过的行。seq 只增，乱序到达的旧份丢弃。
@@ -503,17 +511,21 @@ export function parseProviderGroupRemoteRequest(raw: unknown): ProviderGroupRemo
         exclude: exclude.map(remoteMemberKey),
       };
     }
-    case 'cool': {
+    case 'cool':
+    case 'cool-model': {
+      if (value.model !== undefined && (typeof value.model !== 'string' || !value.model.trim() || value.model.length > 512)) invalidRemote('invalid model');
+      if (value.action === 'cool-model' && (typeof value.model !== 'string' || value.cause !== 'usage-limit')) invalidRemote('invalid model cooldown');
       const cause = value.cause;
       if (!REMOTE_COOL_CAUSES.includes(cause as ProviderGroupRemoteCoolCause)) invalidRemote('invalid cause');
       const resetAt = typeof value.resetAt === 'number' && Number.isFinite(value.resetAt) && value.resetAt > 0
         ? value.resetAt
         : undefined;
       return {
-        action: 'cool',
+        action: value.action,
         providerId: remoteProviderId(value.providerId),
         memberKey: remoteMemberKey(value.memberKey),
         cause: cause as ProviderGroupRemoteCoolCause,
+        ...(typeof value.model === 'string' ? { model: value.model } : {}),
         ...(resetAt !== undefined ? { resetAt } : {}),
       };
     }
@@ -534,6 +546,9 @@ export function parseProviderGroupRemoteRequest(raw: unknown): ProviderGroupRemo
       };
     }
     case 'view': {
+      if (value.agentKind !== undefined && (typeof value.agentKind !== 'string' || !REMOTE_AGENT_KINDS.has(value.agentKind))) {
+        invalidRemote('invalid agent');
+      }
       if (value.model !== undefined && (typeof value.model !== 'string' || !value.model || value.model.length > 512)) {
         invalidRemote('invalid model');
       }
@@ -541,6 +556,7 @@ export function parseProviderGroupRemoteRequest(raw: unknown): ProviderGroupRemo
         action: 'view',
         providerId: remoteProviderId(value.providerId),
         ...(value.model !== undefined ? { model: value.model } : {}),
+        ...(value.agentKind !== undefined ? { agentKind: value.agentKind as 'claude-code' | 'codex' | 'pi' } : {}),
         ...(value.includeGuestSupport === true ? { includeGuestSupport: true } : {}),
       };
     }

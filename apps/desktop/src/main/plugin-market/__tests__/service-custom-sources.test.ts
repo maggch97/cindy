@@ -74,6 +74,7 @@ vi.mock('../../logger.js', () => ({
   createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
 }));
 vi.mock('../../cindy-brain/index.js', () => ({
+  refreshPluginUsageBindings: vi.fn(async () => undefined),
   confirmLegacyLibraryReattach: async () => false,
   getGhostManager: () => ({
     list: () =>
@@ -2472,7 +2473,7 @@ describe('Agent custom marketplace boundaries', () => {
     expect(h.ledger.read()).toEqual(before);
   });
 
-  it('forwards live authority to custom package placement after packaging', async () => {
+  it.each(['early', 'late'])('forwards live authority to the %s custom package commit', async (stage) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-custom-agent-'));
     roots.push(root);
     const dir = writeLocalMarket(root, 'team-lib', [{ rel: 'plugins/alpha', id: 'alpha' }]);
@@ -2481,8 +2482,10 @@ describe('Agent custom marketplace boundaries', () => {
     let current = true;
     const place = vi.fn();
     runtime.install.mockImplementation(async (_file, options) => {
+      if (stage === 'late') options.beforeCommitInLock?.();
       current = false;
-      options.beforeCommitInLock?.();
+      if (stage === 'early') options.beforeCommitInLock?.();
+      else options.assertCurrent?.();
       place();
       throw new Error('unreachable');
     });

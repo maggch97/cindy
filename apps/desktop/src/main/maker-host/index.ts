@@ -1,3 +1,4 @@
+import { readGeneratedImageEpoch } from '../cindy-media/generatedImageStorage';
 import { readAgentCapabilityCatalog, RUNTIME_MCP_NAMES_KEY, type AgentCapabilityQuery } from './agentCapabilityCatalog.js';
 import { listCindyManagedSkills, prepareCindyCodexSkills } from './managed-skills.js';
 import { scanLocalCustomizations } from '../skillhub/customizationScanHost';
@@ -225,6 +226,7 @@ import {
   getRipgrepBinaryPath,
 } from './runtime-configs.js';
 import { createDeviceAgentStarter } from '../remote-agent/controller/service.js';
+import { readRemoteAgentIdleReleaseMinutes } from '../remote-agent/controller/idleReleaseStore.js';
 import { extractReviewPdfTextInChild } from '../reviewer/reviewPdfProcess.js';
 import { disposeRemoteAgentHost, installRemoteAgentHost } from '../remote-agent/host/service.js';
 import {
@@ -236,13 +238,14 @@ import { resolveDesktopClaudeSubagentModelAccess } from './subagent-model-access
 import { claudeSubagentUsageBridge } from './claude-subagent-usage-bridge.js';
 import { createAutoPermissionReviewer } from './auto-permission-reviewer.js';
 import { createToolLoopReviewer } from './tool-loop-reviewer.js';
-import { requestUtilityText } from '../utility-model/oneShotCandidates.js';
+import { createCustomAutoReviewFallback, requestUtilityText } from '../utility-model/oneShotCandidates.js';
 import {
   AUTO_REVIEW_ROUTER_GUARD_TIMEOUT_MS,
   createAutoReviewModelRouter,
 } from './auto-review-model-router.js';
 import { ensureCurrentAccountProviderReadiness } from './account-provider-readiness-ensure.js';
 import { ACCOUNT_PROVIDER_NOT_READY_CODE } from '../../shared/accountProviderReadiness.js';
+import { listBotImConnectionsForBot } from '../im/shared/botImConnectionStore.js';
 import {
   armCodexHttpRecovery,
   clearCodexProxyAuthInjection,
@@ -428,6 +431,7 @@ export function setProviderAccessRuntimeRefreshListener(listener: (() => void) |
 
 const requestAutoReviewText = createAutoReviewModelRouter({
   logger: desktopMakerLogger,
+  createAuxiliaryFallback: createCustomAutoReviewFallback,
 });
 
 let autoReviewContextResolver: AutoReviewDelegate['prepareRequest'];
@@ -1820,12 +1824,13 @@ export function getMaker(): Maker {
             extraEnv: {},
             codexProxyActive: false,
             codexBrowserUseAvailable: true,
-            buildSessionMcpConfig: (instance: string) =>
+            buildSessionMcpConfig: (instance: string, session?: { vendorOptions?: Record<string, unknown> }) =>
               buildRemoteCodexSessionMcpConfig(ctx.remoteHostId!, instance, {
                 bridgeInstanceId: getActiveCodexBridgeInstanceId(),
                 serverNames: getActiveCodexBridgeServerNames() ?? [],
                 collabEnabled: pluginRegistry.isEnabled('collab'),
                 makerMemoryEnabled: _maker?.makerMemory?.isEnabled() ?? false,
+                vendorOptions: session?.vendorOptions,
               }),
           };
         }
@@ -1859,7 +1864,8 @@ export function getMaker(): Maker {
         let buildSessionMcpConfig:
           | ((sessionInstanceId: string) => Record<string, unknown>)
           | undefined;
-        if (!isReview) {
+        // Review hosts and native-storage-only (archive) hosts never expose Cindy MCP tools.
+        if (!isReview && !ctx.nativeStorageOnly) {
           try {
             const cfg = await getCodexExtraSpawnConfig({
               mcpProviders: providers,
@@ -2727,6 +2733,9 @@ export function getMaker(): Maker {
         return result.skills;
       },
       listMcpServers: listBotRuntimeMcpServers,
+      // 伙伴绑了哪些平台的机器人(不含凭证): 主任务据此挂渠道原生 API 工具(见 hydrate 内注释)。
+      listBotImChannels: ({ botId }) =>
+        [...new Set(listBotImConnectionsForBot(botId).map((connection) => connection.channel))],
       listToolsets: async ({ botId, agentKind, workingDir, remoteHostId }) => {
         const registry = getPluginRegistry();
         return Promise.all(
@@ -2794,6 +2803,7 @@ export function getMaker(): Maker {
       logger: desktopMakerLogger,
       // Agent 在同账号另一台电脑上运行、任务与文件留在本机(见 remote-agent/)。
       startDeviceAgentSession: createDeviceAgentStarter({
+        readImageDeliveryEpoch: readGeneratedImageEpoch,
         remoteInvoke: remoteBackgroundInvoke,
         rgPath: getRipgrepBinaryPath,
         // 对方的 Codex 把本机当 exec-server 执行环境：用本机随包的同一个 codex。
@@ -2823,6 +2833,8 @@ export function getMaker(): Maker {
           const shareId = parseProviderShareAgentDeviceId(deviceId);
           return shareId !== null && isProviderShareCredentialConsentSkipped(shareId);
         },
+        // 名额紧张时闲置满这么多分钟的任务让出那台电脑上的 Agent 进程(「远程与分享」里的设置，0 = 不让)。
+        idleReleaseMinutes: readRemoteAgentIdleReleaseMinutes,
         logger: desktopMakerLogger,
       }),
       makerMemory: makerMemoryManager,

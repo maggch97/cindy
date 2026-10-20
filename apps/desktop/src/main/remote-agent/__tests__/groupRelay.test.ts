@@ -53,6 +53,8 @@ function fakeAgentHost(name: string, started: Started[], options: {
   guestRelayCapable?: boolean;
   purge?: (hostSessionIds: readonly string[], nativeIds: readonly string[]) => Promise<void>;
   groupRelay?: RemoteAgentGroupRelayDeps;
+  prepareImageEvent?: Parameters<typeof createRemoteAgentHost>[0]['prepareImageEvent'];
+  imageArtifacts?: Parameters<typeof createRemoteAgentHost>[0]['imageArtifacts'];
   /** 这台的 Agent 启动失败(启动前受邀者目录已经建好)。 */
   failStart?: boolean;
   /** 这台的 Agent 一启动就结束。 */
@@ -62,6 +64,8 @@ function fakeAgentHost(name: string, started: Started[], options: {
   resolveProvider?: NonNullable<Parameters<typeof createRemoteAgentHost>[0]['providerAccess']>['resolve'];
 }) {
   return createRemoteAgentHost({
+    prepareImageEvent: options.prepareImageEvent,
+    imageArtifacts: options.imageArtifacts,
     isAgentAvailable: () => true,
     startHosted: async (input) => {
       if (options.failStart) throw new Error('the agent could not start');
@@ -196,7 +200,7 @@ function setup(options: {
   /** mini 这台的 Agent 表现。 */
   mini?: { failStart?: boolean; endImmediately?: boolean };
   /** 组所在电脑本机的 Agent 表现(组选中本机这一台时)。 */
-  owner?: { failStart?: boolean };
+  owner?: { failStart?: boolean; prepareImageEvent?: Parameters<typeof createRemoteAgentHost>[0]['prepareImageEvent'] };
   /** 截住组所在电脑发给组内电脑的请求(模拟回包丢失、应答慢)。 */
   intercept?: (agentDeviceId: string, request: Record<string, unknown>, forward: () => Promise<unknown>) => Promise<unknown>;
 } = {}) {
@@ -316,6 +320,36 @@ describe('provider group relay for shared users', () => {
     await client.close('close', 'navigation');
   });
 
+  // #6420: the relay must retain the member's task/relay receipt, not just restage its bytes.
+  it('carries the upstream artifact identity and clear generation through the provider-group relay', async () => {
+    let finishPreparation!: () => void;
+    const waiting = new Promise<void>((resolve) => { finishPreparation = resolve; });
+    const prepareImageEvent = vi.fn(async (_sessionId: string, event: AgentEvent) => { await waiting; return event; });
+    const env = setup({ owner: { prepareImageEvent } });
+    const { client, stream, isClosed } = await openAsGuest(env, GUEST_A, openPayload(SESSION, { imageDeliveryEpoch: 123, acceptsImageDeliveryReceipts: true }));
+    try {
+      env.memberStarted.mini[0].emit({ type: 'image', source: 'codex', data: { kind: 'generation', blockId: 'image', deliveryEpoch: 999, url: 'data:image/png;base64,bytes' } } as AgentEvent);
+      env.memberStarted.mini[0].end();
+      await vi.waitFor(() => expect(prepareImageEvent).toHaveBeenCalledTimes(1));
+      expect(isClosed()).toBe(false);
+      finishPreparation();
+      const call = prepareImageEvent.mock.calls[0] as unknown as [string, AgentEvent, { agentDeviceId: string; sessionId: string; relay: string }, boolean];
+      expect(call[3]).toBe(true);
+      expect(call[0]).toBe(hostSessionIdFor(GUEST_A, SESSION));
+      expect(call[1].data).toMatchObject({ deliveryEpoch: 123 });
+      expect(call[2]).toMatchObject({ agentDeviceId: 'mini', relay: relayKeyFor(GUEST_A) });
+      const imageArtifacts = vi.fn(async (_sessionId: string) => ({ ok: true }));
+      const member = fakeAgentHost('release-member', [], { trust: () => 'owner', imageArtifacts });
+      try {
+        await member.handle(OWNER_DEVICE, { op: 'images', ...call[2], action: 'release', imageId: 'a'.repeat(64) });
+        expect(imageArtifacts.mock.calls[0]?.[0]).toBe(env.memberStarted.mini[0].input.hostSessionId);
+        await member.handle('other-owner', { op: 'images', ...call[2], action: 'release', imageId: 'a'.repeat(64) });
+        expect(imageArtifacts.mock.calls[1]?.[0]).not.toBe(imageArtifacts.mock.calls[0]?.[0]);
+      } finally { member.dispose(); }
+      await vi.waitFor(() => expect(stream.some((item) => item.t === 'event' && item.event.type === 'image')).toBe(true));
+    } finally { finishPreparation(); await client.close('close', 'navigation'); }
+  });
+
   it('keeps two shared users apart on the computer even with the same task id', async () => {
     const env = setup({ plans: [{ kind: 'member', ...MEMBER_MINI }, { kind: 'member', ...MEMBER_MINI }] });
     const a = await openAsGuest(env, GUEST_A, openPayload(SESSION));
@@ -349,7 +383,7 @@ describe('provider group relay for shared users', () => {
     const { client } = await openAsGuest(env, GUEST_A, openPayload(SESSION));
     expect(env.memberStarted.mini).toHaveLength(0);
     expect(env.memberStarted.studio).toHaveLength(1);
-    expect(env.relay.noteStartFailure).toHaveBeenCalledWith('shared-provider', MEMBER_MINI, expect.any(Error));
+    expect(env.relay.noteStartFailure).toHaveBeenCalledWith('shared-provider', MEMBER_MINI, expect.any(Error), 'claude-opus');
     expect(env.relay.plan).toHaveBeenLastCalledWith(expect.objectContaining({ exclude: new Set([MEMBER_MINI.memberKey]) }));
     await client.close('close', 'navigation');
   });
@@ -359,7 +393,7 @@ describe('provider group relay for shared users', () => {
     const { client } = await openAsGuest(env, GUEST_A, openPayload(SESSION));
     expect(env.memberStarted.mini).toHaveLength(1);
     // 与组内电脑接不下同一个判定；换下一台时不再回到本机这一台。
-    expect(env.relay.noteStartFailure).toHaveBeenCalledWith('shared-provider', expect.objectContaining({ memberKey: 'local' }), expect.any(Error));
+    expect(env.relay.noteStartFailure).toHaveBeenCalledWith('shared-provider', expect.objectContaining({ memberKey: 'local' }), expect.any(Error), 'claude-opus');
     expect(env.relay.plan).toHaveBeenLastCalledWith(expect.objectContaining({ exclude: new Set(['local']) }));
     await client.close('close', 'navigation');
   });
@@ -688,6 +722,7 @@ describe('provider group "switch to another computer" for shared users', () => {
       'shared-provider',
       MEMBER_MINI,
       expect.objectContaining({ usageLimit: true, message: 'You have hit your usage limit' }),
+      'claude-opus',
     );
     expect(env.relay.plan).toHaveBeenLastCalledWith(expect.objectContaining({ exclude: new Set([MEMBER_MINI.memberKey]) }));
     await first.client.close('close', 'navigation');
@@ -804,6 +839,7 @@ describe('provider group "switch to another computer" for shared users', () => {
     expect(guest.stream).toContainEqual(expect.objectContaining({ t: 'event', event: expect.objectContaining({ type: 'error', data }) }));
     expect(env.relay.noteRunFailure).toHaveBeenCalledWith(
       'shared-provider', expect.anything(), expect.objectContaining({ sdkError: 'max_output_tokens' }),
+      'claude-opus',
     );
     expect(switchTokenIn(guest.stream)).toBeUndefined();
     expect(env.relay.plan).toHaveBeenCalledTimes(1);
@@ -826,6 +862,7 @@ describe('provider group "switch to another computer" for shared users', () => {
       'shared-provider',
       expect.objectContaining({ memberKey: 'local' }),
       expect.objectContaining({ usageLimit: true }),
+      'claude-opus',
     );
     await first.client.close('close', 'navigation');
 
@@ -851,6 +888,7 @@ describe('provider group "switch to another computer" for shared users', () => {
       'shared-provider',
       expect.objectContaining({ memberKey: 'local' }),
       expect.objectContaining({ reason: 'remote_agent_closed' }),
+      'claude-opus',
     );
   });
 
@@ -869,6 +907,7 @@ describe('provider group "switch to another computer" for shared users', () => {
       'shared-provider',
       MEMBER_MINI,
       expect.objectContaining({ reason: 'remote_agent_closed' }),
+      'claude-opus',
     );
   });
 
@@ -1061,7 +1100,7 @@ describe('provider group reshare consent', () => {
     const { client } = await openAsGuest(env, C_AT_B, openPayload(SESSION));
     expect(opened).toEqual(['mini']);
     expect(env.memberStarted.studio).toHaveLength(0);
-    expect(env.relay.noteStartFailure).toHaveBeenCalledWith('shared-provider', shared, expect.objectContaining({ message: expect.stringContaining('REMOTE_AGENT_PEER_TOO_OLD') }));
+    expect(env.relay.noteStartFailure).toHaveBeenCalledWith('shared-provider', shared, expect.objectContaining({ message: expect.stringContaining('REMOTE_AGENT_PEER_TOO_OLD') }), 'claude-opus');
     await client.close('close', 'navigation');
   });
 

@@ -14,6 +14,7 @@ import {
 } from '../sessionAgentSwitchHandler';
 import { createAgentHandoffPendingRegistry } from '../agentHandoff';
 import { MAKER_INVOKE } from '../channels';
+import { remoteAgentLinkError } from '../../remote-agent/controller/runClient';
 import { IpcHarness } from './helpers/ipcHarness';
 import { runDeviceLinkInvokeContext } from '../../device-link/invoke-context';
 
@@ -1517,9 +1518,144 @@ describe('远程 Agent:选模型时换 Agent 所在电脑', () => {
       ...withoutLocation,
       targetAgentKind: 'codex',
       applyNow: true,
-    })).resolves.toMatchObject({ switched: true });
+      })).resolves.toMatchObject({ switched: true });
     expect(userMove.calls).toEqual([]);
     expect(staged.calls).toEqual([]);
+  });
+
+  it('协同 Lead 离开远程电脑:关闭旧远程会话遇链路错误仍提交新位置', async () => {
+    const linkError = Object.assign(
+      new Error('[REMOTE_AGENT_UNAVAILABLE] [DEVICE_LINK_DEVICE_OFFLINE] target offline'),
+      { code: 'DEVICE_OFFLINE' },
+    );
+    const applyNow = relocationHarness({ orcaRole: 'lead', agentDeviceId: 'office-pc' });
+    vi.mocked(applyNow.deps.closeSession).mockImplementationOnce(async () => {
+      applyNow.calls.push('close');
+      throw linkError;
+    });
+    await expect(
+      performSessionAgentSwitch(applyNow.deps, { ...backToTaskComputer, applyNow: true }),
+    ).resolves.toMatchObject({ switched: true });
+    expect(applyNow.deps.applyAgentSwitchToDb).toHaveBeenCalledWith(
+      's1',
+      expect.objectContaining({ agentDeviceId: null }),
+    );
+    expect(applyNow.deps.bootstrapSwitchedSession).toHaveBeenCalledWith('s1');
+    expect(applyNow.deps.log.warn).toHaveBeenCalledWith(
+      expect.stringMatching(/returning|home|close/i),
+      expect.objectContaining({ sessionId: 's1', code: expect.any(String) }),
+    );
+    expect(applyNow.calls).toEqual(['close', 'db', 'provider', 'boundary', 'pending', 'bootstrap']);
+
+    const pending = relocationHarness({ orcaRole: 'lead', agentDeviceId: 'office-pc' });
+    await performSessionAgentSwitch(pending.deps, backToTaskComputer);
+    vi.mocked(pending.deps.closeSession).mockImplementationOnce(async () => {
+      pending.calls.push('close');
+      throw linkError;
+    });
+    await expect(applyPendingAgentSwitchIfIdle(pending.deps, 's1')).resolves.toBeUndefined();
+    expect(pending.deps.applyAgentSwitchToDb).toHaveBeenCalledWith(
+      's1',
+      expect.objectContaining({ agentDeviceId: null }),
+    );
+    expect(pending.pending.get('s1')).toBeUndefined();
+  });
+
+  it('协同 Lead 离开远程电脑:关闭失败非链路类仍中止且不写库', async () => {
+    const h = relocationHarness({ orcaRole: 'lead', agentDeviceId: 'office-pc' });
+    vi.mocked(h.deps.closeSession).mockImplementationOnce(async () => {
+      h.calls.push('close');
+      throw new Error('[REMOTE_AGENT_PEER_TOO_OLD] Cindy on the other computer is too old');
+    });
+    await expect(
+      performSessionAgentSwitch(h.deps, { ...backToTaskComputer, applyNow: true }),
+    ).rejects.toThrow(/REMOTE_AGENT_PEER_TOO_OLD/);
+    expect(h.deps.applyAgentSwitchToDb).not.toHaveBeenCalled();
+    expect(h.calls).toEqual(['close']);
+
+    const unavailable = relocationHarness({ orcaRole: 'lead', agentDeviceId: 'office-pc' });
+    vi.mocked(unavailable.deps.closeSession).mockRejectedValueOnce(
+      new Error('[REMOTE_AGENT_UNAVAILABLE] the agent did not start on that computer'),
+    );
+    await expect(
+      performSessionAgentSwitch(unavailable.deps, { ...backToTaskComputer, applyNow: true }),
+    ).rejects.toThrow(/REMOTE_AGENT_UNAVAILABLE/);
+    expect(unavailable.deps.applyAgentSwitchToDb).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['DEVICE_OFFLINE', 'target device offline'],
+    ['INVOKE_TIMEOUT', 'invoke timed out'],
+    ['DEVICE_UNRESPONSIVE', 'device unresponsive'],
+    ['NOT_CONNECTED', 'not connected'],
+    ['LINK_NOT_OPEN', 'link not open'],
+    ['PEER_RESET', 'peer reset'],
+    ['BACKPRESSURE', 'request expired before socket write within 10000ms'],
+  ] as const)('协同 Lead 离开远程电脑:remoteAgentLinkError(%s) 后仍提交新位置', async (code, message) => {
+    const wrapped = remoteAgentLinkError(Object.assign(new Error(message), { code }));
+    const h = relocationHarness({ orcaRole: 'lead', agentDeviceId: 'office-pc' });
+    vi.mocked(h.deps.closeSession).mockImplementationOnce(async () => {
+      h.calls.push('close');
+      throw wrapped;
+    });
+    await expect(
+      performSessionAgentSwitch(h.deps, { ...backToTaskComputer, applyNow: true }),
+    ).resolves.toMatchObject({ switched: true });
+    expect(h.deps.applyAgentSwitchToDb).toHaveBeenCalledWith(
+      's1',
+      expect.objectContaining({ agentDeviceId: null }),
+    );
+    expect(h.deps.log.warn).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(h.deps.log.warn).mock.calls[0][1]).toEqual({ sessionId: 's1', code });
+  });
+
+  it.each([
+    ['REMOTE_DISABLED', 'remote control is disabled'],
+    ['CHANNEL_NOT_ALLOWED', "channel 'remote-agent' not allowed remotely"],
+    ['ACCESS_REVOKED', 'access revoked'],
+    ['VERSION_MISMATCH', 'version mismatch'],
+    [undefined, '[REMOTE_AGENT_UNAVAILABLE] the agent did not start on that computer'],
+    ['TIMEOUT', 'local timeout'],
+  ] as const)('协同 Lead 离开远程电脑:非链路码 %s 仍中止且不写库', async (code, message) => {
+    const wrapped = code === undefined
+      ? new Error(message)
+      : remoteAgentLinkError(Object.assign(new Error(message), { code }));
+    const h = relocationHarness({ orcaRole: 'lead', agentDeviceId: 'office-pc' });
+    vi.mocked(h.deps.closeSession).mockImplementationOnce(async () => {
+      throw wrapped;
+    });
+    await expect(
+      performSessionAgentSwitch(h.deps, { ...backToTaskComputer, applyNow: true }),
+    ).rejects.toBeDefined();
+    expect(h.deps.applyAgentSwitchToDb).not.toHaveBeenCalled();
+  });
+
+  it('普通任务关闭旧远程会话遇链路错误仍中止', async () => {
+    const wrapped = remoteAgentLinkError(
+      Object.assign(new Error('request expired before socket write within 10000ms'), { code: 'BACKPRESSURE' }),
+    );
+    const h = relocationHarness({ agentDeviceId: 'office-pc' });
+    vi.mocked(h.deps.closeSession).mockImplementationOnce(async () => {
+      throw wrapped;
+    });
+    await expect(
+      performSessionAgentSwitch(h.deps, { ...backToTaskComputer, applyNow: true }),
+    ).rejects.toThrow(/BACKPRESSURE|REMOTE_AGENT_UNAVAILABLE/);
+    expect(h.deps.applyAgentSwitchToDb).not.toHaveBeenCalled();
+  });
+
+  it('协同 Worker 关闭旧远程会话遇链路错误仍中止(容错只给 Lead)', async () => {
+    const wrapped = remoteAgentLinkError(
+      Object.assign(new Error('target device offline'), { code: 'DEVICE_OFFLINE' }),
+    );
+    const h = relocationHarness({ orcaRole: 'worker', agentDeviceId: 'office-pc' });
+    vi.mocked(h.deps.closeSession).mockImplementationOnce(async () => {
+      throw wrapped;
+    });
+    await expect(
+      performSessionAgentSwitch(h.deps, { ...backToTaskComputer, applyNow: true }),
+    ).rejects.toThrow(/REMOTE_AGENT_UNAVAILABLE|offline/);
+    expect(h.deps.applyAgentSwitchToDb).not.toHaveBeenCalled();
   });
 
   it('非法位置参数被拒绝', async () => {

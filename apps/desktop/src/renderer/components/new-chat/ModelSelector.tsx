@@ -1,3 +1,4 @@
+import { ErrorNotice } from '@/components/ui/error-notice';
 import { DisplayPricingDetails } from '@/components/DisplayPricingDetails';
 import { Button } from '@/components/ui/button';
 import { localizedModelDescription } from '@/lib/modelDescriptions';
@@ -597,32 +598,17 @@ function RemoteModelLoadNotice({
     );
   }
   return (
-    <div
+    <ErrorNotice
       role="alert"
-      className={cn(
-        'flex items-start gap-2 border border-[var(--error-border)] bg-[var(--error-bg)] text-[var(--error-fg)]',
-        compact ? 'mx-1 rounded-[8px] px-3 py-2' : 'mx-1 rounded-[8px] px-3 py-3',
-      )}
-    >
-      <CircleAlert size={14} className="mt-0.5 shrink-0" />
-      <div className="min-w-0 flex-1">
-        <p className={cn(compact ? 'text-11 leading-[1.45]' : 'text-xs leading-[1.45]')}>
-          {message ?? t('newChat.modelSelector.remoteLoadFailed')}
-        </p>
-        <Button
-          variant="secondary"
-          tone="danger"
-          size="xs"
-          compact
-          type="button"
-          onClick={onRetry}
-          className="mt-1"
-        >
+      className="mx-1"
+      message={message ?? t('newChat.modelSelector.remoteLoadFailed')}
+      actions={
+        <Button size="sm" compact onClick={onRetry}>
           <RefreshCw size={12} />
           {t('newChat.modelSelector.retryRemoteModels')}
         </Button>
-      </div>
-    </div>
+      }
+    />
   );
 }
 
@@ -3525,6 +3511,17 @@ function ModelSelectorContentView({
           </div>
           {localCatalogNotice && <div className="shrink-0 p-2">{localCatalogNotice}</div>}
           <UnifiedModelPanel
+            {...(!remoteAgent && deviceId && (remoteModelListStatus === 'loading' || remoteModelListStatus === 'error')
+              ? {
+                  catalogNotice: (
+                    <RemoteModelLoadNotice
+                      status={remoteModelListStatus}
+                      onRetry={retryRemoteModels}
+                      message={remoteFailureMessage}
+                    />
+                  ),
+                }
+              : {})}
             deviceId={deviceId}
             providerUsage={providerUsageScope}
             providerGroupUsage={providerGroupUsage}
@@ -3560,6 +3557,7 @@ function ModelSelectorContentView({
                   remoteSources: {
                     localRailItems: remoteAgentLocalRailItems,
                     localProviders: homeProviders,
+                    localUsageDeviceId: homeDeviceId ?? null,
                     localProviderLabel: remoteAgentLocalLabel,
                     groups: remoteAgentGroups,
                     labelOf: remoteAgentLabelOf,
@@ -4254,12 +4252,8 @@ export function ModelSelector({
           ? t('newChat.modelSelector.trigger.agent.pi')
           : t('newChat.modelSelector.trigger.agent.codex')
       : null;
-  const agentIdentityLabel =
-    agentName && agentIdentity?.state === 'pending'
-      ? t('newChat.modelSelector.trigger.agent.pending', { agent: agentName })
-      : agentName;
-  const baseDisplayIdentityLabel = agentIdentityLabel
-    ? `${agentIdentityLabel} · ${displayLabel}`
+  const baseDisplayIdentityLabel = agentName
+    ? `${agentName} · ${displayLabel}`
     : displayLabel;
   const remoteStatusLabel = currentModel
     ? remoteModelLoading
@@ -4471,7 +4465,7 @@ export function ModelSelector({
     </span>
   ) : null;
   const agentIdentityPrefix =
-    agentIdentityLabel &&
+    agentName &&
     !isCompactToolbar &&
     (!engineMarkOption || agentIdentity?.state === 'pending') ? (
       <>
@@ -4481,7 +4475,7 @@ export function ModelSelector({
             isCreateAgentVariant ? 'text-12' : dense ? 'text-12' : 'text-13',
           )}
         >
-          {agentIdentityLabel}
+          {agentName}
         </span>
         <span
           className={cn(

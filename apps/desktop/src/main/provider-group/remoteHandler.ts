@@ -60,9 +60,10 @@ const pendingUsageReports = new WeakMap<object, Map<string, PendingUsageReport>>
 export const PROVIDER_GROUP_USAGE_PART_TTL_MS = 10 * 60_000;
 
 /**
- * 给同账号电脑的 `maker:provider:list` 补组摘要与运行数，都只加在仍允许被远程调用的供应商上：
- * 建了组的带 `group`；`running`(这台电脑上每个供应商正在运行一轮的任务数，localLoad.ts)给出时每个都带
- * `runningTurns`，没在跑的为 0，读不到(null)时不带。结果里已有的这两个字段一律先去掉，只有本机能产生它们。
+ * 给同账号电脑的 `maker:provider:list` 补组摘要与运行数：建了组的供应商都带 `group`，
+ * 让关闭远程调用的组仍能从设置进入管理；`running`(这台电脑上每个供应商正在运行一轮的任务数，
+ * localLoad.ts)只给仍允许被远程调用的供应商附加 `runningTurns`，没在跑的为 0，读不到(null)时不带。
+ * 结果里已有的这两个字段一律先去掉，只有本机能产生它们。
  */
 export function decorateProviderListWithGroups(
   result: unknown,
@@ -79,9 +80,10 @@ export function decorateProviderListWithGroups(
       const entry = { ...(provider as Record<string, unknown>) };
       delete entry.group;
       delete entry[PROVIDER_RUNNING_TURNS_FIELD];
-      if (entry.remoteInvocationEnabled !== true || typeof entry.id !== 'string') return entry;
+      if (typeof entry.id !== 'string') return entry;
       const config = readGroup(entry.id);
       if (config) entry.group = providerGroupSummaryForWire(config);
+      if (entry.remoteInvocationEnabled !== true) return entry;
       if (running) entry[PROVIDER_RUNNING_TURNS_FIELD] = running.get(entry.id) ?? 0;
       return entry;
     }),
@@ -132,7 +134,8 @@ export async function handleProviderGroupRemote(
       const { key, kind, agentDeviceId, providerId: memberProviderId } = pick.member;
       return { kind: 'member', member: { key, kind, agentDeviceId, providerId: memberProviderId }, label: pick.label };
     }
-    case 'cool': {
+    case 'cool':
+    case 'cool-model': {
       const config = deps.readGroup(request.providerId);
       if (!config || !config.members.some((m) => m.key === request.memberKey)) return {};
       const now = deps.now();
@@ -142,7 +145,10 @@ export async function handleProviderGroupRemote(
           now + PROVIDER_GROUP_MAX_REMOTE_COOLDOWN_MS,
         )
         : now + PROVIDER_GROUP_FAILURE_COOLDOWN_MS;
-      scope.router.markCooling(request.providerId, request.memberKey, until);
+      // Old controllers cannot identify the affected model: never turn their report into a week-long account ban.
+      const model = request.cause === 'usage-limit' ? request.model : undefined;
+      scope.router.markCooling(request.providerId, request.memberKey,
+        model ? until : Math.min(until, now + PROVIDER_GROUP_FAILURE_COOLDOWN_MS), model);
       return {};
     }
     case 'leases':
@@ -150,7 +156,9 @@ export async function handleProviderGroupRemote(
       return {};
     case 'view': {
       if (!deps.isRemoteAllowed(request.providerId)) return { providerId: request.providerId, config: null, members: [] };
-      const options = request.model !== undefined
+      const options = request.agentKind !== undefined
+        ? { model: request.model, agentKind: request.agentKind, includeGuestSupport: request.includeGuestSupport === true }
+        : request.model !== undefined
         ? request.includeGuestSupport === true
           ? { model: request.model, includeGuestSupport: true }
           : request.model

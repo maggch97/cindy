@@ -17,7 +17,7 @@
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { and, eq, inArray, isNull } from 'drizzle-orm';
+import { and, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
 
 import { getDbClient } from '../localDb/client/current.js';
 import { botDelegations, botProfiles, botSessionLinks, messages, sessions } from '../localDb/schema.js';
@@ -45,6 +45,11 @@ export interface WorkingMemoryItem {
   /** 产生这条记录的消息(用户或伙伴原话),模型可据此用历史工具拉原文。 */
   messageId?: string;
   updatedAt: number;
+  /**
+   * 来自水位之后、尚未被完整回补的那一轮:在那一轮被回补(水位推进到当前回复)之前,它不占
+   * 正式容量——超容量时先裁它,不裁正式条目;回补完成即转正(去掉标记)。
+   */
+  provisional?: true;
 }
 export interface WorkingThread extends WorkingMemoryItem {
   status: 'active' | 'waiting' | 'blocked';
@@ -66,6 +71,17 @@ export interface BotWorkingMemory {
   revision: number;
   /** 语义层已经读过的最后一条消息 rowid;换窗线是否能提前取决于它是否覆盖最近完成轮。 */
   coveredThroughRowid: number;
+  /**
+   * 水位对应消息的 client_id。messages 用 TEXT 主键,隐藏 rowid 在数据库瘦身(VACUUM INTO)后
+   * 可能重排,持久判据以它为准:用的时候按 client_id 解析回当前 rowid。旧账本没有这一项时
+   * 按不新鲜处理,下一次复盘写入后自愈。
+   */
+  coveredThroughMessageId?: string;
+  /**
+   * 水位消息只覆盖到的字符偏移:用户 / 伙伴的长消息按 6000 字分块复盘,没补完整条时记下
+   * 已覆盖到哪里,下一次复盘从这里接着取。缺省 = 整条已覆盖。有偏移即不算新鲜。
+   */
+  coveredThroughOffset?: number;
   updatedAt: number;
   threads: WorkingThread[];
   commitments: WorkingCommitment[];
@@ -109,6 +125,7 @@ function readItem(value: unknown): WorkingMemoryItem | null {
     text,
     ...(typeof value.messageId === 'string' && value.messageId ? { messageId: value.messageId } : {}),
     updatedAt: typeof value.updatedAt === 'number' && Number.isFinite(value.updatedAt) ? value.updatedAt : 0,
+    ...(value.provisional === true ? { provisional: true as const } : {}),
   };
 }
 
@@ -131,6 +148,12 @@ export function parseWorkingMemory(raw: unknown): BotWorkingMemory {
     ...empty,
     revision: typeof raw.revision === 'number' && raw.revision >= 0 ? Math.floor(raw.revision) : 0,
     coveredThroughRowid: typeof raw.coveredThroughRowid === 'number' && raw.coveredThroughRowid >= 0 ? Math.floor(raw.coveredThroughRowid) : 0,
+    ...(typeof raw.coveredThroughMessageId === 'string' && raw.coveredThroughMessageId
+      ? { coveredThroughMessageId: raw.coveredThroughMessageId }
+      : {}),
+    ...(typeof raw.coveredThroughOffset === 'number' && raw.coveredThroughOffset > 0
+      ? { coveredThroughOffset: Math.floor(raw.coveredThroughOffset) }
+      : {}),
     updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : 0,
     threads: list('threads', WORKING_MEMORY_LIMITS.threads, (item, src) => ({
       ...item,
@@ -263,18 +286,33 @@ function resolveOptionalField(
  *    无证据的字段改动按"未提"处理,旧值保留;
  *  - 旧条目不在提案里时**保留**——漏写不等于完成;要删除走 `resolved`,同样要证据
  *    (用户 / 伙伴 / 工具结果均可);
- *  - 各区按上限保留最新的;只有真正变过的条目才更新时间,排序才有意义。
+ *  - 各区按上限保留最新的;只有真正变过的条目才更新时间,排序才有意义;
+ *  - `deferEvidenceFrom`(本轮取材没完整覆盖、水位停在之前时,水位之后那一轮的消息 id):
+ *    以这些消息为证据的删除(resolved)/ 改写延后,只追加新条目——这些破坏性变更等那一轮被
+ *    完整回补时再提交,免得用户随后 rewind 那一轮后水位仍指着可见的旧回复、账本却已按撤回
+ *    分支删改过且无法回滚。以回补前缀(水位之内)消息为证据的删改照常提交:缺口分多批回放
+ *    时,取消某承诺的证据只会出现在它所在的那一批,错过就再也补不上。以这些消息为证据的新
+ *    条目带 `provisional` 标记进账:不占正式容量(超容量先裁它们),跨多次复盘都不会把正式
+ *    条目挤出去;水位推进到当前回复(所有缺口补完)时一并转正。
  */
 export function applyWorkingMemoryProposal(
   previous: BotWorkingMemory | null,
   proposal: WorkingMemoryProposal,
   messages: ProposalMessage[],
-  opts: { now: number; coveredThroughRowid: number },
+  opts: {
+    now: number;
+    coveredThroughRowid: number;
+    coveredThroughMessageId?: string;
+    coveredThroughOffset?: number;
+    deferEvidenceFrom?: ReadonlySet<string>;
+  },
 ): Omit<BotWorkingMemory, 'revision' | 'version'> {
   const prev = previous ?? emptyWorkingMemory();
+  const deferred = (item: ProposedItem): boolean =>
+    !!item.evidence && !!opts.deferEvidenceFrom?.has(item.evidence.messageId);
   const resolvedTexts = new Set(
     proposal.resolved
-      .filter((item) => evidenceHolds(item.evidence, messages, RESOLVE_ROLES))
+      .filter((item) => !deferred(item) && evidenceHolds(item.evidence, messages, RESOLVE_ROLES))
       .map((item) => clampText(item.text)),
   );
   let seq = 0;
@@ -300,19 +338,37 @@ export function applyWorkingMemoryProposal(
       const evidenced = evidenceHolds(item.evidence, messages, NEW_ITEM_ROLES);
       if (prior) {
         const candidate = build(prior, item, { ...prior, updatedAt: opts.now });
-        // 完整内容没变:原样沿用,时间也不动。字段变了:要证据,没证据就当没提。
-        if (sameItem(candidate, prior) || !evidenced) kept.set(text, prior);
+        // 完整内容没变:原样沿用,时间也不动。字段变了:要证据,没证据就当没提;证据来自水位
+        // 之后那一轮的改写延后。
+        if (deferred(item) || sameItem(candidate, prior) || !evidenced) kept.set(text, prior);
         else kept.set(text, candidate);
         continue;
       }
       if (!evidenced) continue;
-      kept.set(text, build(null, item, { id: nextId(), text, messageId: item.evidence!.messageId, updatedAt: opts.now }));
+      // 证据来自水位之后那一轮的新条目按临时条目进账:不占正式容量,否则 rewind 那一轮时来源
+      // 清理只能删掉新条目,被它挤掉的旧承诺回不来。
+      kept.set(text, build(null, item, {
+        id: nextId(), text, messageId: item.evidence!.messageId, updatedAt: opts.now,
+        ...(deferred(item) ? { provisional: true as const } : {}),
+      }));
     }
     // 提案没提到的旧条目保留(漏写 ≠ 完成),除非被 resolved 点名。
     for (const item of existing) {
       if (!kept.has(item.text) && !resolvedTexts.has(item.text)) kept.set(item.text, item);
     }
-    return [...kept.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, cap);
+    // 水位推进到当前回复 = 所有缺口已补完,之前的临时条目所在轮次都已被完整回补:转正。
+    const settle = (item: T): T => {
+      if (opts.deferEvidenceFrom || !item.provisional) return item;
+      const { provisional: _p, ...rest } = item;
+      return rest as T;
+    };
+    const sorted = [...kept.values()].map(settle).sort((a, b) => b.updatedAt - a.updatedAt);
+    if (sorted.length <= cap) return sorted;
+    // 超容量:先裁临时条目(最旧的先),正式条目只在临时条目裁完后才按最旧裁——这层保护跨
+    // 多次复盘都成立,不只在新增的那一次。
+    const durable = sorted.filter((item) => !item.provisional);
+    const provisional = sorted.filter((item) => item.provisional);
+    return [...durable, ...provisional].slice(0, cap).sort((a, b) => b.updatedAt - a.updatedAt);
   }
   // seed 由旧条目展开而来,可能已带该字段:值为 undefined 表示清空,要把旧键一并去掉。
   const withField = <T extends WorkingMemoryItem, K extends string>(
@@ -324,8 +380,23 @@ export function applyWorkingMemoryProposal(
     return { ...rest, ...(value ? { [key]: value } : {}) } as unknown as T;
   };
 
+  // 水位:调用方带了 client_id 说明它已按当前库的 rowid 解析过(含瘦身重排后的回落),照用;
+  // 旧式只带 rowid 的调用保持"只前进不后退"。
+  const watermark =
+    opts.coveredThroughMessageId !== undefined
+      ? {
+          coveredThroughRowid: opts.coveredThroughRowid,
+          coveredThroughMessageId: opts.coveredThroughMessageId,
+          ...(opts.coveredThroughOffset !== undefined ? { coveredThroughOffset: opts.coveredThroughOffset } : {}),
+        }
+      : opts.coveredThroughRowid > prev.coveredThroughRowid
+        ? { coveredThroughRowid: opts.coveredThroughRowid }
+        : {
+            coveredThroughRowid: prev.coveredThroughRowid,
+            ...(prev.coveredThroughMessageId ? { coveredThroughMessageId: prev.coveredThroughMessageId } : {}),
+          };
   return {
-    coveredThroughRowid: Math.max(prev.coveredThroughRowid, opts.coveredThroughRowid),
+    ...watermark,
     updatedAt: opts.now,
     threads: merge(prev.threads, proposal.threads, WORKING_MEMORY_LIMITS.threads, (prior, item, seed) => ({
       ...withField<WorkingThread, 'next'>(seed, 'next', resolveOptionalField(prior?.next, item.next)),
@@ -572,9 +643,11 @@ export async function listWithdrawnSourceMessageIds(
 
 /**
  * 换窗交接 / 压缩后刷新用的渲染段;非伙伴主对话或没有账本时返回 null。
- * 任何读取失败都按"没有账本"处理——账本是增强,不能挡住换窗。
- * 渲染前统一排除来源已撤回(rewind / 删除)的条目;`excludeMessageIds` 是正在删除、
- * 还没落库的那批(持久清理在删除提交后另做,见 pruneWorkingMemoryForSession)。
+ * 任何读取失败都按"没有账本"处理——账本是增强,不能挡住换窗。来源校验(rewind / 删除 /
+ * clear 对账)和后台任务状态读取失败同样按没有账本:退回"未过滤"会让已撤回的承诺 / 纠正
+ * 借交接回到新上下文,少了任务区会让新上下文不知道旧任务还在跑而重复派发;70% 提前换窗也
+ * 只接受完整渲染成功的快照。`excludeMessageIds` 是正在删除、还没落库的那批(持久清理在
+ * 删除提交后另做,见 pruneWorkingMemoryForSession)。
  */
 export async function readWorkingMemoryNoteForSession(
   sessionId: string,
@@ -586,10 +659,10 @@ export async function readWorkingMemoryNoteForSession(
     if (!botId) return null;
     const stored = await readBotWorkingMemory(userDataDir, botId);
     if (!stored) return null;
-    const withdrawn = await listWithdrawnSourceMessageIds(sessionId, stored).catch(() => new Set<string>());
+    const withdrawn = await listWithdrawnSourceMessageIds(sessionId, stored);
     for (const id of opts.excludeMessageIds ?? []) withdrawn.add(id);
     const memory = withdrawn.size > 0 ? pruneWorkingMemoryForMessages(stored, withdrawn).memory : stored;
-    const openTasks = await listOpenTasks(botId).catch(() => []);
+    const openTasks = await listOpenTasks(botId);
     return renderWorkingMemory(memory, { openTasks });
   } catch {
     return null;
@@ -629,6 +702,71 @@ export async function pruneWithdrawnWorkingMemoryForSession(
     return await pruneBotWorkingMemoryForMessages(userDataDir, botId, withdrawn);
   } catch {
     return 0;
+  }
+}
+
+/**
+ * 账本是否已覆盖会话最近一条已完成回复(`agent_meta.turnCompleted`,与学习复盘取材同一判据)。
+ * 这是伙伴换窗线从 90% 提前到 70% 的依据:新鲜说明最近一轮的语义状态已进账本,宿主换窗
+ * 不会丢东西。水位按账本里的 client_id 解析回当前 rowid 再比较(rowid 在瘦身后可能重排,
+ * 存下的数字不可信);非伙伴主对话、没有账本、账本没有 client_id、水位消息已不在、还没有
+ * 已完成回复或读取失败一律 false——不新鲜就不提前,维持原来的线。
+ */
+export async function isWorkingMemoryFreshForSession(sessionId: string, userDataDir: string): Promise<boolean> {
+  try {
+    const botId = await resolveCanonicalBotIdForSession(sessionId);
+    if (!botId) return false;
+    const stored = await readBotWorkingMemory(userDataDir, botId);
+    // 没有 client_id(旧账本)或水位消息只覆盖了一部分(长消息分块中):都不算新鲜。
+    if (!stored?.coveredThroughMessageId || stored.coveredThroughOffset !== undefined) return false;
+    const db = getDbClient().drizzle;
+    // 水位消息必须仍在可见时间线上(未 rewind、非墓碑、在 /clear 之后),否则按不新鲜。
+    const [covered] = await db
+      .select({ rowid: sql<number | null>`rowid` })
+      .from(messages)
+      .where(
+        and(
+          eq(messages.sessionId, sessionId),
+          eq(messages.clientId, stored.coveredThroughMessageId),
+          isNull(messages.rewindAt),
+          ne(messages.role, 'message_tombstone'),
+          sql`${messages.createdAt} > COALESCE((SELECT cleared_at FROM sessions WHERE id = ${sessionId}), 0)`,
+        ),
+      )
+      .limit(1);
+    if (typeof covered?.rowid !== 'number') return false;
+    // 必须覆盖的水位 = 最近一条完成回复,或更晚落库、**带内容**的交互答复(至少一条非空白答案
+    // 的提问卡、带计划的批准 / 带反馈的打回,与 botLearningReview.interactionText 的取材口径
+    // 一致):它们承载用户决定,没被复盘过就不能算新鲜。取消 / 未回答 / 答案全空白的交互行
+    // 复盘取不到文本,不抬水位——否则一次取消就让账本永远不新鲜。
+    const [row] = await db
+      .select({ rowid: sql<number | null>`MAX(rowid)` })
+      .from(messages)
+      .where(
+        and(
+          eq(messages.sessionId, sessionId),
+          isNull(messages.rewindAt),
+          or(
+            and(
+              eq(messages.role, 'assistant'),
+              sql`json_valid(${messages.agentMeta}) AND json_extract(${messages.agentMeta}, '$.turnCompleted') = 1`,
+            ),
+            and(
+              inArray(messages.role, ['ask_user', 'plan_review']),
+              sql`json_valid(${messages.content}) AND CASE json_extract(${messages.content}, '$.status')
+                WHEN 'answered' THEN EXISTS (SELECT 1 FROM json_each(${messages.content}, '$.answers') WHERE type = 'text' AND trim(value) <> '')
+                WHEN 'approved' THEN trim(coalesce(json_extract(${messages.content}, '$.plan'), '')) <> ''
+                WHEN 'revised' THEN trim(coalesce(json_extract(${messages.content}, '$.feedback'), '')) <> ''
+                ELSE 0 END`,
+            ),
+          ),
+        ),
+      );
+    const latest = row?.rowid;
+    if (typeof latest !== 'number' || !(latest > 0)) return false;
+    return isWorkingMemoryFresh({ ...stored, coveredThroughRowid: covered.rowid }, latest);
+  } catch {
+    return false;
   }
 }
 

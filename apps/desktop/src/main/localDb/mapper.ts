@@ -1,3 +1,4 @@
+import { richAnswerText } from '@cindy/maker-shared/rich-answer';
 /**
  * chat-data-localization F5：IPC 边界 row ↔ camel/ISO 转换。
  *
@@ -12,6 +13,7 @@ import { hasPendingSessionInterruption } from '@cindy/maker-shared/session-activ
 import { DESKTOP_VISIBLE_SESSION_SOURCES } from '../../shared/sessionSource.js';
 import { getSessionInterruptionBootAt } from './sessionInterruptionBoot';
 import { stripInternalWebCitations } from '@cindy/maker-shared/internal-citation';
+import { projectMcpAppContent } from '@cindy/maker-shared/mcp-apps';
 import { markdownPreviewText } from '../../shared/markdownPreviewText.js';
 import {
   parseOrcaRemoteLead,
@@ -97,7 +99,9 @@ type ProjectAutomationConsentInsert = typeof projectAutomationConsents.$inferIns
 type ScheduleRunRow = typeof scheduleRuns.$inferSelect;
 type ScheduleRunInsert = typeof scheduleRuns.$inferInsert;
 
-type SessionRuntimeFields = Pick<Session, 'id' | 'agentKind' | 'model' | 'providerId' | 'effort' | 'fastMode'>;
+type SessionRuntimeFields = Pick<Session, 'id' | 'agentKind' | 'model' | 'providerId' | 'effort' | 'fastMode'> & {
+  scheduledModelBaseline?: string | null;
+};
 type SessionRuntimeProjector = (session: SessionRuntimeFields) => Partial<Session>;
 let sessionRuntimeProjector: SessionRuntimeProjector | null = null;
 
@@ -153,7 +157,7 @@ export function finalizePlainPreview(
   // role='user' 的正常落库行,但对用户不可见 —— 预览显示隐藏英文指令会暴露
   // 实现细节。返回 null 与"无预览"同渲染语义。
   if (isSyntheticTriggerText(next)) return null;
-  if (role === 'assistant') next = stripInternalWebCitations(next);
+  if (role === 'assistant') next = richAnswerText(stripInternalWebCitations(next));
   // Strip formatting before the display limit: URLs must not consume the preview budget.
   const collapsed = markdownPreviewText(next);
   if (!collapsed) return null;
@@ -306,7 +310,7 @@ export function sessionToCamel(row: SessionRowWithCount): Session {
     hasPendingSessionInterruption(candidate)
       ? base.activeTurnStartedAt
       : null;
-  return { ...base, ...projectSessionRuntimeFields(base) };
+  return { ...base, ...projectSessionRuntimeFields({ ...base, scheduledModelBaseline: row.scheduledModelBaseline }) };
 }
 
 export function messageToCamel(row: MessageRow): Message {
@@ -335,7 +339,7 @@ export function messageToCamel(row: MessageRow): Message {
     clientId: row.clientId,
     sessionId: row.sessionId,
     role: row.role as MessageRole,
-    content,
+    content: projectMcpAppContent(content, agentMeta?.mcpApp === true),
     toolUseId: row.toolUseId,
     agentMeta,
     agentKind: (row.agentKind as 'cc' | 'codex' | 'pi' | null) ?? null,

@@ -1,5 +1,7 @@
+import { FORWARDED_REQUEST_RECEIPT } from '../../shared/forwardedRequest.js';
 import type { AutoReviewUserIntent } from '@cindy/maker-core';
 import {
+  PI_CACHE_RECOVERY_EXPECTATION,
   CodexResumePreparationBlockedError,
   AUTO_REVIEW_SOURCE_CONTENT,
   AUTO_REVIEW_USER_INTENT,
@@ -41,6 +43,7 @@ import {
 } from './mobileClientPromptNote.js';
 import { buildWireMessageSourceNote, readWireSourceDevice, readWireSourcePlugin } from './messageSourceNote.js';
 import { buildCindyMakeTaskNote } from '../cindy-make/taskNote.js';
+import { SIDE_CHAT_CONTEXT } from './sideChatContext.js';
 import { getResolvedMainLocale } from '../i18n.js';
 import { buildUiLanguageErrorNote, turnUiLanguageFromSendOpts } from './uiLanguageErrorNote.js';
 import type { RepeatableWireNotes, WireNotePlan } from './wireNoteMemory.js';
@@ -56,6 +59,8 @@ import type { MakerSessionCreateOpts } from './sessionRequest.js';
 import { channelTurnSourceFor, withChannelTurnSource } from './channelTurnSignal.js';
 import type { CindyLearnInvocationGrant } from '../learn-host/invocationGrant.js';
 import { AUTO_REVIEW_DELEGATED_CONTINUATION, currentAutoReviewResourceIntent, readAutoReviewUserText, restoreAutoReviewUserIntent, type AutoReviewHistoryMessage } from './autoReviewUserIntent.js';
+import { mcpAppModelContext } from '../mcp-apps/runtime.js';
+import { MCP_APP_MESSAGE_GUARD, type McpAppMessageGuard } from '../mcp-apps/message.js';
 
 type CreateOpts = MakerSessionCreateOpts;
 
@@ -246,6 +251,9 @@ export function revokeTrustedDesktopQueuedOrigin(item: AgentInputQueuedMessage):
 }
 
 type MakerSendOptions = {
+  readonly [PI_CACHE_RECOVERY_EXPECTATION]?: import('@cindy/maker-core').SendOptions[typeof PI_CACHE_RECOVERY_EXPECTATION];
+  /** Main-only live card guard, never serialized to queue history or provider options. */
+  readonly [MCP_APP_MESSAGE_GUARD]?: McpAppMessageGuard;
   readonly [AUTO_REVIEW_DELEGATED_CONTINUATION]?: true;
   retryUserClientId?: string;
   toolsDisabled?: boolean;
@@ -293,6 +301,7 @@ type MakerSendOptions = {
    */
   sourceDevice?: MessageSourceDevice;
   persistUserMessage?: {
+    [FORWARDED_REQUEST_RECEIPT]?: AgentInputQueuedMessage['autoReviewUserText'];
     botTaskCoordination?: AgentInputQueuedMessage['botTaskCoordination'];
     sharedTaskAuthor?: AgentInputQueuedMessage['sharedTaskAuthor'];
     /** 插件来源(只写入 agentMeta.sourcePlugin 并生成 `[消息来源]`,不传给 maker-core)。 */
@@ -493,12 +502,15 @@ export interface MakerSendTransactionDeps {
    * 保留意图本次不动。undefined = 不启用(测试最小 harness)。`signal` 是这次发送的取消信号：
    * 供应商组在这里等原电脑恢复时，发送被停止就不再等、不再换电脑。
    */
-  applyPendingAgentSwitch?(sessionId: string, options?: { signal?: AbortSignal }): Promise<void>;
+  applyPendingAgentSwitch?(sessionId: string, options?: { signal?: AbortSignal; scheduled?: boolean }): Promise<void>;
+  onModelDispatched?(sessionId: string, clientId: string): void;
   /**
    * 发送前换窗:必须在 getSession 之前。prepare 会关掉不健康的 live handle,
    * 随后本事务按空 session 走 lazy-create,避免 peek 之后对已关闭对象 send。
    */
   prepareUnhealthySession?(sessionId: string): Promise<boolean | void>;
+  /** Restore durable task status before route changes or native session resume. */
+  restoreArchivedSessionForSend?(sessionId: string): Promise<void>;
   /**
    * session-agent-switch:pending 交接读取(agentHandoff 注册表)。命中时把交接
    * 文本前置进 wire payload(不影响 persistUserMessage 落库显示内容),并在
@@ -549,10 +561,10 @@ export interface MakerSendTransactionDeps {
    */
   readHostDeviceIdentity?(): MessageSourceHostDevice;
   /**
-   * 个人版制作任务(sessions.source='cindy-make')判定,由 host 按持久化来源现读。
-   * 命中时每轮把任务说明追加到 wire 用户消息(不落库、不显示),见 cindy-make/taskNote.ts。
+   * Host-owned task source, read from persistence. Scoped task instructions go only
+   * into the wire message; the composer and saved user text remain unchanged.
    */
-  isCindyMakeSession?(sessionId: string): Promise<boolean>;
+  readTaskSource?(sessionId: string): Promise<string | null>;
   /**
    * 逐轮环境说明去重(见 wireNoteMemory.ts):返回本轮真正要前置的段;与上一次已被
    * 引擎接受的内容相同的段不再重复。`force` 在交接首条(原生上下文刚重建)时整体重发。
@@ -581,6 +593,7 @@ type ResolveSessionResult =
   | { kind: 'failure'; result: DesktopMakerSendResult };
 
 function readPersistUserMessageOption(sendOpts: MakerSendOptions): {
+  [FORWARDED_REQUEST_RECEIPT]?: AgentInputQueuedMessage['autoReviewUserText'];
   botTaskCoordination?: AgentInputQueuedMessage['botTaskCoordination'];
   sharedTaskAuthor?: AgentInputQueuedMessage['sharedTaskAuthor'];
   sourcePlugin?: AgentInputQueuedMessage['sourcePlugin'];
@@ -604,6 +617,7 @@ function readPersistUserMessageOption(sendOpts: MakerSendOptions): {
   if (!persist || typeof persist.clientId !== 'string') return null;
   const sourcePlugin = readWireSourcePlugin(persist.sourcePlugin);
   return {
+    ...(persist[FORWARDED_REQUEST_RECEIPT] && typeof persist[FORWARDED_REQUEST_RECEIPT] === 'object' ? { [FORWARDED_REQUEST_RECEIPT]: persist[FORWARDED_REQUEST_RECEIPT] } : {}),
     ...(persist.botTaskCoordination ? { botTaskCoordination: persist.botTaskCoordination } : {}),
     ...(persist.sharedTaskAuthor ? { sharedTaskAuthor: persist.sharedTaskAuthor } : {}),
     ...(sourcePlugin ? { sourcePlugin } : {}),
@@ -1004,12 +1018,21 @@ export function createMakerSendTransaction(deps: MakerSendTransactionDeps): Make
       if (typeof sessionId !== 'string') throwIpcError('INVALID_PARAMS', 'sessionId required');
       const dispatchProductTurn = deps.prepareProductTurn?.(sessionId);
       const requestedSendOpts = (sendOpts ?? {}) as MakerSendOptions;
+      if (!requestedSendOpts.signal?.aborted) {
+        await deps.restoreArchivedSessionForSend?.(sessionId);
+      }
       // session-agent-switch:pending 切换在发送时刻生效(用户语义:「消息真正发出
       // 去时才切」)。必须在 getSession 之前——apply 会 close 旧引擎的 live session,
       // 让下方走 lazy-create 按 DB 新值 spawn 新引擎。
+      const sendOrigin = requestedSendOpts.persistUserMessage?.origin ?? requestedSendOpts.origin;
+      const scheduled = !!sendOrigin && typeof sendOrigin === 'object' &&
+        (sendOrigin as { kind?: unknown }).kind === 'scheduler';
       await deps.applyPendingAgentSwitch?.(
         sessionId,
-        requestedSendOpts.signal ? { signal: requestedSendOpts.signal } : undefined,
+        requestedSendOpts.signal || scheduled ? {
+          ...(requestedSendOpts.signal ? { signal: requestedSendOpts.signal } : {}),
+          ...(scheduled ? { scheduled: true } : {}),
+        } : undefined,
       );
       // 发送前的准备期间就被停止(如供应商组正在等原电脑恢复)：不再打开会话、不再派发，与 Session 在派发前
       // 收到取消是同一个结果，由调用方按「派发前取消」收尾。
@@ -1366,8 +1389,9 @@ export function createMakerSendTransaction(deps: MakerSendTransactionDeps): Make
           })
         : null;
       // 个人版制作任务说明:与手机说明同层、同占位规则(原生命令必须留在消息开头)。
+      const taskSource = await deps.readTaskSource?.(sessionId);
       const cindyMakeNote =
-        (await deps.isCindyMakeSession?.(sessionId).catch(() => false)) === true &&
+        taskSource === 'cindy-make' &&
         allowsEnvironmentNotes
           ? buildCindyMakeTaskNote()
           : null;
@@ -1378,6 +1402,8 @@ export function createMakerSendTransaction(deps: MakerSendTransactionDeps): Make
       // (原生上下文刚重建)整体重发;只有引擎接受后才记为已发送。斜杠命令轮次本来就不带
       // 说明,也不改写记忆——它不代表模型已经看过新的环境。
       const repeatableNotes: RepeatableWireNotes = {
+        'side-chat': allowsEnvironmentNotes && taskSource === 'side-chat'
+          ? SIDE_CHAT_CONTEXT : null,
         'client-environment': mobileClientNote,
         'cindy-make': cindyMakeNote,
         'ui-language': uiLanguageNote,
@@ -1392,9 +1418,24 @@ export function createMakerSendTransaction(deps: MakerSendTransactionDeps): Make
       const withCindyMakeNote = plannedNotes['cindy-make']
         ? prependNoteToWireUserMessage(withMobileNote as HandoffWireMessage, plannedNotes['cindy-make'])
         : withMobileNote;
-      const outgoing = plannedNotes['ui-language']
+      let outgoing = plannedNotes['ui-language']
         ? prependNoteToWireUserMessage(withCindyMakeNote as HandoffWireMessage, plannedNotes['ui-language'])
         : withCindyMakeNote;
+      if (plannedNotes['side-chat']) {
+        outgoing = prependNoteToWireUserMessage(outgoing as HandoffWireMessage, plannedNotes['side-chat']);
+      }
+      const appContext = shouldPrependMobileClientPromptNote(normalized, sess.agentKind)
+        ? await mcpAppModelContext(sessionId)
+        : undefined;
+      if (appContext?.text) {
+        outgoing = prependNoteToWireUserMessage(outgoing as HandoffWireMessage, appContext.text);
+      }
+      const assertAppCurrent = so[MCP_APP_MESSAGE_GUARD] || appContext?.text
+        ? async () => {
+            await so[MCP_APP_MESSAGE_GUARD]?.();
+            await appContext?.assertCurrent();
+          }
+        : undefined;
       const meta = await deps.getSessionMeta(sessionId).catch(() => null);
       let persistUserMessage = readPersistUserMessageOption(so);
       const trustedDesktopQueueReceipt = readTrustedDesktopQueueReceipt(persistUserMessage);
@@ -1584,13 +1625,32 @@ export function createMakerSendTransaction(deps: MakerSendTransactionDeps): Make
         const retryTranscriptUserEntryId = sess.agentKind === 'pi' && so.retryUserClientId
           ? await deps.readPiUserEntry?.(sessionId, so.retryUserClientId)
           : undefined;
+        // Automatic cache replay replaces the native user entry without adding
+        // another Cindy row. Keep later manual Retry attached to the active entry.
+        const transcriptUserClientId = persistUserMessage?.clientId
+          ?? (so[PI_CACHE_RECOVERY_EXPECTATION] ? so.retryUserClientId : undefined);
         // Other-task mail is the only non-scheduler turn whose reply IM relays (channelTurnSignal).
         const sendResult = await withChannelTurnSource(sess.id, channelTurnSourceFor(
           persistUserMessage?.origin,
           persistUserMessage?.botTaskCoordination !== undefined,
         ), () => sess.send(outgoing as never, {
           ...(retryTranscriptUserEntryId ? { retryTranscriptUserEntryId } : {}),
-          ...(resolveScheduledIntent ? { resolveAutoReviewUserIntent: resolveScheduledIntent } : {}),
+          ...(assertAppCurrent
+            ? {
+                beforeProviderStart: assertAppCurrent,
+                resolveAutoReviewUserIntent: async () => {
+                  const intent = resolveScheduledIntent
+                    ? await resolveScheduledIntent()
+                    : restoredAutoReviewIntent ?? (so[MCP_APP_MESSAGE_GUARD]
+                      ? restoreAutoReviewUserIntent([])
+                      : undefined);
+                  // Session awaits this existing authorization hook after all
+                  // preparation (including vision), immediately before dispatch.
+                  await assertAppCurrent();
+                  return intent;
+                },
+              }
+            : resolveScheduledIntent ? { resolveAutoReviewUserIntent: resolveScheduledIntent } : {}),
           [AUTO_REVIEW_SOURCE_CONTENT]: autoReviewSourceContent,
           ...(so[AUTO_REVIEW_DELEGATED_CONTINUATION] ? { [AUTO_REVIEW_DELEGATED_CONTINUATION]: true as const } : {}),
           ...(so[INHERITED_CAPABILITY_SELECTION] !== undefined
@@ -1614,6 +1674,7 @@ export function createMakerSendTransaction(deps: MakerSendTransactionDeps): Make
           ...(so.toolsDisabled === true ? { toolsDisabled: true } : {}),
           turnAttemptToken: so.turnAttemptToken,
           signal: so.signal,
+          [PI_CACHE_RECOVERY_EXPECTATION]: so[PI_CACHE_RECOVERY_EXPECTATION],
           ...(so.onVendorTurnReserved ? { onTurnReserved: so.onVendorTurnReserved } : {}),
           // scheduler 排队消息:origin 打到本轮 turnOrigin(IM 转播识别自动 turn),
           // 与 runner 直发路径的 session.send({ origin }) 语义对齐。
@@ -1628,20 +1689,20 @@ export function createMakerSendTransaction(deps: MakerSendTransactionDeps): Make
             ? { planMode: (createOpts as { planMode: boolean }).planMode }
             : {}),
           ...(sess.agentKind === 'pi' &&
-          persistUserMessage &&
+          transcriptUserClientId &&
           deps.linkPiUserEntry
             ? {
                 onTranscriptUserEntry: async (piEntryId: string) => {
                   try {
                     const linked = await deps.linkPiUserEntry?.(
                       sessionId,
-                      persistUserMessage.clientId,
+                      transcriptUserClientId,
                       piEntryId,
                     );
                     if (linked === false) {
                       deps.log.warn('send: Pi transcript entry target row missing', {
                         sessionId,
-                        clientId: persistUserMessage.clientId,
+                        clientId: transcriptUserClientId,
                         piEntryId,
                       });
                     }
@@ -1650,7 +1711,7 @@ export function createMakerSendTransaction(deps: MakerSendTransactionDeps): Make
                     // 把发送结果翻成 rejected，避免 UI 重发同一条消息。
                     deps.log.warn('send: Pi transcript entry link failed (non-fatal)', {
                       sessionId,
-                      clientId: persistUserMessage.clientId,
+                      clientId: transcriptUserClientId,
                       piEntryId,
                       err: err instanceof Error ? err.message : String(err),
                     });
@@ -1683,7 +1744,9 @@ export function createMakerSendTransaction(deps: MakerSendTransactionDeps): Make
                         ...(sourceDevice ? { sourceDevice } : {}),
                         ...(persistUserMessage.sourcePlugin ? { sourcePlugin: persistUserMessage.sourcePlugin } : {}),
                         uuid: so.messageUuid,
-                        ...(so.origin?.kind === 'scheduler'
+                        ...(persistUserMessage[FORWARDED_REQUEST_RECEIPT]
+                          ? { autoReviewUserText: persistUserMessage[FORWARDED_REQUEST_RECEIPT] }
+                          : so.origin?.kind === 'scheduler'
                           ? { autoReviewUserText: { kind: 'scheduled-continuation' } }
                           : so[AUTO_REVIEW_DELEGATED_CONTINUATION]
                             ? { autoReviewUserText: { kind: 'delegated-continuation' } }
@@ -1748,6 +1811,9 @@ export function createMakerSendTransaction(deps: MakerSendTransactionDeps): Make
               );
             }
             deps.assertBeforeVendorDispatch?.(sessionId, finalFenceSendOpts);
+            if (persistUserMessage?.clientId) {
+              deps.onModelDispatched?.(sessionId, persistUserMessage.clientId);
+            }
             dispatchProductTurn?.();
             if (userPromptPreviewSessionId) {
               deps.dispatchUserPromptPreview?.(
@@ -1759,6 +1825,7 @@ export function createMakerSendTransaction(deps: MakerSendTransactionDeps): Make
         }));
         sendAccepted = sendResult.accepted;
         if (sendAccepted) {
+          appContext?.consume();
           cleanupAfterAcceptance?.();
           await cleanupAcceptedNonPersistedMaterialization();
         } else {

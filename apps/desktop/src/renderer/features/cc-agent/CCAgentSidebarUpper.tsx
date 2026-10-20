@@ -1,4 +1,5 @@
 import { shouldShowOpenPathError } from '../../../shared/openPathResult';
+import { ErrorNotice } from '@/components/ui/error-notice';
 /**
  * CCAgentFeature 的 Sidebar 上半内容。
  * ---------------------------------------------------------------------------
@@ -115,9 +116,16 @@ import type { Session } from '@/lib/ccAgent.types';
 import {
   clearSessionAttentionMany,
   clearSystemSessionAttention,
-  useSessionAttentionKinds,
   useSessionAttentionSnapshot,
 } from '@/lib/sessionAttentionStore';
+import {
+  findOrcaLeadSessionIdForWorker,
+  formatOrcaWorkerNotificationTitle,
+  mergeOrcaLeadNotifications,
+  shouldNotifyOrcaWorkerEvent,
+  useOrcaLeadWorkerAttention,
+  useSessionAttentionKindsWithOrcaLeads,
+} from './lib/orcaLeadWorkerAttention';
 import { patchDraft as patchNewMakerDraft } from '@/state/newMakerDraft';
 import { consumePendingProjectFocus, usePendingProjectFocus } from '@/state/pendingProjectFocus';
 import {
@@ -190,8 +198,9 @@ import {
   holdSidebarViewedPriority,
   ProjectsSection,
   SessionGroupNode,
+  viewedPriorityHold,
 } from './sidebar/sections/ProjectsSection';
-import { partitionCindyMakeSessions, sortSessionsForMainList } from './lib/mainListModel';
+import { advanceViewedPriorityHold, partitionCindyMakeSessions, sortSessionsForMainList } from './lib/mainListModel';
 import { toStoredSessionTitle } from './lib/sessionDisplayTitle';
 import {
   getVisibleSidebarSessionIds,
@@ -208,7 +217,6 @@ import {
   getSessionDeviceId,
   remoteProjectsStore,
   useRemoteScheduleIndex,
-  type RemotePendingStatusToken,
 } from '@/features/device-link/remoteProjectsStore';
 import {
   getRemoteSessionActivity,
@@ -368,17 +376,16 @@ function RemoteSidebarLoadNotice({
           ? 'ccAgent.sidebar.machineSwitcher.tasksPartiallyFailed'
           : 'ccAgent.sidebar.machineSwitcher.tasksLoadFailed'
       : 'ccAgent.sidebar.machineSwitcher.devicesLoading';
+  if (alarming) return <ErrorNotice role="alert" className="mx-3" message={t(messageKey, { device: deviceLabel })} />;
   return (
     <div
-      role={alarming ? 'alert' : 'status'}
+      role="status"
       className={cn(
         quietDeviceLoading
           ? 'mx-3 flex flex-col items-center gap-3 px-4 py-8 text-center text-[var(--text-secondary)]'
           : 'border',
         !quietDeviceLoading &&
-          (alarming
-            ? 'border-[var(--error-border)] bg-[var(--error-bg)] text-[var(--error-fg)]'
-            : 'border-[var(--border-default)] bg-[var(--surface-chip)] text-[var(--text-secondary)]'),
+          'border-[var(--border-default)] bg-[var(--surface-chip)] text-[var(--text-secondary)]',
         !quietDeviceLoading &&
           (partial
             ? 'mx-3 flex items-start gap-2 rounded-[8px] px-3 py-2'
@@ -519,7 +526,13 @@ export function CCAgentSidebarUpper() {
       ).map((session) => session.id),
     [searchProjectSessions, hiddenProjectKeys, localPlatform],
   );
-  const attentionNotifications = useSessionAttentionSnapshot();
+  const rawAttentionNotifications = useSessionAttentionSnapshot();
+  // Orca Lead 汇总其 Worker 的出错 / 等待确认(只读派生,不写回 attention store)。
+  const orcaLeadWorkerAttention = useOrcaLeadWorkerAttention();
+  const attentionNotifications = useMemo(
+    () => mergeOrcaLeadNotifications(rawAttentionNotifications, orcaLeadWorkerAttention),
+    [rawAttentionNotifications, orcaLeadWorkerAttention],
+  );
   // Sidebar is rendered outside the :sessionId route, so useParams won't work.
   // Use useMatch to extract the active session id from the URL.
   const match = useMatch('/cc-agent/:sessionId');
@@ -1158,10 +1171,6 @@ function ExpandedView({
   );
 
   const [confirm, setConfirm] = useState<ConfirmState>(CONFIRM_INITIAL);
-  // 远程任务归档确认弹窗期间行已提前隐藏(见 handleActionClick);凭据放 ref 而非 confirm
-  // state:确认按钮的 onClick 要先同步认领它,Radix 随后触发的 onOpenChange(false) →
-  // handleCancelConfirm 才不会把正在写库的那次归档回滚掉。
-  const confirmRemoteArchiveRef = useRef<RemotePendingStatusToken | null>(null);
 
   // 系统级通知触发：sessions 数组每次渲染都新引用，但 callback 读 ref，
   // 不会因此重跑 transition effect。通道、失焦与灵动岛去重由共享入口收口。
@@ -1185,10 +1194,25 @@ function ExpandedView({
         remoteSessionsForNotificationRef.current,
       ]);
       if (!CINDY_MAKE_ENABLED && session && isCindyMakeSource(session.source)) return;
-      // Orca worker 自身状态翻转不发独立通知 —— 等 lead 接到 worker_report 处理完
-      // 再以 lead 名义统一推一条，避免同一事件双重打扰。语义上用户应回到 lead 主对话
-      // 查看，而非跳到 worker 实现细节；与 effectiveRunningSessionIds 的角色聚合口径一致。
-      if (session && isOrcaWorkerSession(session)) return;
+      // Orca Worker 的完成不发独立通知 —— 等 Lead 接到 worker_report 处理完再以 Lead
+      // 名义统一推一条。出错与需要确认要用户本人处理,单独通知,标题带上所属 Lead;
+      // 点击按 Worker id 走 resolveSessionRoute,落到 Lead 并打开该 Worker。
+      if (session && isOrcaWorkerSession(session)) {
+        if (!shouldNotifyOrcaWorkerEvent(kind, session)) return;
+        const leadSessionId = findOrcaLeadSessionIdForWorker(sessionId);
+        const leadSession = leadSessionId
+          ? findSessionNotificationSession(leadSessionId, [
+              sessionsRef.current,
+              allSessionsForNotificationRef.current,
+            ])
+          : null;
+        const title = formatOrcaWorkerNotificationTitle(
+          projectDraftSessionTitle(session.title, unnamedLabelRef.current),
+          leadSession ? projectDraftSessionTitle(leadSession.title, unnamedLabelRef.current) : null,
+        );
+        sendSessionEventNotification(sessionId, title, kind);
+        return;
+      }
       // /review 审查任务不单独通知:结果回到来源任务,由来源任务的轮次收尾通知。
       if (session && isReviewSessionSource(session.source)) return;
       // 插件后台隐藏任务不单独通知;显示到任务列表后恢复。
@@ -1241,7 +1265,9 @@ function ExpandedView({
     },
   );
   const remoteScheduleIndex = useRemoteScheduleIndex();
-  const attentionKinds = useSessionAttentionKinds();
+  // Lead 的 kind / 未读已并入其 Worker 的出错 / 等待确认(lib/orcaLeadWorkerAttention.ts)。
+  const attentionKinds = useSessionAttentionKindsWithOrcaLeads();
+  const orcaLeadWorkerAttention = useOrcaLeadWorkerAttention();
   const urgentSet = useSessionAttentionUrgencySet();
   const unreadScheduleSessionIds = useMemo(() => {
     const next = new Set<string>();
@@ -1260,9 +1286,10 @@ function ExpandedView({
     [scheduleSessionIndex, remoteScheduleIndex],
   );
   const sidebarNotifications = useMemo(() => {
-    if (unreadScheduleSessionIds.size === 0) return notifications;
-    return new Set([...notifications, ...unreadScheduleSessionIds]);
-  }, [notifications, unreadScheduleSessionIds]);
+    const withOrcaLeads = mergeOrcaLeadNotifications(notifications, orcaLeadWorkerAttention);
+    if (unreadScheduleSessionIds.size === 0) return withOrcaLeads;
+    return new Set([...withOrcaLeads, ...unreadScheduleSessionIds]);
+  }, [notifications, orcaLeadWorkerAttention, unreadScheduleSessionIds]);
   const remoteActivityRevision = useRemoteSessionActivityRevision();
 
   const markAutomationSessionRunsRead = useCallback(
@@ -1921,6 +1948,58 @@ function ExpandedView({
     selectedMachineId,
   ]);
 
+  const projectPriorityProjection = useMemo(() => {
+    const waiting = new Set<string>(urgentSet);
+    for (const [sessionId, kind] of attentionKinds) {
+      if (kind === 'awaiting' || kind === 'error') waiting.add(sessionId);
+    }
+    const natural = sidebarPriorityContext(
+      {
+        runningSessionIds: displayRunningSessionIds,
+        attentionSessionIds: sidebarNotifications,
+        waitingSessionIds: waiting,
+      },
+      [
+        ...visibleProjects.flatMap((project) => project.sessions),
+        ...groups.bots.flatMap((bot) => bot.sessions),
+        ...visibleDialogues,
+        ...visibleUnclassified,
+      ],
+      (session) => getRemoteSessionActivity(session.id, session.deviceLinkDeviceId)?.phase,
+    );
+    const hold = advanceViewedPriorityHold(
+      {
+        prevViewedId: viewedPriorityHold.prevViewedId,
+        heldPriorityRanks: new Map(viewedPriorityHold.heldPriorityRanks),
+        recentlyViewedAtMs: new Map(viewedPriorityHold.recentlyViewedAtMs),
+      },
+      viewedSessionId ?? activeSessionId,
+      natural,
+      Date.now(),
+    );
+    return {
+      context: {
+        ...natural,
+        heldPriorityRanks: hold.heldPriorityRanks,
+        recentlyViewedAtMs: hold.recentlyViewedAtMs,
+      },
+      hold,
+    };
+  }, [
+    activeSessionId,
+    attentionKinds,
+    displayRunningSessionIds,
+    groups.bots,
+    remoteActivityRevision,
+    sidebarNotifications,
+    urgentSet,
+    viewedSessionId,
+    visibleDialogues,
+    visibleProjects,
+    visibleUnclassified,
+  ]);
+  const projectPriorityContext = projectPriorityProjection.context;
+
   const visibleProjectsWithVendor = useMemo(() => {
     const unpinnedProjects = visibleProjects.filter(
       (project) =>
@@ -1949,6 +2028,7 @@ function ExpandedView({
       hostProjectSort.order,
       hostProjectSort.projectOrder,
       localPlatform,
+      projectPriorityContext,
     );
   }, [
     visibleProjects,
@@ -1957,6 +2037,7 @@ function ExpandedView({
     vendorPredicate,
     filter.vendor,
     hostProjectSort,
+    projectPriorityContext,
   ]);
 
   // 折叠 rail 没有独立的 Pinned 项目瓷砖，因此项目面板必须保留置顶项目，
@@ -1985,8 +2066,9 @@ function ExpandedView({
       hostProjectSort.order,
       hostProjectSort.projectOrder,
       localPlatform,
+      projectPriorityContext,
     );
-  }, [visibleProjects, vendorPredicate, filter.vendor, hostProjectSort, localPlatform]);
+  }, [visibleProjects, vendorPredicate, filter.vendor, hostProjectSort, localPlatform, projectPriorityContext]);
 
   /**
    * Pinned 拖拽落定回调。SortableList 给的是当前 visible（含 vendor / projectsFilter
@@ -3014,21 +3096,9 @@ function ExpandedView({
    */
   // includeArchived 跟随当前列表桶（filter.status）—— archived / all 桶里
   // 删除后要刷对应桶，否则已删行残留（见 hook 文件头注释）。
-  const { runSessionAction, unarchiveSession, beginRemoteArchive, cancelRemoteArchive } =
-    useSessionLifecycleActions({
-      includeArchived: filter.status,
-    });
-
-  // 新确认框顶替旧确认框时(两次预检交错返回),旧框提前隐藏的远程任务已无处取消,
-  // 先让它回到列表,再登记新框的凭据。
-  const replaceConfirmRemoteArchive = useCallback(
-    (token: RemotePendingStatusToken | null) => {
-      const previous = confirmRemoteArchiveRef.current;
-      confirmRemoteArchiveRef.current = token;
-      if (previous && previous !== token) cancelRemoteArchive(previous);
-    },
-    [cancelRemoteArchive],
-  );
+  const { runSessionAction, unarchiveSession, archiveBlockedByRunning } = useSessionLifecycleActions({
+    includeArchived: filter.status,
+  });
 
   const closeOwnedSharedTask = useCallback(async (sharedTaskId?: string): Promise<boolean> => {
     if (!sharedTaskId) return true;
@@ -3061,10 +3131,7 @@ function ExpandedView({
       }
       const isArchiveLike = action === 'archive' || action === 'archive-now';
       // 执行中的 session 不允许归档 —— 让用户先停下当前任务
-      if (isArchiveLike && runningSessionIds.has(sessionId)) {
-        toast.warning(t('ccAgent.sidebar.archiveBlocked.running'));
-        return;
-      }
+      if (isArchiveLike && archiveBlockedByRunning(sessionId, session?.deviceLinkDeviceId)) return;
       // 被 IM 接管中的 session 不允许归档 —— 接管方还在操控，先收回再归档。
       // sidebar 常驻订阅的 attached 集合与 binding:resolve-session 同源
       // (binding:list-attached = 全量 resolve, binding:changed 驱动 refresh),
@@ -3108,13 +3175,7 @@ function ExpandedView({
         // (WorktreeManager.removeWorktreeForSession),renderer 这层负责的是「别拿
         // 明显过期的结论免掉确认」。
         //
-        // 远程任务的预检是一次完整隧道往返(被控端跑 git status),不再让用户干等:
-        // 先乐观隐藏行并跳离,再等预检。干净 → 沿用同一叠加层直接写库;需要确认 →
-        // 行保持隐藏弹确认框,取消再让行回来(已跳离的视图不跳回)。本机任务预检
-        // 很快,维持原顺序。
-        const remoteArchiveToken = session?.deviceLinkDeviceId
-          ? beginRemoteArchive(sessionId, session.deviceLinkDeviceId, viewedSessionIdRef.current)
-          : null;
+        // 预检与确认期间保留列表行和当前任务；只有确定归档后才隐藏并跳离。
         const preflight = await resolveWorktreeRemovalPreflight(
           sessionId,
           session?.deviceLinkDeviceId,
@@ -3124,7 +3185,6 @@ function ExpandedView({
         // (greptile review)。'unknown' 时不摆 dirty 警告文案 —— 那会谎称有改动,
         // 走的是普通归档确认。
         if (preflight !== 'clean') {
-          replaceConfirmRemoteArchive(remoteArchiveToken);
           setConfirm({
             open: true,
             sessionId,
@@ -3137,13 +3197,13 @@ function ExpandedView({
         // 重定向判定用 viewedSessionId:files 路由下归档「正在浏览的会话」也要
         // 跳离失效的文件视图(codex review;正常路由下两者恒等)。经 ref 读:它随
         // 路由切换而变,留在 deps 里会让本 handler 每次切换都重建、打穿整表 memo。
+        // Preflight may have outlived the idle state; sharing must stay open when blocked.
+        if (archiveBlockedByRunning(sessionId, session?.deviceLinkDeviceId)) return;
         if (!(await closeOwnedSharedTask(sharedTaskId))) {
-          if (remoteArchiveToken) cancelRemoteArchive(remoteArchiveToken);
           return;
         }
         await runSessionAction(sessionId, 'archive', {
           activeSessionId: viewedSessionIdRef.current,
-          remoteArchiveToken,
         });
         return;
       }
@@ -3156,7 +3216,6 @@ function ExpandedView({
           'dirty';
         // Keep the existing confirm-state shape for the normal delete flow, then attach
         // the shared-task scope in a functional update so cancellation still leaves it open.
-        replaceConfirmRemoteArchive(null);
         setConfirm({ open: true, sessionId, action, dirtyWorktree });
         if (sharedTaskId) {
           setConfirm((previous) => ({ ...previous, sharedTaskId }));
@@ -3166,11 +3225,8 @@ function ExpandedView({
       await unarchiveSession(sessionId);
     },
     [
-      beginRemoteArchive,
-      cancelRemoteArchive,
       closeOwnedSharedTask,
-      replaceConfirmRemoteArchive,
-      runningSessionIds,
+      archiveBlockedByRunning,
       runSessionAction,
       unarchiveSession,
       t,
@@ -3179,18 +3235,17 @@ function ExpandedView({
 
   const handleConfirm = useCallback(async () => {
     const { sessionId, action, sharedTaskId } = confirm;
-    // 同步认领提前隐藏的远程归档,见 confirmRemoteArchiveRef。
-    const remoteArchiveToken = confirmRemoteArchiveRef.current;
-    confirmRemoteArchiveRef.current = null;
     const session = sessionsById.get(sessionId);
     if (isRemoteSessionWriteBlocked(session)) {
-      if (remoteArchiveToken) cancelRemoteArchive(remoteArchiveToken);
       toast.warning(t('ccAgent.remoteSession.actionsUnavailable'));
       setConfirm(CONFIRM_INITIAL);
       return;
     }
+    if (action === 'archive' && archiveBlockedByRunning(sessionId, session?.deviceLinkDeviceId)) {
+      setConfirm(CONFIRM_INITIAL);
+      return;
+    }
     if (!(await closeOwnedSharedTask(sharedTaskId))) {
-      if (remoteArchiveToken) cancelRemoteArchive(remoteArchiveToken);
       return;
     }
     // 重定向判定统一用 viewedSessionId(files 路由下 = 被浏览文件的会话,
@@ -3203,18 +3258,13 @@ function ExpandedView({
     await runSessionAction(sessionId, action, {
       activeSessionId: viewedSessionId,
       deleteRedirectRoute,
-      remoteArchiveToken,
     });
     setConfirm(CONFIRM_INITIAL);
-  }, [cancelRemoteArchive, closeOwnedSharedTask, viewedSessionId, confirm, resolveSessionRemovalRedirect, runSessionAction, sessionsById, t]);
+  }, [closeOwnedSharedTask, archiveBlockedByRunning, viewedSessionId, confirm, resolveSessionRemovalRedirect, runSessionAction, sessionsById, t]);
 
   const handleCancelConfirm = useCallback(() => {
-    // 取消 / 点外部关闭:提前隐藏的远程任务回到列表。
-    const remoteArchiveToken = confirmRemoteArchiveRef.current;
-    confirmRemoteArchiveRef.current = null;
-    if (remoteArchiveToken) cancelRemoteArchive(remoteArchiveToken);
     setConfirm(CONFIRM_INITIAL);
-  }, [cancelRemoteArchive]);
+  }, []);
 
   const handleBulkDelete = useCallback(async () => {
     if (bulkActionPending !== null) return;
@@ -3958,6 +4008,8 @@ function ExpandedView({
                   isAllCollapsed={collapse.isAllCollapsed}
                   activeSessionId={activeSessionId}
                   viewedSessionId={viewedSessionId}
+                  priorityContext={projectPriorityContext}
+                  priorityHold={projectPriorityProjection.hold}
                   runningSessionIds={displayRunningSessionIds}
                   attachedSessionIds={attachedSessionIds}
                   notifications={sidebarNotifications}
@@ -4140,8 +4192,8 @@ function CollapsedView({
   const { runningSessionIds } = useSessionRunningStatus(attentionSessionId);
   // 瓷砖未读点颜色按 attention kind(done 绿 / awaiting TapTap 蓝 / error 红);组件层
   // 取一次,renderItem 里查表(renderItem 非组件,不能 per-item 用 hook)。
-
-  const attentionKinds = useSessionAttentionKinds();
+  // Lead 的 kind 已并入其 Worker 的出错 / 等待确认(notifications 由上层同口径合并)。
+  const attentionKinds = useSessionAttentionKindsWithOrcaLeads();
   // 失败 automation urgency 集合 —— rail 瓷砖也要按此把 failed schedule 涂红,不能
   // 让"失败的定时任务"落到默认绿色 done tone(否则和 SessionItem 不一致,
   // 折叠视图会把失败误传成"完成了")。
@@ -4406,7 +4458,8 @@ function RailPanels({
   // (只是 return null),下次打开面板旧菜单会按旧坐标复现并引用旧项目(review)。
   // 与下方 showAllProjects 的复位同构。
 
-  const attentionKinds = useSessionAttentionKinds();
+  // Lead 的 kind 已并入其 Worker 的出错 / 等待确认(notifications 由 ExpandedView 同口径合并)。
+  const attentionKinds = useSessionAttentionKindsWithOrcaLeads();
   const urgentSet = useSessionAttentionUrgencySet();
   // 项目列表「显示全部」:面板关闭后复位(与 ProjectsSection 的段收起复位同语义)。
   const [showAllProjects, setShowAllProjects] = useState(false);

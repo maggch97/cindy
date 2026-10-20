@@ -179,7 +179,7 @@
     "speakingMode": "Speaking order",
     "speakingModeAuto": "Automatic",
     "speakingModeSequential": "One at a time",
-    "speakingModeAutoNote": "Without @mentions or with @Everyone, teammates think at the same time in the first pass, then reply one after another. Mentioned teammates answer in the order you mentioned them.",
+    "speakingModeAutoNote": "No mentions or @Everyone: think simultaneously on the first pass, then reply one by one. Mentioned teammates reply in mention order.",
     "speakingModeSequentialNote": "One teammate speaks at a time, and each one sees the replies before it.",
     "speakingModeSaveFailed": "Couldn't save the speaking order. Try again.",
     "setOrganizer": "Make Organizer",

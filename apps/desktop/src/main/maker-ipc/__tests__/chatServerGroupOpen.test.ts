@@ -25,7 +25,8 @@ vi.mock('../../localDb/client/current.js', () => ({ getDbClient: () => ({ drizzl
   select: () => ({ from: () => ({ where: () => Object.assign(Promise.resolve(fixture.profiles), {
     limit: async () => fixture.localGroupIds.map(id => ({ id })),
   }) }) }),
-} }) }));
+  insert: () => ({ values: () => ({ onConflictDoNothing: async () => undefined }) }),
+}, tx: async () => undefined }) }));
 vi.mock('node:http', async () => {
   const { EventEmitter } = await import('node:events');
   return { request: (url: string, options: { method: string }, callback: (response: unknown) => void) => {
@@ -140,6 +141,52 @@ describe('Chat Server group open latency (simulated 100ms per request)', () => {
     expect(revisit.routes).toHaveLength(5);
   });
 
+  it('answers a send after one parallel read round and its post', async () => {
+    await timed(() => service.getGroup(rooms[0]));
+    await warm();
+    fixture.handle.mockImplementation((route, method) => route.endsWith('/messages') && method === 'POST'
+      ? { body: { id: '50000000-0000-4000-8000-000000000099' } } : route.endsWith('/members') ? { body: [] } : response(route));
+    const plain = await timed(() => service.sendMessage({ groupId: rooms[0], text: 'hello', clientId: 'open-latency-send-1', mentions: { all: false, botIds: [] } }));
+    const everyone = await timed(() => service.sendMessage({ groupId: rooms[0], text: 'hello all', clientId: 'open-latency-send-2', mentions: { all: true, botIds: [] } }));
+    // Before: snapshot → plans → members → post, one after another (400ms each).
+    console.info(`[group-send-latency] ${JSON.stringify({ plainMs: plain.ms, everyoneMs: everyone.ms, plainRequests: plain.routes.length, everyoneRequests: everyone.routes.length })}`);
+    expect([plain.value, everyone.value]).toEqual([{ ok: true, messageId: '50000000-0000-4000-8000-000000000099' }, { ok: true, messageId: '50000000-0000-4000-8000-000000000099' }]);
+    expect(plain.ms).toBe(200);
+    expect(everyone.ms).toBe(200);
+    // An unaddressed message needs no member read.
+    expect(plain.routes).toHaveLength(3);
+    expect(everyone.routes).toHaveLength(4);
+  });
+
+  it('starts a claimed turn after one parallel read round and one lease check', async () => {
+    service.dispose();
+    const botActor = '20000000-0000-4000-8000-000000000001';
+    fixture.profiles = [{ id: 'local-bot', displayName: 'Bot', avatar: null, status: 'active' }];
+    const execution = { id: '40000000-0000-4000-8000-000000000001', conversation_id: rooms[0], source_message_id: message.id, bot_id: botActor,
+      context_seq: '1', epoch: 1, status: 'running', access_mode: 'chat', access_revision: 1 };
+    let queued = true;
+    let claimedAt = 0;
+    let dispatchedAt = 0;
+    fixture.handle.mockImplementation(route => {
+      if (route === '/actors') return { body: [{ id: botActor, kind: 'bot', externalId: 'local-bot', name: 'Bot' }] };
+      if (route === '/executions/claim') {
+        if (!queued) return { body: { execution: null } };
+        // Served and answered at once: this is when the claim reaches the client.
+        queued = false; claimedAt = Date.now();
+        return { body: { execution } };
+      }
+      return response(route);
+    });
+    service = withChatServer(local as unknown as BotGroupChatService, { onChanged,
+      ensureLane: async () => ({ ok: true, sessionId: 'lane' }), abortLane: async () => {},
+      dispatch: async () => { dispatchedAt = Date.now(); return { ok: true }; } } as unknown as BotGroupChatServiceDeps);
+    await vi.advanceTimersByTimeAsync(3000);
+    // Before: snapshot → lease check → history → lease check → dispatch (400ms after the claim).
+    console.info(`[group-pickup-latency] ${JSON.stringify({ afterClaimMs: dispatchedAt - claimedAt })}`);
+    expect(dispatchedAt).toBeGreaterThan(0);
+    expect(dispatchedAt - claimedAt).toBe(200);
+  });
+
   it('reads a new room only after the snapshot whose cursor it follows from', async () => {
     await warm();
     const from = fixture.routes.length;
@@ -164,8 +211,8 @@ describe('Chat Server group open latency (simulated 100ms per request)', () => {
     onChanged.mockClear();
     fixture.sockets[0].emit('message', JSON.stringify({ type: 'ready' }));
     expect(sent()).toContainEqual({ type: 'subscribe', scope: `conversation:${rooms[0]}`, after: '58' });
-    // A reconnect still re-reads every followed room once.
-    await vi.advanceTimersByTimeAsync(0);
+    // A reconnect still re-reads every followed room once, after the 150ms coalescing window.
+    await vi.advanceTimersByTimeAsync(150);
     expect(onChanged).toHaveBeenCalledWith({ groupId: rooms[0], change: 'messages' }, undefined);
   });
 

@@ -7,20 +7,14 @@ import { useProviderOnboarding } from '@/hooks/useProviderOnboarding';
 import { useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { MainViewHistoryContext } from '@/contexts/MainViewHistoryContext';
 import { BotPortraitPicker } from './BotPortraitPicker';
+import { botSettingsIcons } from './botSettingsIcons';
 import {
   ArrowLeft,
   Bot,
-  Brain,
   Camera,
   Check,
   ChevronRight,
-  Clock3,
   FolderOpen,
-  History,
-  Info,
-  Settings2,
-  Sparkles,
-  UserRound,
 } from 'lucide-react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useBotTranslation } from './botPronounContext';
@@ -58,13 +52,17 @@ import {
 import { useCompanionCloud } from './companionCloudStore';
 import { withoutShadowedBots } from './companionCloudPresentation';
 import { BotHomeComputerSetting } from './BotHomeComputerSetting';
+import { CindyMergeSetting } from './CindyMergeSetting';
 import { BotLifecycleSettings } from './BotLifecycleSettings';
 import { BotInvitationWelcome } from './BotInvitationWelcome';
 import { BotModelChainEditor } from './BotModelChainEditor';
 import { BotTaskModelEditor } from './BotTaskModelEditor';
 import { BotCapabilitySettings } from './BotCapabilitySettings';
 import { BotRoutines } from './BotRoutines';
+import { BotAutonomySettings } from './BotAutonomySettings';
+import { BotTodoList } from './BotTodoList';
 import { BotMemorySettings } from './BotMemorySettings';
+import { BotChannelsPage } from './BotChannelsPage';
 import {
   botSettingsChanges,
   normalizeBotSettingsPayload,
@@ -104,7 +102,7 @@ export function BotSettings({
   beforeCloseRef,
   initialPage = 'home',
 }: {
-  initialPage?: 'home' | 'memory' | 'capabilities' | 'model';
+  initialPage?: 'home' | 'memory' | 'capabilities' | 'model' | 'channels';
   bot: BotProfile;
   beforeCloseRef?: { current: (() => Promise<boolean>) | null };
   onBack: () => void;
@@ -144,6 +142,7 @@ export function BotSettings({
     | 'personality'
     | 'model'
     | 'capabilities'
+    | 'channels'
     | 'history'
     | 'advanced'
     | 'routines'
@@ -154,7 +153,9 @@ export function BotSettings({
   const memoryLeaveRef = useRef<(() => Promise<boolean>) | null>(null);
   const memoryBackRef = useRef<(() => Promise<boolean>) | null>(null);
   const pageTitle =
-    page === 'memory'
+    page === 'channels'
+      ? t('bots.channels.title')
+      : page === 'memory'
       ? t('bots.memory.title')
       : page === 'model'
         ? t('bots.settingsTabs.model')
@@ -408,14 +409,15 @@ export function BotSettings({
     && !(bot.invitation.stage === 'avatar' && bot.canonicalSessionId);
 
   const settingsRows = [
-    ['profile', Info, t('bots.profile.title')],
-    ['personality', UserRound, t('bots.profile.personality')],
-    ['memory', Brain, t('bots.memory.title')],
-    ['model', Sparkles, t('bots.settingsTabs.model')],
-    ['capabilities', Settings2, t('bots.capabilities.title')],
-    ['routines', Clock3, t('routines.title')],
-    ['history', History, t('bots.historySearch.title')],
-    ['advanced', FolderOpen, t('bots.homeFolder.title')],
+    ['profile', botSettingsIcons.profile, t('bots.profile.title')],
+    ['personality', botSettingsIcons.personality, t('bots.profile.personality')],
+    ['memory', botSettingsIcons.memory, t('bots.memory.title')],
+    ['model', botSettingsIcons.model, t('bots.settingsTabs.model')],
+    ['capabilities', botSettingsIcons.capabilities, t('bots.capabilities.title')],
+    ['channels', botSettingsIcons.channels, t('bots.channels.title')],
+    ['routines', botSettingsIcons.routines, t('routines.title')],
+    ['history', botSettingsIcons.history, t('bots.historySearch.title')],
+    ['advanced', botSettingsIcons.advanced, t('bots.homeFolder.title')],
   ] as const;
   return (
     <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 pb-8">
@@ -516,6 +518,7 @@ export function BotSettings({
               ))}
             </div>
             <BotHomeComputerSetting bot={bot} />
+            <CindyMergeSetting bot={bot} />
             <div className="mt-6">
               <BotLifecycleSettings
                 bot={bot}
@@ -681,6 +684,7 @@ export function BotSettings({
             </div>
           </div>
         )}
+        {page === 'channels' ? <BotChannelsPage bot={bot} /> : null}
         {page === 'history' ? (
           <BotLifecycleSettings
             bot={bot}
@@ -739,6 +743,21 @@ export function BotSettings({
             botId={bot.id}
             beforeLeaveRef={routineLeaveRef}
             backRef={routineBackRef}
+            header={
+              <BotAutonomySettings
+                botId={bot.id}
+                botName={displayName}
+                allowSchedulerFollow={capabilities.allowSchedulerFollow === true}
+                onAllowSchedulerFollowChange={(value) => updateCapability('allowSchedulerFollow', value)}
+              />
+            }
+            footer={
+              // 伙伴被叫醒后维护的待办：工作台里不再平铺，主人在这里查看与处理。
+              // 待办面板自带 20px 水平内边距，这里收回 8px，与例行任务行的文字起点对齐。
+              <div className="-mx-2 border-t border-[var(--border-default)] pt-2">
+                <BotTodoList botId={bot.id} />
+              </div>
+            }
           />
         ) : null}
       </div>

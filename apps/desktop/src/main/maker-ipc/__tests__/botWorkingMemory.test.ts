@@ -4,10 +4,11 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
- * 最小 drizzle 假链:每次 select() 按顺序弹出一组行;链上任何方法都返回自身并可 await。
+ * 最小 drizzle 假链:每次 select() 按顺序弹出一组行(弹出 Error 则该次查询 reject);
+ * 链上任何方法都返回自身并可 await。
  * 读取路径依次 select:伙伴归属 → 会话 cleared_at → 来源消息存活 → 进行中的后台任务。
  */
-const db = vi.hoisted(() => ({ queue: [] as unknown[][] }));
+const db = vi.hoisted(() => ({ queue: [] as (unknown[] | Error)[] }));
 vi.mock('../../localDb/client/current.js', () => ({
   getDbClient: () => ({
     drizzle: {
@@ -15,7 +16,7 @@ vi.mock('../../localDb/client/current.js', () => ({
         const rows = db.queue.shift() ?? [];
         const chain: Record<string, unknown> = {
           then: (resolve: (value: unknown) => unknown, reject?: (reason: unknown) => unknown) =>
-            Promise.resolve(rows).then(resolve, reject),
+            (rows instanceof Error ? Promise.reject(rows) : Promise.resolve(rows)).then(resolve, reject),
         };
         for (const name of ['from', 'innerJoin', 'where', 'limit']) chain[name] = () => chain;
         return chain;
@@ -30,6 +31,7 @@ import {
   createWorkingMemoryRefreshRegistry,
   emptyWorkingMemory,
   isWorkingMemoryFresh,
+  isWorkingMemoryFreshForSession,
   parseWorkingMemory,
   pruneWithdrawnWorkingMemoryForSession,
   pruneWorkingMemoryForMessages,
@@ -70,8 +72,9 @@ describe('applyWorkingMemoryProposal', () => {
         resolved: [],
       },
       messages,
-      { now, coveredThroughRowid: 42 },
+      { now, coveredThroughRowid: 42, coveredThroughMessageId: 'a1' },
     );
+    expect(next.coveredThroughMessageId).toBe('a1');
     expect(next.threads.map((t) => t.text)).toEqual(['改周报模板']);
     expect(next.commitments.map((c) => c.text)).toEqual(['周五前改完周报模板并发用户确认']);
     expect(next.commitments[0]).toMatchObject({ messageId: 'a1', trigger: '周五前' });
@@ -111,8 +114,127 @@ describe('applyWorkingMemoryProposal', () => {
     // 原样带回的条目连时间都不动,排序才能表达"最新优先"。
     expect(next.commitments.find((c) => c.id === 'c1')).toMatchObject({ messageId: 'old', updatedAt: 1 });
     expect(next.recentlyDone.map((d) => d.text)).toEqual(['测试已补上']);
-    // 水位只前进不后退。
+    // 旧式只带 rowid 的调用:水位只前进不后退。
     expect(next.coveredThroughRowid).toBe(10);
+    // 带 client_id 的调用已按当前库解析过(瘦身重排后 rowid 可能变小):照用,不被旧数字卡住。
+    const remapped = applyWorkingMemoryProposal(
+      { ...previous, coveredThroughRowid: 500, coveredThroughMessageId: 'old' },
+      { threads: [], commitments: [], waiting: [], corrections: [], recentlyDone: [], resolved: [] },
+      messages,
+      { now, coveredThroughRowid: 5, coveredThroughMessageId: 'a1' },
+    );
+    expect(remapped).toMatchObject({ coveredThroughRowid: 5, coveredThroughMessageId: 'a1' });
+    expect(remapped).not.toHaveProperty('coveredThroughOffset');
+    // 长消息分块中:偏移随 client_id 一起写入;补完后不再传偏移即清掉。
+    const chunked = applyWorkingMemoryProposal(
+      previous,
+      { threads: [], commitments: [], waiting: [], corrections: [], recentlyDone: [], resolved: [] },
+      messages,
+      { now, coveredThroughRowid: 12, coveredThroughMessageId: 'long', coveredThroughOffset: 6000 },
+    );
+    expect(chunked).toMatchObject({ coveredThroughRowid: 12, coveredThroughMessageId: 'long', coveredThroughOffset: 6000 });
+    expect(parseWorkingMemory({ version: 1, ...chunked }).coveredThroughOffset).toBe(6000);
+    // 本轮没完整覆盖:以水位之后那一轮(a1 / t1)为证据的 resolved 与字段改写都延后,新条目照常进账。
+    const additive = applyWorkingMemoryProposal(
+      previous,
+      {
+        threads: [],
+        commitments: [
+          { text: '周五前改完周报模板', trigger: '下周一', evidence: { messageId: 'a1', quote: '改完发你确认' } },
+          { text: '新承诺', evidence: { messageId: 'a1', quote: '改完发你确认' } },
+        ],
+        waiting: [],
+        corrections: [],
+        recentlyDone: [],
+        resolved: [{ text: '把测试补上', evidence: { messageId: 't1', quote: 'report-template.md written' } }],
+      },
+      messages,
+      { now, coveredThroughRowid: 10, coveredThroughMessageId: 'old', deferEvidenceFrom: new Set(['a1', 't1']) },
+    );
+    // 旧条目一个都不少(含本该被 resolved 的 c3),按更新时间降序;新条目在最前。
+    expect(additive.commitments.map((c) => c.text)).toEqual(['新承诺', '把测试补上', '给设计稿加暗色模式', '周五前改完周报模板']);
+    expect(additive.commitments.find((c) => c.id === 'c1')).toMatchObject({ messageId: 'old', updatedAt: 1 });
+    expect(additive.commitments.find((c) => c.id === 'c1')).not.toHaveProperty('trigger');
+    // 延后只针对水位之后那一轮的证据:回补前缀里的证据(t1 不在集合里)照常删除。
+    const prefixEvidenced = applyWorkingMemoryProposal(
+      previous,
+      {
+        threads: [], commitments: [], waiting: [], corrections: [], recentlyDone: [],
+        resolved: [{ text: '把测试补上', evidence: { messageId: 't1', quote: 'report-template.md written' } }],
+      },
+      messages,
+      { now, coveredThroughRowid: 10, coveredThroughMessageId: 'old', deferEvidenceFrom: new Set(['a1']) },
+    );
+    expect(prefixEvidenced.commitments.map((c) => c.text)).not.toContain('把测试补上');
+    // 只追加模式下分区已满:新条目延后,不把最旧的旧条目挤出去。
+    const fullWaiting = Array.from({ length: WORKING_MEMORY_LIMITS.waiting }, (_, i) => ({
+      id: `w${i}`, text: `等第${i}个回复`, on: 'user' as const, updatedAt: i + 1,
+    }));
+    const crowded = applyWorkingMemoryProposal(
+      { ...emptyWorkingMemory(), waiting: fullWaiting },
+      {
+        threads: [], commitments: [], corrections: [], recentlyDone: [], resolved: [],
+        waiting: [{ text: '等新的回复', on: 'user', evidence: { messageId: 'a1', quote: '改完发你确认' } }],
+      },
+      messages,
+      { now, coveredThroughRowid: 10, coveredThroughMessageId: 'old', deferEvidenceFrom: new Set(['a1']) },
+    );
+    expect(crowded.waiting.map((w) => w.id).sort()).toEqual(fullWaiting.map((w) => w.id).sort());
+    // 非只追加模式照旧:新条目进账,最旧的被容量裁掉。
+    const normal = applyWorkingMemoryProposal(
+      { ...emptyWorkingMemory(), waiting: fullWaiting },
+      {
+        threads: [], commitments: [], corrections: [], recentlyDone: [], resolved: [],
+        waiting: [{ text: '等新的回复', on: 'user', evidence: { messageId: 'a1', quote: '改完发你确认' } }],
+      },
+      messages,
+      { now, coveredThroughRowid: 10, coveredThroughMessageId: 'a1' },
+    );
+    expect(normal.waiting.map((w) => w.text)).toContain('等新的回复');
+    expect(normal.waiting.map((w) => w.id)).not.toContain('w0');
+  });
+
+  it('keeps provisional items from an uncovered turn out of durable capacity across reviews, and settles them once the watermark catches up', () => {
+    // 分区只剩一个空位:水位之后那一轮的新条目按临时条目进账,标记随账本落盘。
+    const durable = Array.from({ length: WORKING_MEMORY_LIMITS.waiting - 1 }, (_, i) => ({
+      id: `w${i}`, text: `等第${i}个回复`, on: 'user' as const, updatedAt: i + 1,
+    }));
+    const first = applyWorkingMemoryProposal(
+      { ...emptyWorkingMemory(), waiting: durable },
+      {
+        threads: [], commitments: [], corrections: [], recentlyDone: [], resolved: [],
+        waiting: [{ text: '等新的回复', on: 'user', evidence: { messageId: 'a1', quote: '改完发你确认' } }],
+      },
+      messages,
+      { now, coveredThroughRowid: 10, coveredThroughMessageId: 'old', deferEvidenceFrom: new Set(['a1']) },
+    );
+    expect(first.waiting).toHaveLength(WORKING_MEMORY_LIMITS.waiting);
+    expect(first.waiting.find((w) => w.text === '等新的回复')).toMatchObject({ provisional: true });
+    const reloaded = parseWorkingMemory({ version: 1, ...first });
+    expect(reloaded.waiting.find((w) => w.text === '等新的回复')).toMatchObject({ provisional: true });
+    // 下一次复盘:老缺口还在分批回补,前缀里一条有证据的新条目进账(不延后)——裁掉的是临时条目,
+    // 正式条目一个不少;否则 rewind 那一轮后被挤掉的正式条目回不来。
+    const second = applyWorkingMemoryProposal(
+      reloaded,
+      {
+        threads: [], commitments: [], corrections: [], recentlyDone: [], resolved: [],
+        waiting: [{ text: '等用户确认模板', on: 'user', evidence: { messageId: 'u1', quote: '周报模板改成先结论后细节' } }],
+      },
+      messages,
+      { now: now + 1, coveredThroughRowid: 11, coveredThroughMessageId: 'u1', deferEvidenceFrom: new Set(['x9']) },
+    );
+    expect(second.waiting.map((w) => w.text)).toContain('等用户确认模板');
+    expect(second.waiting.map((w) => w.text)).not.toContain('等新的回复');
+    expect(second.waiting.map((w) => w.id).sort()).toEqual([...durable.map((w) => w.id), second.waiting.find((w) => w.text === '等用户确认模板')!.id].sort());
+    // 水位推进到当前回复(缺口全部补完):临时条目转正,不再带标记。
+    const settled = applyWorkingMemoryProposal(
+      reloaded,
+      { threads: [], commitments: [], waiting: [], corrections: [], recentlyDone: [], resolved: [] },
+      messages,
+      { now: now + 2, coveredThroughRowid: 12, coveredThroughMessageId: 'a1' },
+    );
+    expect(settled.waiting.find((w) => w.text === '等新的回复')).not.toHaveProperty('provisional');
+    expect(settled.waiting.find((w) => w.text === '等新的回复')).toMatchObject({ updatedAt: now });
   });
 
   it('requires evidence to change a field of an existing item, allows evidenced clearing, and bumps time only on real change', () => {
@@ -316,6 +438,12 @@ describe('store', () => {
     expect(await readWorkingMemoryNoteForSession('s-task', root)).toBeNull();
     db.queue.push([]);
     expect(await pruneWithdrawnWorkingMemoryForSession('s-task', root)).toBe(0);
+    // 来源校验查询失败:不退回"未过滤",按没有账本返回 null(提前换窗也随之取消)。
+    db.queue.push([{ botId: 'bot-1' }], new Error('db down'));
+    expect(await readWorkingMemoryNoteForSession('s-bot', root)).toBeNull();
+    // 后台任务状态查询失败:不渲染"没有任务区"的账本(新上下文会以为旧任务不在跑),同样按 null。
+    db.queue.push([{ botId: 'bot-1' }], [{ clearedAt: null }], dbRows, new Error('db down'));
+    expect(await readWorkingMemoryNoteForSession('s-bot', root)).toBeNull();
   });
 
   it('treats items whose source message predates /clear as withdrawn, and prunes them after the clear is persisted', async () => {
@@ -350,6 +478,32 @@ describe('store', () => {
     expect(after.commitments.map((c) => c.id)).toEqual(['c-after']);
     expect(after.corrections).toEqual([]);
     expect(after.waiting).toEqual([]);
+  });
+
+  it('is fresh only when the ledger covers the latest completed reply of a companion chat', async () => {
+    // 账本存的 rowid(999)是瘦身前的数字,不作数;按 client_id 'r12' 解析回当前 rowid 再比较。
+    await writeBotWorkingMemory(root, 'bot-1', { ...emptyWorkingMemory(), updatedAt: 1, coveredThroughRowid: 999, coveredThroughMessageId: 'r12' }, 0);
+    // 伙伴归属 → 水位消息的当前 rowid → 最近一条已完成回复的 rowid。
+    db.queue.push([{ botId: 'bot-1' }], [{ rowid: 12 }], [{ rowid: 12 }]);
+    expect(await isWorkingMemoryFreshForSession('s-bot', root)).toBe(true);
+    db.queue.push([{ botId: 'bot-1' }], [{ rowid: 12 }], [{ rowid: 13 }]);
+    expect(await isWorkingMemoryFreshForSession('s-bot', root)).toBe(false);
+    // 还没有已完成回复 / 水位消息已不在 / 非伙伴主对话 / 没有账本 / 旧账本没有 client_id:都不算新鲜。
+    db.queue.push([{ botId: 'bot-1' }], [{ rowid: 12 }], [{ rowid: null }]);
+    expect(await isWorkingMemoryFreshForSession('s-bot', root)).toBe(false);
+    db.queue.push([{ botId: 'bot-1' }], []);
+    expect(await isWorkingMemoryFreshForSession('s-bot', root)).toBe(false);
+    db.queue.push([]);
+    expect(await isWorkingMemoryFreshForSession('s-task', root)).toBe(false);
+    db.queue.push([{ botId: 'bot-none' }]);
+    expect(await isWorkingMemoryFreshForSession('s-bot', root)).toBe(false);
+    await writeBotWorkingMemory(root, 'bot-legacy', { ...emptyWorkingMemory(), updatedAt: 1, coveredThroughRowid: 12 }, 0);
+    db.queue.push([{ botId: 'bot-legacy' }]);
+    expect(await isWorkingMemoryFreshForSession('s-bot', root)).toBe(false);
+    // 水位停在一条长消息中间(分块未补完):同样不算新鲜。
+    await writeBotWorkingMemory(root, 'bot-chunk', { ...emptyWorkingMemory(), updatedAt: 1, coveredThroughRowid: 12, coveredThroughMessageId: 'r12', coveredThroughOffset: 6000 }, 0);
+    db.queue.push([{ botId: 'bot-chunk' }]);
+    expect(await isWorkingMemoryFreshForSession('s-bot', root)).toBe(false);
   });
 
   it('treats a corrupt or foreign file as no ledger', async () => {

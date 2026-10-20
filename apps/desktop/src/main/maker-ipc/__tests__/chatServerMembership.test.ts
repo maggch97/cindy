@@ -132,6 +132,8 @@ describe('Chat Server membership notices', () => {
       const result = await service.getGroup(roomId);
       expect(result.ok && result.group.messages.map(m => m.id)).toEqual([joined().id]);
     }
+    // Duplicate notices coalesce into one push at the end of the 150ms window.
+    await vi.advanceTimersByTimeAsync(150);
     expect(changed).toHaveBeenCalled();
     expect(dispatch).not.toHaveBeenCalled();
     expect(fixture.handle.mock.calls.some(([route, method]) => method === 'POST' && route.includes('/messages'))).toBe(false);

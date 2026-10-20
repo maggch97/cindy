@@ -217,6 +217,7 @@ function harness(
     assertTrustedAppRendererEvent: vi.fn(),
     captureGhostMutationOwner: () => ({ ...session }),
     beginGhostMutation: () => release,
+    pluginDeviceSync: { beginMutation: vi.fn(() => vi.fn()) },
     getActiveAppSession: () => session,
     isAppSessionBoundaryPending: () => false,
     isSameAppSession: (left: typeof session, right: typeof session) =>
@@ -285,6 +286,7 @@ function harness(
     getLayoutStore: () => ({ getLayout: () => ({}), setLayout: vi.fn() }),
     layoutWithGhostPanel: () => null,
     spawnIfResident: vi.fn(),
+    bindPluginUsage: vi.fn(async () => {}),
     exportGhostPackage: exportPackage,
     BrowserWindow: { fromWebContents: () => null },
     dialog: { showSaveDialog: vi.fn() },

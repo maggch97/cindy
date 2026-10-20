@@ -789,9 +789,13 @@ function extraResourcesForTarget(targetPlatform: string): string[] {
     'resources/cindy-version-protocol.json',
     // Input bytes for upgrading retired preset avatars to ordinary managed images.
     'resources/legacy-teammate-avatars',
+    // Bundled preset artwork main draws outside the renderer (Agent Island companion avatars).
+    'resources/companion-preset-avatars',
     'resources/teammate-portrait-gallery.png',
     // Cindy-owned Agent Skills are materialized under userData on startup.
     'resources/system-skills',
+    // Bundled Bot Market teammate packages; packaged builds read them from process.resourcesPath (bot-import/host.ts).
+    'resources/bot-packages',
     'resources/tools',
     'drizzle',
     'resources/cc-manager',
@@ -1621,7 +1625,13 @@ function buildMacMenubarHelper(platform: ForgePlatform, arch: ForgeArch): void {
   const src = path.join(srcDir, 'macos-menubar-helper.swift');
   const destDir = path.join(__dirname, 'resources', 'tools', 'menubar');
   const dest = path.join(destDir, 'xdt-macos-menubar-helper');
-  const assets = ['wordmark-light.png', 'wordmark-dark.png'];
+  const assets = [
+    'wordmark-light.png',
+    'wordmark-dark.png',
+    'BarlowCondensed-Light.ttf',
+    'BarlowCondensed-Medium.ttf',
+    'BarlowCondensed-SemiBold.ttf',
+  ];
   if (!fs.existsSync(src)) {
     throw new Error(`[forge] macOS menu bar helper source missing at ${src}`);
   }
@@ -2163,12 +2173,6 @@ const config: ForgeConfig = {
         {
           // 右侧栏独立子窗口专用 preload:最小权限 bridge,不加载主 preload 完整桥。
           entry: 'src/preload/sidebarWindowPreload.ts',
-          config: 'vite.preload.config.ts',
-          target: 'preload',
-        },
-        {
-          // 插件面板独立窗口专用 preload:最小权限 bridge。
-          entry: 'src/preload/ghostPanelWindowPreload.ts',
           config: 'vite.preload.config.ts',
           target: 'preload',
         },

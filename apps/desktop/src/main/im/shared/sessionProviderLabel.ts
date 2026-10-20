@@ -1,8 +1,5 @@
 /**
- * 某任务此刻实际走的供应商显示名 —— 渠道失败说明(额度不足等)要说清「是哪个供应商」。
- *
- * 只在需要时(失败收口)读一次, 尽力而为: 读库或供应商目录失败一律返回 null,
- * 调用方退回「当前供应商」的说法, 不为一个名字挡住失败消息。
+ * 失败时按任务实际路由读取定位信息；目录不可读也保留任务名和模型 ID。
  */
 import { eq } from 'drizzle-orm';
 import { actualSourceIdForModel } from '@cindy/model-providers';
@@ -13,19 +10,31 @@ import { sessions } from '../../localDb/schema';
 import { getDesktopProviderService } from '../../maker-host/createDesktopProviderService';
 import { getSessionProvider, hasSessionProvider } from '../../maker-host/session-provider-store';
 
-export async function resolveSessionProviderLabel(sessionId: string): Promise<string | null> {
+export async function resolveSessionErrorContext(sessionId: string): Promise<{
+  providerLabel?: string;
+  modelLabel?: string;
+  taskLabel?: string;
+}> {
   try {
     const [row] = await getDbClient()
       .drizzle.select({
         agentKind: sessions.agentKind,
         model: sessions.model,
         providerId: sessions.providerId,
+        title: sessions.title,
       })
       .from(sessions)
       .where(eq(sessions.id, sessionId))
       .limit(1);
-    if (!row?.model) return null;
-    const providers = await getDesktopProviderService().listProviders({ allowSideEffects: false });
+    if (!row) return {};
+    const context = {
+      taskLabel: `${row.title || '任务'}（${sessionId.slice(0, 8)}）`,
+      ...(row.model ? { modelLabel: row.model } : {}),
+    };
+    if (!row.model) return context;
+    const providers = await getDesktopProviderService()
+      .listProviders({ allowSideEffects: false })
+      .catch(() => []);
     // 内存里的来源比库里新(本轮刚切过、尚未落库时以运行中的为准)。
     const selected = hasSessionProvider(sessionId) ? getSessionProvider(sessionId) : row.providerId;
     // 「运行中会话」口径(与实际路由层 provider-route 一致): 停用 / 退役的拷贝仍算数 ——
@@ -37,8 +46,12 @@ export async function resolveSessionProviderLabel(sessionId: string): Promise<st
       row.model,
       dbToMakerAgentKind(row.agentKind),
     );
-    return providers.find((provider) => provider.id === providerId)?.name ?? null;
+    const provider = providers.find((provider) => provider.id === providerId);
+    const model = provider?.models[dbToMakerAgentKind(row.agentKind)]?.find(
+      (entry) => entry.id === row.model,
+    );
+    return { ...context, modelLabel: model?.name || row.model, providerLabel: provider?.name };
   } catch {
-    return null;
+    return {};
   }
 }

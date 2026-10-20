@@ -72,7 +72,11 @@ vi.mock('@/features/device-link/remoteSessionActivityStore', () => ({}));
 vi.mock('@/lib/makerChatStore', () => ({
   makerChatStore: { subscribeAll: () => () => {}, getRunningSnapshot: () => state.running },
 }));
-vi.mock('@/lib/sessionAttentionStore', () => ({ useSessionAttentionKinds: () => state.attention }));
+vi.mock('@/lib/sessionAttentionStore', () => ({
+  useSessionAttentionKinds: () => state.attention,
+  getSessionAttentionKinds: () => state.attention,
+  subscribeSessionAttention: () => () => undefined,
+}));
 vi.mock('@/state/agentIslandActivity', () => ({ useAgentIslandActivityMap: () => state.empty }));
 vi.mock('@/lib/orcaSessionIdentity', () => ({ isOrcaWorkerSession: () => false }));
 

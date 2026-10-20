@@ -83,6 +83,7 @@ function pipeline() {
   const builtin = vi.fn(async () => 'completed' as const);
   const syncMarket = vi.fn(() => market.promise);
   const oauth = vi.fn(async () => true);
+  const refreshUsage = vi.fn(async () => undefined);
   const warn = vi.fn();
   const coordinator = new StableOwnerPostCommitCoordinator({
     snapshot: () => ({ scopeKey: scope, dataOwnerId: owner, stable: true }),
@@ -100,6 +101,7 @@ function pipeline() {
     getActiveAppSession: () => ({ dataOwnerId: owner }),
     runStableOwnerPostCommitTask: builtin,
     syncDefaultMarketPlugins: syncMarket,
+    refreshPluginUsageBindings: refreshUsage,
     reconcileGhostOauthAccountsForActiveOwner: oauth,
   };
   const compiled = transpileModule(
@@ -121,6 +123,7 @@ function pipeline() {
     syncMarket,
     builtin,
     oauth,
+    refreshUsage,
     warn,
     switchOwner: (next: string | null) => {
       owner = next;
@@ -136,6 +139,7 @@ describe('production background pipeline', () => {
     const result = run.coordinator.ensure('startup');
     await vi.advanceTimersByTimeAsync(180_000);
     await expect(result).resolves.toBe('failed');
+    expect(run.refreshUsage).toHaveBeenCalledTimes(1);
     expect(run.oauth).toHaveBeenCalledTimes(1);
     run.syncPluginMarketForActiveOwner();
     await vi.advanceTimersByTimeAsync(1_000);
@@ -181,7 +185,10 @@ describe('production background pipeline', () => {
     builtin.resolve('completed');
     await vi.advanceTimersByTimeAsync(0);
     run.switchOwner(null);
+    const usageRefreshesBeforeSignOut = run.refreshUsage.mock.calls.length;
     await expect(run.coordinator.ensure('signed-out')).resolves.toBe('completed');
+    expect(usageRefreshesBeforeSignOut).toBeGreaterThan(0);
+    expect(run.refreshUsage).toHaveBeenCalledTimes(usageRefreshesBeforeSignOut);
     expect(run.syncMarket).toHaveBeenCalledTimes(1);
     expect(run.oauth).toHaveBeenCalledTimes(1);
   });

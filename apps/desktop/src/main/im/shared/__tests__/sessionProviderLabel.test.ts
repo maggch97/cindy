@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProviderView } from '@cindy/model-providers';
 
 const mocks = vi.hoisted(() => ({
-  row: null as null | { agentKind: string; model: string | null; providerId: string | null },
+  row: null as null | { agentKind: string; model: string | null; providerId: string | null; title?: string },
   providers: [] as unknown[],
   live: undefined as undefined | string | null,
 }));
@@ -28,7 +28,7 @@ vi.mock('../../../maker-host/session-provider-store', () => ({
   getSessionProvider: () => mocks.live ?? null,
 }));
 
-const { resolveSessionProviderLabel } = await import('../sessionProviderLabel');
+const { resolveSessionErrorContext } = await import('../sessionProviderLabel');
 
 function codexProvider(id: string, name: string, disabled = false): ProviderView {
   return {
@@ -60,30 +60,38 @@ beforeEach(() => {
   mocks.live = undefined;
 });
 
-describe('resolveSessionProviderLabel', () => {
+describe('resolveSessionErrorContext', () => {
   it('names the implicit native default source', async () => {
-    await expect(resolveSessionProviderLabel('s1')).resolves.toBe('OpenAI');
+    await expect(resolveSessionErrorContext('s1')).resolves.toMatchObject({ providerLabel: 'OpenAI', modelLabel: 'GPT-6 Astra' });
   });
 
   it('keeps naming the implicit default when its copy was disabled while the task runs', async () => {
     // 新路由口径会剔除停用拷贝、落到 Cindy AI —— 说明会把 OpenAI 的花费上限归给别家。
     mocks.providers = [codexProvider('openai', 'OpenAI', true), codexProvider('xd', 'Cindy AI')];
-    await expect(resolveSessionProviderLabel('s1')).resolves.toBe('OpenAI');
+    await expect(resolveSessionErrorContext('s1')).resolves.toMatchObject({ providerLabel: 'OpenAI' });
   });
 
   it('keeps naming an explicit source whose model was disabled while the task runs', async () => {
     mocks.row = { agentKind: 'codex', model: 'gpt-6-astra', providerId: 'openai' };
     mocks.providers = [codexProvider('openai', 'OpenAI', true), codexProvider('xd', 'Cindy AI')];
-    await expect(resolveSessionProviderLabel('s1')).resolves.toBe('OpenAI');
+    await expect(resolveSessionErrorContext('s1')).resolves.toMatchObject({ providerLabel: 'OpenAI' });
   });
 
   it('prefers the in-memory source over the stored one', async () => {
     mocks.live = 'xd';
-    await expect(resolveSessionProviderLabel('s1')).resolves.toBe('Cindy AI');
+    await expect(resolveSessionErrorContext('s1')).resolves.toMatchObject({ providerLabel: 'Cindy AI' });
   });
 
-  it('returns null when the task or its model is unknown', async () => {
+  it('keeps task identity and the model ID when catalog metadata is missing', async () => {
+    mocks.providers = [];
+    mocks.row!.title = 'Telegram 测试';
+    await expect(resolveSessionErrorContext('12345678-abcd')).resolves.toMatchObject({
+      taskLabel: 'Telegram 测试（12345678）', modelLabel: 'gpt-6-astra',
+    });
+  });
+
+  it('returns no context when the task is unknown', async () => {
     mocks.row = null;
-    await expect(resolveSessionProviderLabel('s1')).resolves.toBeNull();
+    await expect(resolveSessionErrorContext('s1')).resolves.toEqual({});
   });
 });

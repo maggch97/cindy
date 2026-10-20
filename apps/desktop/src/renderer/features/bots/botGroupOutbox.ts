@@ -592,6 +592,8 @@ export function registerBotGroupComposer(groupId: string, handle: BotGroupCompos
 }
 
 export interface BotGroupOutboxProjection {
+  /** Server message id → local client id, to keep the same rendered row. */
+  replacements: ReadonlyMap<string, string>;
   /** Entries still shown under the timeline. */
   pending: BotGroupOutboxEntry[];
   /** Local attachment previews to lay over timeline messages, by message id. */
@@ -610,7 +612,8 @@ export function projectBotGroupOutbox(
   previews: ReadonlyMap<string, readonly BotGroupAttachment[]> = NO_PREVIEWS,
 ): BotGroupOutboxProjection {
   const localAttachments = new Map(previews);
-  if (entries.length === 0) return { pending: [], localAttachments };
+  const replacements = new Map<string, string>();
+  if (entries.length === 0) return { pending: [], localAttachments, replacements };
   const claimedIds = new Set(claimed);
   const sequenceOf = new Map(messages.map((message) => [message.id, message.sequence]));
   // A message sent later never shows above an earlier one the timeline already has.
@@ -620,6 +623,7 @@ export function projectBotGroupOutbox(
     pending.push(floor > entry.after ? { ...entry, after: floor } : entry);
   };
   const replaced = (messageId: string, entry: BotGroupOutboxEntry) => {
+    replacements.set(messageId, entry.input.clientId);
     floor = Math.max(floor, sequenceOf.get(messageId) ?? -Infinity);
     if (entry.attachments.length > 0) localAttachments.set(messageId, entry.attachments);
   };
@@ -647,7 +651,7 @@ export function projectBotGroupOutbox(
     if (copy) replaced(copy.id, entry);
     else shown(entry);
   }
-  return { pending, localAttachments };
+  return { pending, localAttachments, replacements };
 }
 
 export type BotGroupTimelineRow =

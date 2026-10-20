@@ -12,6 +12,7 @@ function Controls() {
   return (
     <>
       <button onClick={() => settings.setWallpaper('cindy-window')}>Choose</button>
+      <button onClick={() => settings.setWallpaper('night-launch')}>Choose Still</button>
       <button onClick={settings.resetWallpaper}>Reset</button>
       <button onClick={() => settings.setMotion('dynamic')}>Animate</button>
       <button onClick={() => settings.setMotion('static')}>Static</button>
@@ -40,6 +41,68 @@ afterEach(() => {
 });
 
 describe('application wallpaper lifecycle', () => {
+  // Regression: changing static wallpaper must retain the displayed canvas
+  // until the selected original is decoded, including out-of-order downloads.
+  it('retains the background until the selected original is ready, ignoring late downloads', async () => {
+    const finishes = new Map<string, (url: string) => void>();
+    const ensureImage = vi.fn(
+      (id: string) =>
+        new Promise<string>((resolve) => {
+          finishes.set(id, resolve);
+        }),
+    );
+    const ensureVideo = vi.fn();
+    const setPatch = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal(
+      'Image',
+      class {
+        src = '';
+        decode = async () => {};
+      },
+    );
+    vi.stubGlobal('electronAPI', {
+      appearanceSettings: {
+        getSync: () => ({ ...DEFAULT_APPEARANCE_SETTINGS, wallpaperId: 'cindy-window' }),
+        onChanged: () => () => {},
+        setPatch,
+        ensureWallpaperImage: ensureImage,
+        ensureWallpaperVideo: ensureVideo,
+      },
+    });
+    render(
+      <WallpaperSettingsProvider>
+        <Controls />
+      </WallpaperSettingsProvider>,
+    );
+    await waitFor(() => expect(ensureImage).toHaveBeenCalledExactlyOnceWith('cindy-window'));
+    const background = () =>
+      document.documentElement.style.getPropertyValue('--app-wallpaper-image');
+    const originalBackground = background();
+    fireEvent.click(screen.getByText('Choose Still'));
+    await waitFor(() =>
+      expect(setPatch).toHaveBeenCalledExactlyOnceWith({ wallpaperId: 'night-launch' }),
+    );
+    expect(background()).toBe(originalBackground);
+    await act(async () =>
+      finishes.get('cindy-window')!(`cindy-media://client-wallpaper/${'a'.repeat(64)}.webp`),
+    );
+    expect(background()).toBe(originalBackground);
+    const stillUrl = `cindy-media://client-wallpaper/${'b'.repeat(64)}.webp`;
+    await act(async () => finishes.get('night-launch')!(stillUrl));
+    expect(background()).toContain(stillUrl);
+    const root = document.documentElement;
+    expect(root.style.getPropertyValue('--app-wallpaper-previous-image')).toBe(originalBackground);
+    expect(root.dataset.wallpaperTransition).toBe('true');
+    const finished = new Event('animationend', { bubbles: true });
+    Object.defineProperty(finished, 'animationName', { value: 'app-wallpaper-image-out' });
+    fireEvent(document.body, finished);
+    expect(root.dataset.wallpaperTransition).toBeUndefined();
+    expect(root.style.getPropertyValue('--app-wallpaper-previous-image')).toBe('');
+    expect(background()).toContain(stillUrl);
+    expect(ensureImage).toHaveBeenCalledTimes(2);
+    expect(ensureVideo).not.toHaveBeenCalled();
+  });
+
   it('weights required image and video progress by bytes, excluding video in static mode', async () => {
     const listeners = new Set<(progress: WallpaperDownloadProgress) => void>();
     vi.stubGlobal('electronAPI', {

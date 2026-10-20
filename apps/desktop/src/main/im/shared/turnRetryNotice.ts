@@ -223,46 +223,21 @@ export function isQuotaExhaustionFailure(data: unknown): boolean {
   return isQuotaExhaustedErrorMessage(e.message);
 }
 
-/**
- * 额度类终态错误 -> 渠道可读的失败说明; 不是这类错误返回 null。
- *
- * 说清三件事: 哪个供应商、什么原因、怎么处理(按入口指到对的设置, 见 surface)。**不自动更换模型或供应商**(与 openSession
- * 模型准入「不会自动更换模型或供应商」同一口径): 换哪个供应商、花不花钱由用户决定。
- * 上游原文(脱敏、截断)附在最后, 用户转给工作区管理员或排查时用得上。
- */
+/** IM 失败说明只定位当前 bot / 任务 / 路由，并给当前任务的恢复动作。 */
 export interface QuotaFailureNoticeOptions {
   providerLabel?: string | null;
-  /**
-   * 哪个入口的任务 —— 「怎么处理」要指到对的地方:
-   * - `personal`: 个人 bot / 个人 IM 渠道, 支持时 `/model` 直接改这个任务, 默认模型在
-   *   这个 bot 自己的卡片(如「Telegram 机器人」)的「新对话配置」里;
-   * - `official`: 官方 bot, `/model` 与官方卡片工作目录里的模型改的是**目录默认**,
-   *   已有任务保持原模型, 所以要接着 `/new` 开新任务, 或在 Cindy 里直接给任务换模型。
-   */
+  modelLabel?: string;
+  taskLabel?: string;
+  botLabel?: string;
   surface: 'personal' | 'official';
-  /** 个人渠道只有富卡输出支持 /model；未声明时指向 Cindy 内的当前任务。 */
+  /** 只有个人富卡渠道的 /model 改当前任务；官方的 /model 改目录默认。 */
   supportsModelCommand?: boolean;
 }
 
 function quotaRecoveryHint(options: QuotaFailureNoticeOptions): string {
-  if (options.surface === 'official') {
-    return (
-      'Cindy 不会自动更换模型或供应商。可以发 /model，或在 Cindy 的 设置 → IM 机器人 →' +
-      '「Telegram」等官方 bot 卡片的工作目录里换一个模型（改的是这个目录的默认，已有任务保持原模型），' +
-      '然后发 /new 开新任务；也可以在 Cindy 里直接给这个任务换模型。额度恢复后也可以直接重发这条消息。'
-    );
-  }
-  if (!options.supportsModelCommand) {
-    return (
-      'Cindy 不会自动更换模型或供应商。可以在 Cindy 里打开这个任务，给它换一个供应商或模型，' +
-      '然后回到这里重发这条消息。额度恢复后也可以直接重发这条消息。'
-    );
-  }
-  return (
-    'Cindy 不会自动更换模型或供应商。可以发 /model 给这个任务换一个供应商或模型；' +
-    '以后新任务的默认模型在 Cindy 的 设置 → IM 机器人 里这个 bot 自己的卡片' +
-    '（如「Telegram 机器人」）的「新对话配置」中修改。额度恢复后也可以直接重发这条消息。'
-  );
+  return options.surface === 'personal' && options.supportsModelCommand
+    ? '发 /model 为当前任务更换供应商或模型，再重发这条消息。'
+    : '在 Cindy 里打开这个任务，更换供应商或模型，再回到这里重发这条消息。';
 }
 
 export function quotaFailureNotice(
@@ -276,13 +251,17 @@ export function quotaFailureNotice(
     : codexErrorInfo === 'usageLimitExceeded' || USAGE_LIMIT_RE.test(message)
       ? '账号用量已达上限'
       : '账号余额或配额不足';
-  const label = options.providerLabel?.trim();
+  const display = (value: string | null | undefined): string =>
+    redactSensitiveText(value?.replace(/\s+/g, ' ').trim() ?? '').slice(0, 100);
+  const label = display(options.providerLabel);
   const who = label ? `「${label}」` : '当前供应商';
-  const upstream = redactSensitiveText(message.replace(/\s+/g, ' ').trim()).slice(0, 300);
   return [
     `${QUOTA_FAILURE_NOTICE_PREFIX}：${who}${reason}，这个任务暂时无法继续。`,
+    `来源：${display(options.botLabel) || (options.surface === 'official' ? '官方 bot' : '个人 bot')}` +
+      (options.modelLabel ? ` · 模型：${display(options.modelLabel)}` : ''),
+    ...(options.taskLabel ? [`任务：${display(options.taskLabel)}`] : []),
+    ...(SPEND_CAP_RE.test(message) ? ['请联系工作区管理员调整花费上限，或更换供应商。'] : []),
     quotaRecoveryHint(options),
-    ...(upstream ? [`上游原文：${upstream}`] : []),
   ].join('\n');
 }
 

@@ -228,20 +228,25 @@ export async function decideProviderShareReshare(
   id: string,
   decision: 'approve' | 'reject',
   now = Date.now(),
+  assertCurrent: () => void = () => undefined,
 ): Promise<{ record: ProviderShareReshareRecord; previous: RemoteAgentReshareState } | null> {
+  assertCurrent();
   let changed: { record: ProviderShareReshareRecord; previous: RemoteAgentReshareState } | null = null;
-  await store.updateAtomic(({ value }) => ({
-    records: value.records.map((record) => {
-      if (record.id !== id) return record;
-      const next: ProviderShareReshareRecord = {
-        ...record,
-        state: decision === 'approve' ? 'approved' : 'rejected',
-        decidedAt: now,
-      };
-      changed = { record: next, previous: record.state };
-      return next;
-    }),
-  }));
+  await store.updateAtomic(({ value }) => {
+    assertCurrent();
+    return {
+      records: value.records.map((record) => {
+        if (record.id !== id) return record;
+        const next: ProviderShareReshareRecord = {
+          ...record,
+          state: decision === 'approve' ? 'approved' : 'rejected',
+          decidedAt: now,
+        };
+        changed = { record: next, previous: record.state };
+        return next;
+      }),
+    };
+  });
   return changed;
 }
 

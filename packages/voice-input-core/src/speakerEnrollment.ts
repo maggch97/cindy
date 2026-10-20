@@ -27,6 +27,8 @@ export type SpeakerEnrollmentResult =
     };
 
 export const SPEAKER_ENROLLMENT_CLIP_COUNT = 3;
+/** Recording may finish earlier when the user has read the passage. */
+export const SPEAKER_ENROLLMENT_MAX_CLIP_SEC = 30;
 export const SPEAKER_ENROLLMENT_MIN_CLIP_SPEECH_SEC = 2;
 // Own-voice windows scored 0.77–0.88 in validation; clips of one person that
 // disagree this much usually mean a second voice or heavy noise in a clip.

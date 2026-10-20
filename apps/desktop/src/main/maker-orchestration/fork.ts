@@ -47,6 +47,40 @@ export type ForkErrorCode =
 
 const STRIP_FORK_TITLE_PREFIX = '[Fork·已剥离]';
 
+export async function listSideChats(sourceSessionId: string): Promise<Array<{ id: string }>> {
+  return getDbClient().drizzle.select({ id: sessions.id }).from(sessions).where(and(
+    eq(sessions.parentSessionId, sourceSessionId), eq(sessions.source, 'side-chat'),
+    or(eq(sessions.status, 'active'), eq(sessions.status, 'archived')),
+  )).orderBy(asc(sessions.createdAt));
+}
+
+/** Snapshot completed history without waiting for or stopping the parent turn. */
+export async function createSideChat(sourceSessionId: string): Promise<Session> {
+  const db = getDbClient().drizzle;
+  const [source] = await db.select().from(sessions).where(eq(sessions.id, sourceSessionId)).limit(1);
+  if (!source || source.status !== 'active') {
+    throw forkError('SOURCE_NOT_FOUND', 'Source task is unavailable');
+  }
+  if (source.source === 'side-chat' || source.source === 'review' || source.source === 'bot') {
+    throw forkError('UNSUPPORTED_HISTORY', 'Open a side chat from the main task');
+  }
+  const inFlight = (source.activeTurnStartedAt ?? 0) > (source.lastTurnEndedAt ?? 0);
+  const completedBefore = source.lastTurnEndedAt
+    ? source.lastTurnEndedAt + 1
+    : inFlight ? source.activeTurnStartedAt : undefined;
+  // Fork the last completed reply through the next user boundary. Later user
+  // rows may be steers; a queued turn's question may also predate its start.
+  const [anchor] = await db.select({ clientId: messages.clientId }).from(messages).where(and(
+    eq(messages.sessionId, sourceSessionId),
+    eq(messages.role, 'assistant'),
+    isNull(messages.rewindAt),
+    source.clearedAt === null ? undefined : gt(messages.createdAt, source.clearedAt),
+    completedBefore ? lt(messages.createdAt, completedBefore) : undefined,
+  )).orderBy(desc(messages.createdAt), desc(messageRowid)).limit(1);
+  if (!anchor?.clientId) throw forkError('NO_PRIOR_ASSISTANT', 'Wait for the first completed reply');
+  return forkSessionAtMessage(sourceSessionId, anchor.clientId, { sideChat: true });
+}
+
 function forkError(code: ForkErrorCode, message: string): Error {
   const err = new Error(message);
   (err as { code?: string }).code = code;
@@ -82,7 +116,7 @@ interface ForkNativeSource {
   nextSwitch: MessagePosition | null;
   /** false = 原生会话已因同引擎换窗失效，只复制可见历史，首次发送走交接。 */
   reuseVendorSession: boolean;
-  rebuildReason?: 'context-overflow' | 'model-window-switch' | 'pi-prompt-timeout' | 'native-session-recovery';
+  rebuildReason?: 'context-overflow' | 'model-window-switch' | 'pi-prompt-timeout' | 'native-session-recovery' | 'idle-gap';
 }
 
 interface ForkTimelineMessage {
@@ -163,7 +197,7 @@ async function seedForkHandoffAfterSameEngineRebuild(opts: {
   agentKind: DbAgentKind;
   model: string;
   providerId: string | null;
-  reason: 'context-overflow' | 'model-window-switch' | 'pi-prompt-timeout' | 'native-session-recovery';
+  reason: 'context-overflow' | 'model-window-switch' | 'pi-prompt-timeout' | 'native-session-recovery' | 'idle-gap';
 }): Promise<void> {
   const handoffMessages: HandoffSourceMessage[] = opts.rows
     .filter(
@@ -184,7 +218,8 @@ async function seedForkHandoffAfterSameEngineRebuild(opts: {
     fromLabel: label,
     toLabel: label,
     sessionId: opts.sessionId,
-    reason: opts.reason,
+    // fork 出的新任务不知道原来隔了多久,空闲间隔边界按「换了干净原生会话」的通用口径交接。
+    reason: opts.reason === 'idle-gap' ? 'native-session-recovery' : opts.reason,
   });
   await commitContextRebuild(opts.sessionId, handoff, {
     reason: opts.reason,
@@ -208,7 +243,7 @@ async function seedForkHandoffAfterSameEngineRebuild(opts: {
 }
 
 interface ParsedContextRebuildBoundary {
-  reason: 'context-overflow' | 'model-window-switch' | 'pi-prompt-timeout' | 'native-session-recovery';
+  reason: 'context-overflow' | 'model-window-switch' | 'pi-prompt-timeout' | 'native-session-recovery' | 'idle-gap';
   sourceAgentKind?: DbAgentKind;
   sourceModel?: string | null;
   sourceProviderId?: string | null;
@@ -221,7 +256,8 @@ function parseContextRebuildBoundary(content: string): ParsedContextRebuildBound
       parsed.reason !== 'context-overflow' &&
       parsed.reason !== 'model-window-switch' &&
       parsed.reason !== 'pi-prompt-timeout' &&
-      parsed.reason !== 'native-session-recovery'
+      parsed.reason !== 'native-session-recovery' &&
+      parsed.reason !== 'idle-gap'
     ) {
       return null;
     }
@@ -247,7 +283,7 @@ function parseContextRebuildBoundary(content: string): ParsedContextRebuildBound
 
 function parseContextRebuildReason(
   content: string,
-): 'context-overflow' | 'model-window-switch' | 'pi-prompt-timeout' | 'native-session-recovery' | null {
+): 'context-overflow' | 'model-window-switch' | 'pi-prompt-timeout' | 'native-session-recovery' | 'idle-gap' | null {
   return parseContextRebuildBoundary(content)?.reason ?? null;
 }
 
@@ -772,6 +808,7 @@ function collectClaudeToolParentUuids(
 export async function forkSessionAtMessage(
   sourceSessionId: string,
   messageClientId: string,
+  options: { sideChat?: boolean } = {},
 ): Promise<Session> {
   const db = getDbClient().drizzle;
 
@@ -1011,6 +1048,7 @@ export async function forkSessionAtMessage(
       targetRowid: copyBoundary.rowid,
       newSession: {
         id: newSessionId,
+        ...(options.sideChat ? { source: 'side-chat' as const } : {}),
         title: newTitle,
         workingDir: source.workingDir,
         model: forkSource.model,

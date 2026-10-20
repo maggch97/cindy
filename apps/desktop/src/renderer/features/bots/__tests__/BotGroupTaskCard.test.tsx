@@ -11,8 +11,10 @@ vi.mock('../companionCloudStore', () => ({ useCompanionCloud: () => stores.cloud
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key.replace('bots.groupChat.task.state.', 'state:') }),
 }));
-// The live link reads stores of its own; the card only decides whether to show it.
-vi.mock('../BotSessionTaskLink', () => ({ BotSessionTaskLink: () => <span data-testid="live-link">live</span> }));
+// The live card reads stores of its own; this card only decides whether to show it.
+vi.mock('../BotCollaborationCard', () => ({
+  BotTaskCard: ({ sessionId }: { sessionId?: string }) => <span data-testid="live-card">live:{sessionId}</span>,
+}));
 
 import { BotGroupTaskCard } from '../BotGroupTaskCard';
 
@@ -41,7 +43,7 @@ describe('BotGroupTaskCard', () => {
     expect(card.dataset.state).toBe('completed');
     expect(card.textContent).toContain('Launch post');
     expect(card.textContent).toContain('state:completed');
-    expect(screen.queryByTestId('live-link')).toBeNull();
+    expect(screen.queryByTestId('live-card')).toBeNull();
   });
 
   it('shows what a waiting task asks for', () => {
@@ -49,36 +51,35 @@ describe('BotGroupTaskCard', () => {
     expect(screen.getByTestId('bot-group-task').textContent).toContain('state:waiting · Which audience?');
   });
 
-  it('shows my own teammate\'s task as the live link', () => {
-    render(<BotGroupTaskCard task={task('waiting', 'Which audience?')} owned botId="bot-a" />);
-    expect(screen.getByTestId('live-link')).toBeTruthy();
-    // The posted state would go stale once the task moves on; the live link shows its own status.
-    expect(screen.getByTestId('bot-group-task').textContent).not.toContain('state:waiting');
+  it('shows my own teammate\'s task as the live background-task card, read through the group lane', () => {
+    render(<BotGroupTaskCard task={task('started')} owned botId="bot-a" />);
+    expect(screen.getByTestId('live-card').textContent).toBe('live:group-lane');
+    expect(screen.getByTestId('bot-group-task').textContent).not.toContain('state:started');
   });
 
   it('shows my own teammate\'s task live on its home computer', () => {
     stores.cloud = homedOn('this-desktop');
     render(<BotGroupTaskCard task={task('started')} owned botId="bot-a" />);
-    expect(screen.getByTestId('live-link')).toBeTruthy();
+    expect(screen.getByTestId('live-card')).toBeTruthy();
   });
 
   it('shows my own teammate\'s task as the snapshot on another of my computers: it runs on its home', () => {
     // A local copy whose home is elsewhere holds neither the group lane nor the task.
     stores.cloud = homedOn('home-desktop');
     render(<BotGroupTaskCard task={task('started')} owned botId="bot-a" />);
-    expect(screen.queryByTestId('live-link')).toBeNull();
+    expect(screen.queryByTestId('live-card')).toBeNull();
     expect(screen.getByTestId('bot-group-task').textContent).toContain('Launch post');
     cleanup();
     // No copy here at all.
     stores.cloud = EMPTY_COMPANION_CLOUD_SNAPSHOT;
     stores.profileIds = [];
     render(<BotGroupTaskCard task={task('started')} owned botId="bot-a" />);
-    expect(screen.queryByTestId('live-link')).toBeNull();
+    expect(screen.queryByTestId('live-card')).toBeNull();
     cleanup();
     // A copy shadowed after its home moved away.
     stores.profileIds = ['bot-a'];
     stores.cloud = { ...EMPTY_COMPANION_CLOUD_SNAPSHOT, demotedBotIds: ['bot-a'] };
     render(<BotGroupTaskCard task={task('started')} owned botId="bot-a" />);
-    expect(screen.queryByTestId('live-link')).toBeNull();
+    expect(screen.queryByTestId('live-card')).toBeNull();
   });
 });

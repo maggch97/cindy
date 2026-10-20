@@ -72,7 +72,8 @@ export interface BuildHandoffOptions {
    * 交接触发原因。message-deletion 表示同一引擎因本地消息被删除而重建原生
    * 上下文；context-overflow 表示同一引擎因窗口超限而换干净原生会话；
    * model-window-switch 表示切到更小模型前主动换窗；pi-prompt-timeout 表示原生会话
-   * 对 prompt 无响应后用户重试换窗。
+   * 对 prompt 无响应后用户重试换窗;idle-gap 表示伙伴对话空闲足够久之后的下一条消息
+   * 主动换干净原生会话,免得老话题带偏新话题。
    */
   reason?:
     | 'agent-switch'
@@ -80,7 +81,10 @@ export interface BuildHandoffOptions {
     | 'context-overflow'
     | 'model-window-switch'
     | 'pi-prompt-timeout'
-    | 'native-session-recovery';
+    | 'native-session-recovery'
+    | 'idle-gap';
+  /** reason = 'idle-gap' 时的空闲时长(ms),写进 framing 让模型知道隔了多久。 */
+  idleGapMs?: number;
   /**
    * 伙伴主对话:检索指引改成"按需回忆"口径——用户提到窗口里看不到的事时先搜再答,
    * 不先说"没有记录",也不向用户提搜索过程。
@@ -101,7 +105,8 @@ export interface BuildHandoffOptions {
   companionSessionIdsTruncated?: boolean;
   /**
    * 伙伴工作记忆账本的渲染段(botWorkingMemory.renderWorkingMemory):承诺、纠正、
-   * 等待、线索。它是代码摘录之外唯一的语义交接载体,排在工作状态区之后、提要之前;
+   * 等待、线索。它是代码摘录之外唯一的语义交接载体,排在提要 / 近期对话之后、检索指引之前,
+   * 与检索指引同属硬截断时必须整段保住的尾部;
    * 非伙伴主对话或没有账本时不传。
    */
   workingMemory?: string | null;
@@ -603,15 +608,31 @@ const REBUILD_TERMINATOR = "== End of rebuild note; the user's new message follo
 const HANDOFF_TERMINATOR = "== End of handoff note; the user's new message follows ==";
 const FORK_TERMINATOR = "== End of fork note; the user's new message follows ==";
 
+/** 同引擎换干净原生会话的几种原因;交接文本用「上下文重建」口径而非「换引擎」口径。 */
+function isRebuildReason(reason: BuildHandoffOptions['reason']): boolean {
+  return (
+    reason === 'message-deletion' ||
+    reason === 'context-overflow' ||
+    reason === 'model-window-switch' ||
+    reason === 'pi-prompt-timeout' ||
+    reason === 'native-session-recovery' ||
+    reason === 'idle-gap'
+  );
+}
+
+/** 交接 framing 里的空闲时长:整到小时 / 天,不精确到分钟(模型只需要量级)。 */
+export function formatIdleGapForHandoff(ms: number): string {
+  const hours = Math.max(1, Math.floor(ms / (60 * 60 * 1000)));
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'}`;
+  const days = Math.floor(hours / 24);
+  const rest = hours % 24;
+  const dayPart = `${days} day${days === 1 ? '' : 's'}`;
+  return rest > 0 ? `${dayPart} ${rest} hour${rest === 1 ? '' : 's'}` : dayPart;
+}
+
 /** 结束标记——交接正文与"用户的新消息"之间唯一的分隔,任何情况下都要留住。 */
 function handoffTerminator(opts: BuildHandoffOptions): string {
-  return opts.reason === 'message-deletion' ||
-    opts.reason === 'context-overflow' ||
-    opts.reason === 'model-window-switch' ||
-    opts.reason === 'pi-prompt-timeout' ||
-    opts.reason === 'native-session-recovery'
-    ? REBUILD_TERMINATOR
-    : HANDOFF_TERMINATOR;
+  return isRebuildReason(opts.reason) ? REBUILD_TERMINATOR : HANDOFF_TERMINATOR;
 }
 
 /**
@@ -663,18 +684,25 @@ const RECALL_SECTION_HEADING = '== Recalling earlier history';
  */
 export const COMPANION_SESSION_IDS_LIMIT = 50;
 
+/**
+ * 伙伴工作记忆账本段的标题前缀(botWorkingMemory.WORKING_MEMORY_HEADING;这里不引那个模块,
+ * 交接构造保持纯函数)。账本段排在检索指引之前,硬截断时从它起整段保住:账本本身有 6K 预算,
+ * 加上检索指引与结束标记仍远小于硬上限,正文总有余量。
+ */
+const WORKING_MEMORY_SECTION_HEADING = '== Working memory (host-maintained summary';
+
 function splitMandatoryHandoffTail(text: string, opts: BuildHandoffOptions): {
   body: string;
   tail: string;
 } {
-  const retrievalAt = Math.max(
-    text.lastIndexOf(RETRIEVAL_SECTION_HEADING),
-    text.lastIndexOf(RECALL_SECTION_HEADING),
-  );
-  if (retrievalAt >= 0) {
+  const starts = [WORKING_MEMORY_SECTION_HEADING, RETRIEVAL_SECTION_HEADING, RECALL_SECTION_HEADING]
+    .map((heading) => text.lastIndexOf(heading))
+    .filter((at) => at >= 0);
+  if (starts.length > 0) {
+    const tailAt = Math.min(...starts);
     return {
-      body: text.slice(0, retrievalAt).trimEnd(),
-      tail: text.slice(retrievalAt),
+      body: text.slice(0, tailAt).trimEnd(),
+      tail: text.slice(tailAt),
     };
   }
   const [body, terminatorTail] = splitTrailingTerminator(text);
@@ -703,15 +731,13 @@ function assembleHandoffText(
   const earlier = turns.slice(0, -recentCount);
 
   const sections: string[] = [];
-  if (
-    opts.reason === 'message-deletion' ||
-    opts.reason === 'context-overflow' ||
-    opts.reason === 'model-window-switch' ||
-    opts.reason === 'pi-prompt-timeout' ||
-    opts.reason === 'native-session-recovery'
-  ) {
+  if (isRebuildReason(opts.reason)) {
     const rebuildCause =
-      opts.reason === 'context-overflow'
+      opts.reason === 'idle-gap'
+        ? `This conversation was idle for about ${formatIdleGapForHandoff(opts.idleGapMs ?? 0)}, so Cindy started a fresh native session in the same task before the user's new message. ` +
+          `Nothing went wrong and the full record is still kept in this task. Treat the user's new message as the current topic: ` +
+          `do not continue, revisit, or follow up on earlier threads unless the user refers to them, and use the history tools below when an earlier detail is actually needed. `
+        : opts.reason === 'context-overflow'
         ? `The previous native agent session exceeded the model's context window, so Cindy started a fresh native session in the same task. ` +
           `Below is the valid conversation history before the overflowing turn; treat only these records as the prior conversation, ` +
           `and do not try to recover, cite, or infer messages that are not listed. `
@@ -787,9 +813,6 @@ function assembleHandoffText(
     sections.push(`== Work ledger (auto-extracted) ==\n${lines.join('\n')}`);
   }
 
-  // 工作记忆账本:宿主维护的语义状态,逐字段已自带标题与"不是授权"说明。
-  if (opts.workingMemory) sections.push(opts.workingMemory);
-
   if (earlier.length > 0) {
     const lines: string[] = [];
     for (const t of earlier) {
@@ -839,6 +862,11 @@ function assembleHandoffText(
     // 切走后一条消息都没发就切回:显式说明,避免引擎误以为漏了记录。
     sections.push('== No new messages while you were away ==');
   }
+
+  // 工作记忆账本:宿主维护的语义状态,逐字段已自带标题与"不是授权"说明。放在提要 / 近期
+  // 对话之后、检索指引之前:它和检索指引、结束标记一样属于硬截断时必须整段保住的尾部
+  // (splitMandatoryHandoffTail 从它的标题起算),正文再长也只会裁掉前面的摘录。
+  if (opts.workingMemory) sections.push(opts.workingMemory);
 
   if (opts.sessionId && opts.companion) {
     // 伙伴主对话的"按需回忆"口径。history 工具不传 session_ids 时搜的是本机账号下的全部

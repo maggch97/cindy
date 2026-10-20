@@ -445,7 +445,7 @@ describe('botGroupOutbox', () => {
       const shownLocal = getBotGroupOutbox('g1')[0]!.attachments;
 
       const loading = [msg({ id: 'm1', sequence: 1, attachments: [placeholder('s1', 'a.png')] })];
-      expect(project('g1', loading)).toEqual({ pending: [], localAttachments: new Map([['m1', shownLocal]]) });
+      expect(project('g1', loading)).toEqual({ pending: [], localAttachments: new Map([['m1', shownLocal]]), replacements: new Map([['m1', 'c1']]) });
       noteBotGroupTimeline('g1', loading, beginBotGroupTimelineRead());
       // The entry is settled, the preview stays with the message.
       expect(getBotGroupOutbox('g1')).toEqual([]);

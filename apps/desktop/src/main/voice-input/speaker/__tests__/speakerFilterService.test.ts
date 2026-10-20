@@ -154,7 +154,13 @@ describe('parseEnrollmentClips', () => {
     expect(parseEnrollmentClips({ clips: [clip(320), clip(320), 'nope'] })).toBeNull();
     expect(parseEnrollmentClips({ clips: [clip(320), clip(320), clip(0)] })).toBeNull();
     expect(parseEnrollmentClips({ clips: [clip(320), clip(320), clip(321)] })).toBeNull();
-    // Longer than the 20-second limit.
-    expect(parseEnrollmentClips({ clips: [clip(320), clip(320), clip(20 * 16_000 * 2 + 2)] })).toBeNull();
+    // Longer than the 30-second limit.
+    expect(parseEnrollmentClips({ clips: [clip(320), clip(320), clip(30 * 16_000 * 2 + 2)] })).toBeNull();
+  });
+
+  it('accepts three full 30-second recordings', () => {
+    const clips = [clip(30 * 16_000 * 2), clip(30 * 16_000 * 2), clip(30 * 16_000 * 2)];
+    expect(parseEnrollmentClips({ clips })?.map((buffer) => buffer.byteLength))
+      .toEqual([960_000, 960_000, 960_000]);
   });
 });

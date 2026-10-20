@@ -123,7 +123,7 @@ describe('useOwnRemoteProviders', () => {
     expect([...result.current.hiddenShareIds]).toEqual(['s1']);
   });
 
-  it('keeps the group listed when the group computer’s own provider is logged out or paused', () => {
+  it('keeps the group listed when the group computer’s provider is logged out, paused, or closed to remote invocation', () => {
     devices.value = [
       { deviceId: 'mini-a', name: "Magi's Mac Mini", platform: 'darwin' },
       { deviceId: 'mini-b', name: 'Studio', platform: 'darwin' },
@@ -132,7 +132,7 @@ describe('useOwnRemoteProviders', () => {
       strategy: 'least',
       members: [{ kind: 'local' }, { kind: 'device', agentDeviceId: 'mini-b', providerId: 'anthropic' }],
     };
-    for (const state of [{ connected: false }, { suspended: true }]) {
+    for (const state of [{ connected: false }, { suspended: true }, { remoteInvocationEnabled: false }]) {
       catalogs.value = new Map([
         ['mini-a', { providers: [provider('anthropic', { ...state, group })], loading: false, error: null }],
         ['mini-b', { providers: [provider('anthropic')], loading: false, error: null }],

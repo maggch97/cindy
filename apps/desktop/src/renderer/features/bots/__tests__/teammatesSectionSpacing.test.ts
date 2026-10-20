@@ -12,7 +12,7 @@
  *   .row-open  { flex:1; padding:8px 10px; gap:10px }                     → px-2.5 py-2 gap-2.5(左右对称)
  *   .row-l1    { display:flex; align-items:baseline; gap:8px }            → gap-2
  *   .row-l2    { display:flex; align-items:center; gap:8px; margin-top:2px } → gap-2 + 外层 flex-col gap-0.5
- *   .row-meta  { width:40px; align-items:flex-end }                       → w-10 items-end
+ *   .row-meta  { min-width:40px; align-items:flex-end }                   → min-w-10 items-end
  *   .row-name  { font-size:14px }                                        → text-14
  *   .row-time  { font-size:11px; flex:none }                             → text-11 shrink-0
  *   .row-prev  { font-size:12.5px }                                      → text-12(仓库字号阶梯里最近的一档)
@@ -86,9 +86,9 @@ describe('伙伴行的间距基线', () => {
     );
   });
 
-  it('时间与未读共用固定右列,不会被名字或预览推来推去', () => {
+  it('时间与未读共用右列,较长的相对时间不折行', () => {
     const start = source.indexOf(
-      '<span className="flex w-10 shrink-0 self-stretch flex-col items-end justify-between py-0.5">',
+      '<span className="flex min-w-10 shrink-0 self-stretch flex-col items-end justify-between whitespace-nowrap py-0.5">',
     );
     const metaColumn = source.slice(start, source.indexOf('</button>', start));
     expect(metaColumn).toContain("aria-label={t('bots.list.unread', { count: unread })}");
@@ -128,7 +128,7 @@ describe('伙伴行的间距基线', () => {
     // 头像行起点 = 列表容器 12px + 行内边距 10px。
     expect(source).toContain('<div ref={avatarRowRef} className="flex flex-nowrap items-center gap-2 overflow-hidden py-1 pr-0 pl-[22px]">');
     // 段头动作是 20px 图标钮,与其它段头动作同尺寸。
-    expect(source).toContain('<BotCreateMenu variant="header" />');
+    expect(source).toContain('<BotCreateMenu variant="header" entryHint={marketHint} />');
     // 加入群聊收进「+」菜单的「输入邀请链接…」(#6013),段头不再有单独的加群按钮。
     expect(source).not.toContain('ChatJoinButton');
   });
@@ -145,6 +145,6 @@ describe('群聊与伙伴行同一套几何', () => {
     expect(groupRow).toContain('<span className="flex min-w-0 flex-1 flex-col gap-0.5">');
     expect(groupRow).toContain('min-w-0 truncate text-14 leading-5');
     expect(groupRow).toContain("'min-w-0 flex-1 truncate text-12 leading-4'");
-    expect(groupRow).toContain("'w-10 shrink-0 self-start pt-0.5 text-right text-11 tabular-nums'");
+    expect(groupRow).toContain("'min-w-10 shrink-0 self-start whitespace-nowrap pt-0.5 text-right text-11 tabular-nums'");
   });
 });

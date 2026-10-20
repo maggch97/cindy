@@ -17,6 +17,7 @@ import {
 import { toast } from '@/lib/toast';
 import { matchesModelName } from '@/lib/modelDisplayNames';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { favoritesSyncFailureI18nKey } from './favoritesSyncFailure';
 import { Check, Loader2, TriangleAlert } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
@@ -281,18 +282,22 @@ export interface UnifiedModelPanelProps {
   /** 面板容器元素(浮层按它的左 / 右外侧定位)。 */
   panelElement: HTMLElement | null;
   overlayClassName?: string;
+  /** deviceId 目录读取中/失败时取代「没有匹配的模型」。 */
+  catalogNotice?: ReactNode;
   /**
-   * 远程 Agent(仅新任务草稿):左侧栏在本机供应商之后列出其他电脑上的供应商。选中那台
-   * 电脑上的模型 = Agent 在那台电脑运行,任务和文件仍在本机。
+   * 远程 Agent：左侧栏在任务所在电脑的供应商之后列出其他电脑上的供应商。选中那台
+   * 电脑上的模型 = Agent 在那台电脑运行，任务和文件仍在原电脑。
    *
    * 面板只管栏位与选中态;列表数据(`providers` / `deviceId` 及各谓词)由调用方随
    * `active` 切到那台电脑的目录 —— 所以 `ready` 为 false 的那几帧列表显示加载态,
    * 绝不拿上一份目录按同名供应商筛出一份「看起来像远程」的列表。
    */
   remoteSources?: {
-    /** 本机格(★ / 全部 / 本机供应商)的栏位,按**本机**目录派生。 */
+    /** 普通格(★ / 全部 / 任务所在电脑的供应商)，按任务所在电脑的目录派生。 */
     localRailItems: readonly UnifiedRailItem[];
     localProviders: readonly ProviderView[];
+    /** 任务所在电脑的用量归属；null / 缺省 = 控制端本机。与正在浏览的目录无关。 */
+    localUsageDeviceId?: string | null;
     localProviderLabel: (providerId: string) => string;
     /** 每台电脑一段:有可用模型的供应商(按那台的目录顺序)。 */
     groups: readonly {
@@ -397,6 +402,7 @@ export function UnifiedModelPanel({
   panelElement,
   overlayClassName,
   panelWidthFluid = false,
+  catalogNotice,
   remoteSources,
 }: UnifiedModelPanelProps) {
   const { t } = useTranslation();
@@ -1294,6 +1300,7 @@ export function UnifiedModelPanel({
           ? {
               remoteSources: {
                 localProviders: remoteSources.localProviders,
+                localUsageDeviceId: remoteSources.localUsageDeviceId,
                 localProviderLabel: remoteSources.localProviderLabel,
                 providersOf: (deviceId: string) =>
                   remoteSources.groups.find((group) => group.deviceId === deviceId)?.providers ?? [],
@@ -1384,7 +1391,7 @@ export function UnifiedModelPanel({
               </span>
             </div>
           )}
-          {favoritesListDeviceId && remoteFavorites.error ? <div role="status" className="px-3 py-2 text-13 text-[var(--text-secondary)]">{t('newChat.modelSelector.unified.favoritesSyncFailed')}</div> : null}
+          {favoritesListDeviceId && remoteFavorites.error ? <div role="status" className="px-3 py-2 text-13 text-[var(--text-secondary)]">{t(favoritesSyncFailureI18nKey(remoteFavorites.errorCode))}</div> : null}
           {remoteListPending ? (
             remoteSources?.failure ?? (
               <div
@@ -1395,6 +1402,8 @@ export function UnifiedModelPanel({
                 {t('newChat.modelSelector.unified.remoteLoading')}
               </div>
             )
+          ) : catalogNotice ? (
+            catalogNotice
           ) : !hasRows ? (
             <div className="px-3 py-6 text-center text-13 text-[var(--text-tertiary)]">
               {/* ★ 视图的空态是引导语,不是「没有匹配」(设计稿 favEmpty;★ 常驻后必经)。 */}

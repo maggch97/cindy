@@ -6,6 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import { ChatInviteButton, ChatMessageActions } from '../ChatServerControls';
 import { ChatInviteDialog } from '../ChatInviteDialog';
 import { ChatThreadPanel } from '../ChatThreadPanel';
+import { botGroupThreadDraftKey } from '../botGroupAttachments';
+import { clearDraft } from '@/lib/composerDraftStore';
 import { flashThreadTarget } from '../BotGroupThreadViews';
 import { chatErrorKey } from '../chatError';
 import type { BotGroupDetail, BotGroupMessageView } from '../../../../shared/botGroupChat';
@@ -16,8 +18,11 @@ const mocks = vi.hoisted(() => ({
   status: vi.fn(), react: vi.fn(), reactors: vi.fn(), thread: vi.fn(), reply: vi.fn(), createInvite: vi.fn(), previewInvite: vi.fn(), acceptInvite: vi.fn(),
   refresh: vi.fn(), shareToMain: vi.fn(), ownerCurrent: true,
 }));
-vi.mock('react-i18next', async (original) => ({ ...(await original<typeof import('react-i18next')>()),
-  useTranslation: () => ({ t: (key: string) => key, i18n: { language: 'en' } }) }));
+// Partial: the 话题 reply box shares the group composer, whose attachment pieces pull in the app i18n instance.
+vi.mock('react-i18next', async (original) => ({
+  ...(await original<typeof import('react-i18next')>()),
+  useTranslation: () => ({ t: (key: string) => key, i18n: { language: 'en' } }),
+}));
 vi.mock('@/components/chat/MarkdownRenderer', () => ({ MarkdownRenderer: ({ content }: { content: string }) => <div>{content}</div> }));
 vi.mock('../BotAvatar', () => ({ BotAvatar: () => null }));
 vi.mock('../botGroupStore', () => ({ refreshBotGroups: mocks.refresh }));
@@ -26,12 +31,14 @@ vi.mock('@/contexts/dataOwnerGeneration', () => ({
   getDataOwnerGeneration: () => 1, isDataOwnerGenerationCurrent: () => mocks.ownerCurrent, isDataOwnerPushCurrent: () => true,
 }));
 const k = (name: string) => `bots.groupChat.server.${name}`;
-const message = { id: 'root', authorName: 'Human', content: 'Root message', reactions: [{ emoji: '👍', count: 2, me: true }], attachments: [] } as unknown as BotGroupMessageView;
+const message = { id: 'root', kind: 'message', authorKind: 'user', isSelf: false, authorName: 'Human', content: 'Root message', reactions: [{ emoji: '👍', count: 2, me: true }], attachments: [] } as unknown as BotGroupMessageView;
 const group = { id: 'room', members: [], messages: [message] } as unknown as BotGroupDetail;
 const render = (ui: ReactNode) => renderUI(<Tooltip.Provider>{ui}</Tooltip.Provider>);
 beforeEach(() => {
   vi.clearAllMocks(); mocks.ownerCurrent = true;
   shareSelectionStore.reset();
+  // The thread reply keeps a draft per thread; one test's unsent text must not start the next.
+  clearDraft(botGroupThreadDraftKey(group.id, 'root'));
   vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} });
   mocks.status.mockResolvedValue({ enabled: true, connected: true });
   mocks.react.mockResolvedValue({ ok: true });
@@ -108,23 +115,26 @@ describe('chat interaction controls', () => {
     expect(input.style.height).toBe('96px');
   });
 
-  it('keeps a sending thread reply focused and locked, then sends it only once', async () => {
+  it('keeps the focus in a sending thread reply, shows it in the thread at once, and sends it only once', async () => {
     let settle: (value: { ok: true; messageId: string }) => void = () => {};
     mocks.reply.mockReturnValue(new Promise(resolve => { settle = resolve; }));
     render(<ChatThreadPanel group={group} rootId="root" onClose={vi.fn()} />);
     const input = screen.getByRole('textbox', { name: k('replyPlaceholder') }) as HTMLTextAreaElement;
     const sendButton = screen.getByRole('button', { name: k('sendReply') }) as HTMLButtonElement;
     expect(sendButton.disabled).toBe(true);
+    input.focus();
     fireEvent.change(input, { target: { value: 'In flight' } });
     fireEvent.keyDown(input, { key: 'Enter' });
-    await waitFor(() => expect(input.readOnly).toBe(true));
+    // Optimistic: the reply moves into the thread while main answers; the input is free again but
+    // nothing else goes out until this reply settles.
+    await waitFor(() => expect(input.value).toBe(''));
     expect(document.activeElement).toBe(input);
     expect(sendButton.disabled).toBe(true);
     fireEvent.keyDown(input, { key: 'Enter' });
     fireEvent.click(sendButton);
     expect(mocks.reply).toHaveBeenCalledOnce();
     settle({ ok: true, messageId: 'reply' });
-    await waitFor(() => expect(input.value).toBe(''));
+    await waitFor(() => expect(mocks.reply).toHaveBeenCalledOnce());
     expect(input.readOnly).toBe(false);
     expect(document.activeElement).toBe(input);
   });
@@ -172,6 +182,59 @@ describe('chat interaction controls', () => {
     fireEvent.click(screen.getByRole('button', { name: 'bots.groupChat.timeline.loadEarlier' }));
     await waitFor(() => expect(screen.queryByText(text)).toBeNull());
     expect(screen.getByText('Root message')).toBeTruthy();
+  });
+
+  it('retains the loaded Thread when a full adjacent page of replies arrives', async () => {
+    const replies = (start: number) => Array.from({ length: 50 }, (_, i) => ({
+      ...message, id: `reply-${start + i}`, sequence: start + i, content: `Reply ${start + i}`, reactions: [],
+    }));
+    mocks.thread.mockResolvedValueOnce({ ok: true, root: message, replies: replies(2), hasMore: false })
+      .mockResolvedValue({ ok: true, root: message, replies: replies(52), hasMore: true });
+    render(<ChatThreadPanel group={group} rootId="root" onClose={vi.fn()} />);
+    const oldRow = (await screen.findByText('Reply 2')).closest('article');
+    const root = screen.getByText('Root message').closest('article')!;
+    fireEvent.click(within(root).getByRole('button', { name: k('reactionCount') }));
+    await screen.findByText('Reply 101');
+    expect(screen.getByText('Reply 2').closest('article')).toBe(oldRow);
+    expect(screen.getByText('Reply 51')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'bots.groupChat.timeline.loadEarlier' })).toBeNull();
+  });
+
+  it('starts the Thread over from a latest page that no longer reaches the replies on screen', async () => {
+    const early = { ...message, id: 'early', sequence: 5, content: 'Early reply' };
+    const far = { ...message, id: 'far', sequence: 200, content: 'Far reply' };
+    mocks.thread.mockResolvedValueOnce({ ok: true, root: message, replies: [early], hasMore: false })
+      .mockResolvedValue({ ok: true, root: message, replies: [far], hasMore: true });
+    render(<ChatThreadPanel group={group} rootId="root" onClose={vi.fn()} />);
+    await screen.findByText('Early reply');
+    expect(screen.queryByRole('button', { name: 'bots.groupChat.timeline.loadEarlier' })).toBeNull();
+    // More than a page arrived at once: replies may sit between 5 and 200.
+    const root = screen.getByText('Root message').closest('article')!;
+    fireEvent.click(within(root).getByRole('button', { name: k('reactionCount') }));
+    await screen.findByText('Far reply');
+    expect(screen.queryByText('Early reply')).toBeNull();
+    fireEvent.click(await screen.findByRole('button', { name: 'bots.groupChat.timeline.loadEarlier' }));
+    await waitFor(() => expect(mocks.thread.mock.calls.at(-1)?.[0]).toMatchObject({ before: 200 }));
+  });
+
+  it('drops an older Thread page that answers after the latest page started over', async () => {
+    const latest = { ...message, id: 'latest', sequence: 100, content: 'Latest reply' };
+    const older = { ...message, id: 'older', sequence: 4, content: 'Earlier reply' };
+    const far = { ...message, id: 'far', sequence: 300, content: 'Far reply' };
+    let finish!: (value: unknown) => void;
+    mocks.thread.mockResolvedValueOnce({ ok: true, root: message, replies: [latest], hasMore: true })
+      .mockReturnValueOnce(new Promise(resolve => { finish = resolve; }))
+      .mockResolvedValue({ ok: true, root: message, replies: [far], hasMore: true });
+    render(<ChatThreadPanel group={group} rootId="root" onClose={vi.fn()} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'bots.groupChat.timeline.loadEarlier' }));
+    // More than a page arrives while the older page is still on its way.
+    const root = screen.getByText('Root message').closest('article')!;
+    fireEvent.click(within(root).getByRole('button', { name: k('reactionCount') }));
+    await screen.findByText('Far reply');
+    await act(async () => finish({ ok: true, root: message, replies: [older], hasMore: false }));
+    expect(screen.queryByText('Earlier reply')).toBeNull();
+    fireEvent.click(await screen.findByRole('button', { name: 'bots.groupChat.timeline.loadEarlier' }));
+    await waitFor(() => expect(mocks.thread.mock.calls.at(-1)?.[0]).toMatchObject({ before: 300 }));
   });
 
   it('clears a retried failure on an older loaded Thread page without dropping its reply', async () => {
@@ -230,7 +293,7 @@ describe('chat interaction controls', () => {
   });
 
   it('keeps looking for a shared reply when group pushes overtake its older-page reads', async () => {
-    const latest = { ...message, id: 'latest', sequence: 100, content: 'Latest reply' };
+    let latest = { ...message, id: 'latest', sequence: 100, content: 'Latest reply' };
     const target = { ...message, id: 'target', sequence: 4, content: 'Target reply' };
     const olderReads: Array<(value: unknown) => void> = [];
     mocks.thread.mockImplementation(({ before }: { before?: number }) => before
@@ -247,6 +310,7 @@ describe('chat interaction controls', () => {
     await waitFor(() => expect(olderReads).toHaveLength(1));
     // Each push refresh lands while an older page is in flight, so that page is discarded.
     for (let overtaken = 1; overtaken <= 6; overtaken += 1) {
+      latest = { ...latest, id: `latest-${overtaken}`, sequence: latest.sequence + 100 };
       push({ groupId: 'room' }, null);
       await waitFor(() => expect(olderReads).toHaveLength(overtaken + 1));
       olderReads[overtaken - 1]!({ ok: true, root: message, replies: [], hasMore: true });
@@ -315,7 +379,9 @@ describe('chat interaction controls', () => {
   it('shares thread messages separately from the main timeline and excludes controls from the image', async () => {
     const view = render(<ChatThreadPanel group={group} rootId="root" onClose={vi.fn()} />);
     const article = (await screen.findByText('Root message')).closest('article')!;
-    fireEvent.click(within(article).getByRole('button', { name: 'chat.shareImage.entry' }));
+    // Share lives in the bubble toolbar's more menu.
+    fireEvent.pointerDown(within(article).getByRole('button', { name: 'chat.messageActionBar.moreActions' }), { button: 0, ctrlKey: false });
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'chat.shareImage.entry' }));
     const scope = 'bot-group:room:thread:root';
     expect(shareSelectionStore.isActive(scope)).toBe(true);
     expect(queryShareableMessageIds(scope)).toEqual(['root']);
@@ -339,6 +405,33 @@ describe('chat interaction controls', () => {
     fireEvent.click(reaction);
     await waitFor(() => expect(changed).toHaveBeenCalledOnce());
     expect(mocks.react).toHaveBeenCalledWith({ groupId: 'room', messageId: 'root', emoji: '👍', present: false });
+  });
+
+  it('re-reads the opened older Thread page after reacting to a reply on it', async () => {
+    const latest = { ...message, id: 'latest', sequence: 100, content: 'Latest reply', reactions: [] };
+    const older = { ...message, id: 'older', sequence: 4, content: 'Earlier reply', reactions: [{ emoji: '👍', count: 1, me: false }] };
+    let reacted = false;
+    mocks.thread.mockImplementation(async (input: { before?: number }) => input.before
+      // The re-read page's hasMore is not about the oldest loaded page, so it must be ignored.
+      ? { ok: true, root: message, replies: [reacted ? { ...older, reactions: [{ emoji: '👍', count: 2, me: true }] } : older], hasMore: input.before === 5 }
+      : { ok: true, root: message, replies: [latest], hasMore: true });
+    mocks.react.mockImplementation(async () => { reacted = true; return { ok: true }; });
+    render(<ChatThreadPanel group={group} rootId="root" onClose={vi.fn()} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'bots.groupChat.timeline.loadEarlier' }));
+    const earlier = (await screen.findByText('Earlier reply')).closest('article')!;
+    expect(screen.queryByRole('button', { name: 'bots.groupChat.timeline.loadEarlier' })).toBeNull();
+    const chip = within(earlier).getByRole('button', { name: k('reactionCount') });
+    expect(chip.getAttribute('aria-pressed')).toBe('false');
+    fireEvent.click(chip);
+    const earlierChip = () => within(screen.getByText('Earlier reply').closest('article')!).getByRole('button', { name: k('reactionCount') });
+    await waitFor(() => expect(earlierChip().getAttribute('aria-pressed')).toBe('true'));
+    // The message refresh sets `me` before the separate reactors read settles
+    // from avatar placeholders back to the authoritative count.
+    await waitFor(() => expect(earlierChip().textContent).toContain('2'));
+    expect(mocks.react).toHaveBeenCalledWith({ groupId: 'room', messageId: 'older', emoji: '👍', present: true });
+    expect(mocks.thread.mock.calls.map(([input]) => input.before)).toEqual([undefined, 100, undefined, 5]);
+    expect(screen.queryByRole('button', { name: 'bots.groupChat.timeline.loadEarlier' })).toBeNull();
+    expect(screen.getByText('Latest reply')).toBeTruthy();
   });
 
   it('re-reads Thread reactors only when this message or the whole room changed, even if the page is not reloaded', async () => {
@@ -515,21 +608,22 @@ describe('chat interaction controls', () => {
       expect(mocks.reply).toHaveBeenCalledOnce();
     });
 
-    it('keeps the list closed while a reply is sending, so the read-only text cannot change', async () => {
+    it('closes the list once a reply is sent, so a late pick cannot rewrite what went out', async () => {
       const input = renderThread();
       let settle: (value: { ok: true; messageId: string }) => void = () => {};
       mocks.reply.mockReturnValue(new Promise(resolve => { settle = resolve; }));
       type(input, '@B');
       expect(labels()).toContain('Bo');
       fireEvent.click(screen.getByRole('button', { name: k('sendReply') }));
-      await waitFor(() => expect(input.readOnly).toBe(true));
+      // The reply left the input the moment it was sent; the picker has nothing to complete.
+      await waitFor(() => expect(input.value).toBe(''));
       expect(screen.queryByRole('listbox')).toBeNull();
       fireEvent.keyDown(input, { key: 'Enter' });
       fireEvent.keyDown(input, { key: 'Tab' });
-      expect(input.value).toBe('@B');
+      expect(input.value).toBe('');
       settle({ ok: true, messageId: 'reply' });
-      await waitFor(() => expect(input.value).toBe(''));
-      expect(mocks.reply).toHaveBeenCalledOnce();
+      await waitFor(() => expect(mocks.reply).toHaveBeenCalledOnce());
+      expect(screen.queryByRole('listbox')).toBeNull();
     });
 
     it('treats an e-mail address as text and forgets a pick once its name is edited', async () => {

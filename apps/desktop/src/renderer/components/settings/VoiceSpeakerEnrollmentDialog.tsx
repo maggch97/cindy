@@ -1,7 +1,8 @@
+import { ErrorNotice } from '@/components/ui/error-notice';
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
 import { useTranslation } from 'react-i18next';
 import * as Dialog from '@radix-ui/react-dialog';
-import { Check, Mic } from 'lucide-react';
+import { Check, Mic, Square } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { createLogger } from '@/lib/logger';
@@ -37,7 +38,7 @@ interface VoiceSpeakerEnrollmentDialogProps {
 
 /**
  * Reads three short passages aloud to build the voiceprint. Each clip records
- * a fixed time and stops by itself; any clip can be re-recorded, and main
+ * up to 30 seconds or until the user finishes; any clip can be re-recorded, and main
  * points at the clip to redo when one does not match the others.
  */
 export function VoiceSpeakerEnrollmentDialog({
@@ -58,6 +59,7 @@ export function VoiceSpeakerEnrollmentDialog({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<EnrollError | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const stopRef = useRef<AbortController | null>(null);
   const recordButtonRef = useRef<HTMLButtonElement>(null);
   const submitButtonRef = useRef<HTMLButtonElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
@@ -67,6 +69,7 @@ export function VoiceSpeakerEnrollmentDialog({
   const reset = useCallback(() => {
     abortRef.current?.abort();
     abortRef.current = null;
+    stopRef.current = null;
     setClips(CLIP_INDEXES.map(() => null));
     setCurrent(0);
     setRecording(false);
@@ -99,6 +102,8 @@ export function VoiceSpeakerEnrollmentDialog({
     setError(null);
     const controller = new AbortController();
     abortRef.current = controller;
+    const stopController = new AbortController();
+    stopRef.current = stopController;
     const index = current;
     setRecording(true);
     setProgress(0);
@@ -113,9 +118,14 @@ export function VoiceSpeakerEnrollmentDialog({
       const clip = await recordSpeakerEnrollmentClip({
         deviceId: microphoneDeviceId ?? undefined,
         durationMs: VOICE_SPEAKER_ENROLLMENT_TARGET_CLIP_SEC * 1000,
-        onLevel: setLevel,
-        onProgress: setProgress,
+        onLevel: (value) => {
+          if (!controller.signal.aborted) setLevel(value);
+        },
+        onProgress: (value) => {
+          if (!controller.signal.aborted) setProgress(value);
+        },
         signal: controller.signal,
+        stopSignal: stopController.signal,
       });
       if (controller.signal.aborted) return;
       const next = [...clipsRef.current];
@@ -130,6 +140,7 @@ export function VoiceSpeakerEnrollmentDialog({
     } finally {
       if (abortRef.current === controller && !controller.signal.aborted) {
         abortRef.current = null;
+        stopRef.current = null;
         setRecording(false);
         setLevel(0);
       }
@@ -267,16 +278,19 @@ export function VoiceSpeakerEnrollmentDialog({
               variant="secondary"
               size="md"
               type="button"
-              disabled={recording || submitting}
+              disabled={submitting || (recording && progress === 0)}
               onClick={() => {
-                void record();
+                if (recording) stopRef.current?.abort();
+                else void record();
               }}
             >
-              <Mic size={14} />
+              {recording ? <Square size={14} /> : <Mic size={14} />}
               {t(
-                clips[current]
-                  ? 'settings.voiceInput.speakerFilter.enroll.rerecord'
-                  : 'settings.voiceInput.speakerFilter.enroll.record',
+                recording
+                  ? 'settings.voiceInput.speakerFilter.enroll.stop'
+                  : clips[current]
+                    ? 'settings.voiceInput.speakerFilter.enroll.rerecord'
+                    : 'settings.voiceInput.speakerFilter.enroll.record',
               )}
             </Button>
             <p
@@ -308,9 +322,7 @@ export function VoiceSpeakerEnrollmentDialog({
           </div>
 
           {errorText ? (
-            <p role="alert" className="text-12 leading-[1.4] text-[var(--error-fg)]">
-              {errorText}
-            </p>
+            <ErrorNotice role="alert" message={errorText} />
           ) : null}
 
           <div className="flex justify-end gap-2">

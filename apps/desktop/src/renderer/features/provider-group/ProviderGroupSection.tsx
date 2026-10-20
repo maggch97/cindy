@@ -12,7 +12,8 @@
  * 账号收在它下面，上限、开关、移出与额度仍按账号各管各的。
  */
 import { ChevronRight, CircleMinus, Monitor, MoreHorizontal } from 'lucide-react';
-import { useCallback, useId, useMemo, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useState } from 'react';
+import type { ProviderView } from '@cindy/model-providers';
 import { useTranslation } from 'react-i18next';
 
 import { formatQuotaResetAt } from '@/components/status/usageCardModel';
@@ -31,7 +32,6 @@ import { Tip } from '@/components/ui/tooltip';
 import { useOptionalAuthDeviceId } from '@/contexts/AuthContext';
 import { toast } from '@/lib/toast';
 import { cn } from '@/lib/utils';
-import { mapIpcErrorToI18nKey } from '@/utils/ipcError';
 
 import {
   PROVIDER_GROUP_MAX_LIMIT,
@@ -54,6 +54,7 @@ import {
   providerGroupDeviceVersion,
 } from './providerGroupPresentation';
 import { useProviderGroup } from './useProviderGroup';
+import { providerManagementErrorKey } from './providerManagement';
 
 /**
  * Claude 订阅的配额排序已对所有组策略生效(provider-groups.md §5，2026-10-15)，不再单列「用量均衡」；
@@ -65,13 +66,27 @@ const selectableStrategy = (strategy: ProviderGroupStrategy): ProviderGroupStrat
 const LIMIT_OPTIONS = Array.from({ length: PROVIDER_GROUP_MAX_LIMIT }, (_, i) => String(i + 1));
 const WEIGHT_OPTIONS = ['1', '2', '3', '5', '10', '20', '50', String(PROVIDER_GROUP_MAX_WEIGHT)];
 
-export function ProviderGroupSection({ providerId, providerName }: { providerId: string; providerName: string }) {
+export function ProviderGroupSection({ providerId, providerName, deviceId, deviceName, initialConfig, remoteProvider, onConfigChange }: {
+  providerId: string;
+  providerName: string;
+  deviceId?: string;
+  deviceName?: string;
+  initialConfig?: ProviderGroupConfig | null;
+  remoteProvider?: ProviderView;
+  onConfigChange?: (config: ProviderGroupConfig | null) => void;
+}) {
   const { t } = useTranslation();
   const { confirm } = useConfirmDialog();
-  const group = useProviderGroup(providerId, { live: true });
+  const group = useProviderGroup(providerId, { live: true, deviceId, initialConfig });
+  // 远程页面仍传入供应商详情供上层复用；组策略展示由主干统一采用配额优先规则。
+  void remoteProvider;
   const [addOpen, setAddOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const config = group.view?.config ?? null;
+  const blocked = saving || group.loading || group.failed;
+  useEffect(() => {
+    if (group.view) onConfigChange?.(group.view.config);
+  }, [group.view, onConfigChange]);
   const statuses = useMemo(
     () => new Map((group.view?.members ?? []).map((status) => [status.key, status])),
     [group.view],
@@ -85,13 +100,13 @@ export function ProviderGroupSection({ providerId, providerName }: { providerId:
         if (success) toast.success(success);
         return true;
       } catch (error) {
-        toast.error(t(mapIpcErrorToI18nKey(error)));
+        toast.error(t(providerManagementErrorKey(error, Boolean(deviceId))));
         return false;
       } finally {
         setSaving(false);
       }
     },
-    [group, t],
+    [group, deviceId, t],
   );
 
   const updateMember = useCallback(
@@ -138,11 +153,11 @@ export function ProviderGroupSection({ providerId, providerName }: { providerId:
       await group.remove();
       toast.success(t('providerGroup.toast.deleted', { provider: providerName }));
     } catch (error) {
-      toast.error(t(mapIpcErrorToI18nKey(error)));
+      toast.error(t(providerManagementErrorKey(error, Boolean(deviceId))));
     } finally {
       setSaving(false);
     }
-  }, [confirm, group, providerName, t]);
+  }, [confirm, group, providerName, deviceId, t]);
 
   return (
     <section className="mt-6 shrink-0" aria-labelledby="provider-group-title" data-testid="provider-group-section">
@@ -154,11 +169,11 @@ export function ProviderGroupSection({ providerId, providerName }: { providerId:
         {config && <span className="text-13 text-[var(--text-tertiary)]">{providerGroupDeviceCount(config.members)}</span>}
         <span className="flex-1" />
         {config && (
-          <Button variant="secondary" size="sm" compact tone="quiet" disabled={saving} onClick={() => void deleteGroup()}>
+          <Button variant="secondary" size="sm" compact tone="quiet" disabled={blocked} onClick={() => void deleteGroup()}>
             {t('providerGroup.section.delete')}
           </Button>
         )}
-        <Button variant="primary" size="sm" compact disabled={saving || group.loading} onClick={() => setAddOpen(true)}>
+        <Button variant="primary" size="sm" compact disabled={blocked} onClick={() => setAddOpen(true)}>
           {t('providerGroup.section.addComputer')}
         </Button>
       </div>
@@ -169,7 +184,7 @@ export function ProviderGroupSection({ providerId, providerName }: { providerId:
             {group.loading
               ? t('providerGroup.section.loading')
               : group.failed
-                ? t('providerGroup.section.loadFailed')
+                ? t(group.errorKey ?? 'providerGroup.section.loadFailed')
                 : t('providerGroup.section.empty', { provider: providerName })}
           </p>
         ) : (
@@ -183,7 +198,9 @@ export function ProviderGroupSection({ providerId, providerName }: { providerId:
                   strategy={config.strategy}
                   first={index === 0}
                   account={account}
-                  disabled={saving}
+                  disabled={blocked}
+                  ownerDeviceId={deviceId ?? null}
+                  ownerDeviceName={deviceName}
                   onChange={(patch) => updateMember(member.key, patch)}
                   onRemove={(label) => void removeMember(member, label)}
                 />
@@ -195,7 +212,12 @@ export function ProviderGroupSection({ providerId, providerName }: { providerId:
                   data-testid="provider-group-device"
                   className={cn(index > 0 && 'border-t border-[var(--settings-theme-card-border)]')}
                 >
-                  <MemberDeviceHeader members={device.items} statuses={device.items.map((m) => statuses.get(m.key))} />
+                  <MemberDeviceHeader
+                    members={device.items}
+                    statuses={device.items.map((m) => statuses.get(m.key))}
+                    ownerDeviceId={deviceId ?? null}
+                    ownerDeviceName={deviceName}
+                  />
                   {device.items.map((member, accountIndex) => row(member, accountIndex + 1))}
                 </div>
               );
@@ -210,7 +232,7 @@ export function ProviderGroupSection({ providerId, providerName }: { providerId:
                   options={SELECTABLE_STRATEGIES.map((value) => ({
                     value,
                     label: t(`providerGroup.strategy.${value}`),
-                    disabled: saving,
+                    disabled: blocked,
                   }))}
                 />
                 <span className="flex-1" />
@@ -231,7 +253,7 @@ export function ProviderGroupSection({ providerId, providerName }: { providerId:
               </div>
               <Switch
                 checked={config.autoSwitch}
-                disabled={saving}
+                disabled={blocked}
                 aria-label={t('providerGroup.autoSwitch.label')}
                 onCheckedChange={(autoSwitch) => void save({ ...config, autoSwitch })}
               />
@@ -239,6 +261,11 @@ export function ProviderGroupSection({ providerId, providerName }: { providerId:
           </>
         )}
       </div>
+      {config && group.failed && (
+        <p role="status" className="mt-2 text-12 leading-[1.5] text-[var(--text-secondary)]">
+          {t(group.errorKey ?? 'providerGroup.section.loadFailed')}
+        </p>
+      )}
       {config && (
         <p className="mt-2 text-12 leading-[1.5] text-[var(--text-tertiary)]">{t('providerGroup.section.note')}</p>
       )}
@@ -247,6 +274,7 @@ export function ProviderGroupSection({ providerId, providerName }: { providerId:
         <ProviderGroupAddDialog
           providerId={providerId}
           providerName={providerName}
+          deviceId={deviceId}
           config={config}
           onSave={(next, success) => save(next, success)}
           onClose={() => setAddOpen(false)}
@@ -257,18 +285,23 @@ export function ProviderGroupSection({ providerId, providerName }: { providerId:
 }
 
 /** 组内电脑的称呼与来源；只有一个账号的电脑行与多个账号时的电脑这一层共用。 */
-function useMemberNames(member: ProviderGroupMember, status: ProviderGroupMemberStatus | undefined) {
+function useMemberNames(
+  member: ProviderGroupMember,
+  status: ProviderGroupMemberStatus | undefined,
+  ownerDeviceId: string | null = null,
+  ownerDeviceName?: string,
+) {
   const { t } = useTranslation();
   const ownerNameOf = useProviderShareOwnerNameOf();
   // 分享来的电脑只用分享者的昵称称呼，不用电脑名(provider-sharing.md §6)。
   const ownerName = member.kind === 'share' ? (status?.ownerName ?? ownerNameOf(member.agentDeviceId)) : null;
   const label = member.kind === 'local'
-    ? t('providerGroup.member.local')
+    ? ownerDeviceId ? (ownerDeviceName ?? status?.label ?? member.key) : t('providerGroup.member.local')
     : member.kind === 'share'
       ? providerShareComputerName(t, ownerName)
       : (status?.label ?? member.label ?? member.key);
   const source = member.kind === 'local'
-    ? status?.label
+    ? ownerDeviceId ? t('providerGroup.member.sourceDevice') : status?.label
     : member.kind === 'device'
       ? t('providerGroup.member.sourceDevice')
       : t('providerGroup.member.sourceShare', { name: ownerName ?? '' });
@@ -279,12 +312,16 @@ function useMemberNames(member: ProviderGroupMember, status: ProviderGroupMember
 function MemberDeviceHeader({
   members,
   statuses,
+  ownerDeviceId,
+  ownerDeviceName,
 }: {
   members: readonly ProviderGroupMember[];
   statuses: readonly (ProviderGroupMemberStatus | undefined)[];
+  ownerDeviceId: string | null;
+  ownerDeviceName?: string;
 }) {
   const { t } = useTranslation();
-  const { label, source } = useMemberNames(members[0], statuses.find((status) => status != null));
+  const { label, source } = useMemberNames(members[0], statuses.find((status) => status != null), ownerDeviceId, ownerDeviceName);
   return (
     <div data-testid="provider-group-device-header" className="flex items-center gap-3 px-4 py-3">
       <span
@@ -314,6 +351,8 @@ function MemberRow({
   first,
   account,
   disabled,
+  ownerDeviceId,
+  ownerDeviceName,
   onChange,
   onRemove,
 }: {
@@ -324,11 +363,13 @@ function MemberRow({
   /** 同一台电脑上有几个账号时，这是第几个(从 1 起)：行收在电脑下面，只写账号；不传就是一台电脑一行。 */
   account?: number;
   disabled: boolean;
+  ownerDeviceId: string | null;
+  ownerDeviceName?: string;
   onChange: (patch: Partial<ProviderGroupMember>) => void;
   onRemove: (label: string) => void;
 }) {
   const { t, i18n } = useTranslation();
-  const { ownerName, label: computer, source } = useMemberNames(member, status);
+  const { ownerName, label: computer, source } = useMemberNames(member, status, ownerDeviceId, ownerDeviceName);
   const accountName = account === undefined
     ? null
     : providerGroupAccountName(member, status) ?? t('providerGroup.member.accountFallback', { index: account });
@@ -368,7 +409,7 @@ function MemberRow({
             onClick={() => setQuotaOpen((open) => !open)}
             className="group -m-1 flex min-w-[200px] flex-1 items-center gap-3 rounded-lg p-1 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
           >
-            {/* 组内电脑用设备图标；人像头像留给下方「分享」块里真实的人。账号行的图标在电脑那一层。 */}
+            {/* 组内电脑用设备图标；人像头像留给下方「用量」里真实的人。账号行的图标在电脑那一层。 */}
             {accountName === null && (
               <span
                 aria-hidden="true"
@@ -445,7 +486,7 @@ function MemberRow({
             <Switch
               checked={!member.paused}
               disabled={disabled}
-              aria-label={t(member.kind === 'local'
+              aria-label={t(member.kind === 'local' && !ownerDeviceId
                 ? 'providerGroup.member.assignLocalAria'
                 : 'providerGroup.member.assignAria', { name: label })}
               onCheckedChange={(on) => onChange({ paused: !on })}
@@ -479,7 +520,7 @@ function MemberRow({
       {quotaOpen && (
         <GroupMemberQuota
           id={quotaId}
-          target={groupMemberQuotaTarget(member, null, selfDeviceId)}
+          target={groupMemberQuotaTarget(member, ownerDeviceId, selfDeviceId)}
           offline={status?.state === 'offline'}
         />
       )}

@@ -108,6 +108,10 @@ it('exposes catalog and guarded model changes without accepting permission overr
   const request = { type: 'tasks-request', kind: 'setModel', taskId: 'own', expectedRevision: 1,
     route: { agentKind: 'codex', model: 'm', providerId: 'p', effort: '', fastMode: false } };
   expect(validPluginTaskRequest(request)).toBe(true);
+  expect(validPluginTaskRequest({ ...request, route: 'plugin-default' })).toBe(true);
+  expect(validPluginTaskRequest({ ...request, route: 'plugin-default', expectedRevision: undefined })).toBe(false);
+  expect(validPluginTaskRequest({ ...request, route: 'plugin-default', ghostId: 'other' })).toBe(false);
+  expect(validPluginTaskRequest({ type: 'tasks-request', kind: 'create', requestKey: 'one', title: 'Work', route: 'plugin-default' })).toBe(false);
   expect(validPluginTaskRequest({ ...request, expectedRevision: undefined })).toBe(false);
   expect(validPluginTaskRequest({ ...request, permissionMode: 'bypassPermissions' })).toBe(false);
 });

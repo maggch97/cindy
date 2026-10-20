@@ -96,6 +96,7 @@ import {
   OwnRemoteProviderDetail,
   OwnRemoteProviderRows,
   useOwnRemoteProviderList,
+  type OwnRemoteProvider,
 } from './OwnRemoteProviders';
 import { LlamaCppProviderDetail } from './LlamaCppProviderDetail';
 import { MANAGED_LLAMACPP_PROVIDER_ID } from '../../../shared/llamaCpp';
@@ -900,7 +901,7 @@ function DetailHeader({
                 }
               >
                 {resetEnabled ? (
-                  <CodexResetCredits key={provider?.id} variant="embedded" snapshot={resetSnapshot} busy={manualReset.busy} canReset={manualReset.canReset} canRetry={manualReset.canRetry} onReset={(credit) => void manualReset.reset(credit)} />
+                  <CodexResetCredits providerId={provider?.id} onChanged={refreshResets} key={provider?.id} variant="embedded" snapshot={resetSnapshot} busy={manualReset.busy} canReset={manualReset.canReset} canRetry={manualReset.canRetry} onReset={(credit) => void manualReset.reset(credit)} />
                 ) : null}
               </QuotaHoverCard>
             </div>
@@ -1734,6 +1735,7 @@ function XdGatewayHeader({
     available: credit.usage?.available ?? null,
     quotaAccessible,
     quota: quota.usage,
+    quotaUnlimited: quota.unlimited,
     loading: billingAccessible ? credit.loading : quota.loading,
   });
   const primaryAction = useXdAssetPrimaryAction(assetState.kind === 'balance');
@@ -1893,7 +1895,7 @@ function XdGatewayHeader({
             </p>
             <PillButton label={t('settings.providers.xd.sync.retry')} onClick={handleRetry} />
           </>
-        ) : assetState.kind === 'loading' || assetState.kind === 'unavailable' ? (
+        ) : assetState.kind === 'loading' || assetState.kind === 'unavailable' || assetState.kind === 'unlimited' ? (
           <>
             <div>
               <p className="text-12 text-[var(--text-secondary)]">
@@ -1907,7 +1909,9 @@ function XdGatewayHeader({
                 {t(
                   assetState.kind === 'loading'
                     ? 'settings.providers.xd.asset.loading'
-                    : 'settings.providers.xd.asset.unavailable',
+                    : assetState.kind === 'unlimited'
+                      ? 'settings.providers.xd.asset.noPersonalLimit'
+                      : 'settings.providers.xd.asset.unavailable',
                 )}
               </p>
             </div>
@@ -2435,16 +2439,18 @@ export function ProvidersSection() {
   const codexAuth = useCodexAuth();
   const remoteControlEnabled = useRemoteControlEnabled();
   // 供应商分享：入口提示点读待审批申请与待处理的转分享请求；管理页是本页的子页面(返回回到供应商详情)。
+  // 带 hostDeviceId 的申请在另一台电脑的分享里(那台的供应商 id 可能与本机重名)，只计入那台的组入口。
   const pendingShareRequests = useProviderSharePendingRequests();
   const pendingReshares = useProviderSharePendingReshares();
   const pendingShareCounts = useMemo(
     () => pendingRequestCountByProvider([
-      ...pendingShareRequests.map((item) => item.share),
+      ...pendingShareRequests.filter((item) => !item.hostDeviceId).map((item) => item.share),
       ...pendingReshares.map((item) => item.share),
     ]),
     [pendingShareRequests, pendingReshares],
   );
   const [shareManageProviderId, setShareManageProviderId] = useState<string | null>(null);
+  const [shareManageRemote, setShareManageRemote] = useState<OwnRemoteProvider | null>(null);
   const openaiReconnectRequired = codexAuth.state.kind === 'reconnect-required';
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -2765,6 +2771,7 @@ export function ProvidersSection() {
     const target = searchParams.get(PROVIDER_SHARE_MANAGE_PARAM);
     if (!target) return;
     setShareManageProviderId(target);
+    setShareManageRemote(null);
     const next = new URLSearchParams(searchParams);
     next.delete(PROVIDER_SHARE_MANAGE_PARAM);
     setSearchParams(next, { replace: true });
@@ -2811,6 +2818,7 @@ export function ProvidersSection() {
     if (!connect && !wizardFlag && !importId) return;
     // 这些深链要显示供应商主页或弹窗：先离开分享管理页，不能被它挡住。
     setShareManageProviderId(null);
+    setShareManageRemote(null);
     // 不用一次性 ref:消费后立即删参(下方 replace)即防重放;组件常驻期间
     // 再次带参导航(如二次深链)仍应生效(review 反馈)。
     if (importId) {
@@ -3072,21 +3080,27 @@ export function ProvidersSection() {
 
   // 「分享 {供应商}」管理页：设置内的子页面，返回回到该供应商的详情。只替换主体内容，
   // 下方的添加 / 编辑 / 导入弹窗层保持挂载，不会因打开管理页而丢失正在填写的内容。
-  const shareManageProvider = shareManageProviderId ? byId.get(shareManageProviderId) ?? null : null;
+  const shareManageProvider = shareManageRemote?.provider ?? (shareManageProviderId ? byId.get(shareManageProviderId) ?? null : null);
   const shareManagePage = shareManageProviderId ? (
     <ProviderShareManagePage
-      key={shareManageProviderId}
+      key={`${shareManageRemote?.deviceId ?? 'local'}:${shareManageProviderId}`}
       providerId={shareManageProviderId}
-      providerName={shareManageProvider?.name ?? shareManageProviderId}
+      providerName={shareManageProvider ? providerDisplayName(shareManageProvider, t) : shareManageProviderId}
       providerIcon={shareManageProvider ? providerIcon(shareManageProvider, 18) : null}
+      deviceId={shareManageRemote?.deviceId}
+      deviceName={shareManageRemote?.deviceName}
+      initialGroup={shareManageRemote?.group}
+      remoteProvider={shareManageRemote?.provider}
       // 供应商还没加载出来时不判「未开放」；生成链接时 main 会再校验。
       gate={providerShareGate({
-        remoteControlEnabled,
+        remoteControlEnabled: shareManageRemote ? true : remoteControlEnabled,
         invocationEnabled: !shareManageProvider || shareManageProvider.remoteInvocationEnabled === true,
       })}
       onBack={() => {
-        setSelectedId(shareManageProviderId);
+        if (shareManageRemote) setSelectedRemoteKey(shareManageRemote.key);
+        else setSelectedId(shareManageProviderId);
         setShareManageProviderId(null);
+        setShareManageRemote(null);
       }}
     />
   ) : null;
@@ -3248,7 +3262,15 @@ export function ProvidersSection() {
             {selectedShare ? (
               <ProviderShareReceivedDetail share={selectedShare} />
             ) : selectedRemote ? (
-              <OwnRemoteProviderDetail entry={selectedRemote} />
+              <OwnRemoteProviderDetail
+                entry={selectedRemote}
+                pendingShareRequests={pendingShareRequests.filter((item) =>
+                  item.hostDeviceId === selectedRemote.deviceId && item.share.providerId === selectedRemote.provider.id).length}
+                onManage={() => {
+                  setShareManageRemote(selectedRemote);
+                  setShareManageProviderId(selectedRemote.provider.id);
+                }}
+              />
             ) : cindySigninActive ? (
               /* 登录引导是 brand-scale surface(DESIGN §3):48px 标识 → 24px 名字 →
                  一行价值主张 → 赠送余额徽标 → 黑 CTA,间距走 8px 系统。底部留白比
@@ -3367,7 +3389,7 @@ export function ProvidersSection() {
                         provider={effectiveSelected}
                         remoteControlEnabled={remoteControlEnabled}
                         pendingShareRequests={pendingShareCounts.get(effectiveSelected.id) ?? 0}
-                        onManageShare={() => setShareManageProviderId(effectiveSelected.id)}
+                        onManageShare={() => { setShareManageRemote(null); setShareManageProviderId(effectiveSelected.id); }}
                       />
                     )}
                   {!effectiveSelected.suspended &&

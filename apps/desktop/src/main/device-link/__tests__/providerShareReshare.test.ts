@@ -44,6 +44,19 @@ beforeEach(async () => {
 });
 
 describe('provider share reshare consent (sharer computer)', () => {
+  it('keeps a reshare pending when account teardown begins while waiting for the decision write lock', async () => {
+    await reshare.handleProviderShareReshare(B_GROUP, [{ key: CAROL, name: 'Carol' }]);
+    const record = reshare.listProviderShareReshares()[0]!;
+    let current = true;
+    const pending = reshare.decideProviderShareReshare(record.id, 'approve', Date.now(), () => {
+      if (!current) throw new Error('[PRECONDITION_FAILED] The account changed');
+    });
+    current = false;
+    await expect(pending).rejects.toThrow(/PRECONDITION_FAILED/);
+    expect(reshare.listProviderShareReshares()[0]).toEqual(record);
+    expect(reshare.providerShareReshareAllows(B_GROUP, CAROL)).toBe(false);
+  });
+
   it('records newly reported people as pending and tells the owner once', async () => {
     const requested = vi.fn();
     reshare.setProviderShareReshareEvents({ requested, changed: vi.fn(), revoked: vi.fn() });

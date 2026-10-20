@@ -1,10 +1,13 @@
+import { runPluginUsageTransaction } from '../worker/opHandlers/pluginUsageTx.js';
 import { runTaskTagsTransaction } from '../worker/opHandlers/taskTagsTx.js';
+import { recordMediaSpend } from '../worker/opHandlers/mediaSpendTx.js';
 import { createAutoReviewIntentProjection } from '@cindy/maker-shared/auto-review-intent';
 import { batchAutoReviewProjection, readAutoReviewProjection } from '../autoReviewProjection.js';
 import { CLOSE_SHARED_TASKS_FOR_SESSION_SQL } from '../sharedTaskClosureSql.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Worker } from 'node:worker_threads';
+import { capToolResultTextForPersist, compactToolCardResult, TOOL_RESULT_PERSIST_CONTENT_LIMIT, TOOL_RESULT_PERSIST_TRUNCATION_SUFFIX } from '../../../shared/toolResultPersistCap.js';
 
 import {
   createDbTransportError,
@@ -20,11 +23,17 @@ import {
 import { isBackgroundDbRpc } from './rpcAdmission.js';
 
 const WORKER_CODE = `
+const TOOL_RESULT_PERSIST_CONTENT_LIMIT = ${TOOL_RESULT_PERSIST_CONTENT_LIMIT};
+const TOOL_RESULT_PERSIST_TRUNCATION_SUFFIX = ${JSON.stringify(TOOL_RESULT_PERSIST_TRUNCATION_SUFFIX)};
+const compactToolCardResult = ${compactToolCardResult.toString()};
+const capToolResultTextForPersist = ${capToolResultTextForPersist.toString()};
 const createAutoReviewIntentProjection = ${createAutoReviewIntentProjection.toString()};
 const readAutoReviewProjection = ${readAutoReviewProjection.toString()};
 const batchAutoReviewProjection = ${batchAutoReviewProjection.toString()};
 const CLOSE_SHARED_TASKS_FOR_SESSION_SQL = ${JSON.stringify(CLOSE_SHARED_TASKS_FOR_SESSION_SQL)};
+const runPluginUsageTransaction = ${runPluginUsageTransaction.toString()};
 const runTaskTagsTransaction = ${runTaskTagsTransaction.toString()};
+const recordMediaSpend = ${recordMediaSpend.toString()};
 // 旧版 inline worker fallback。默认运行时走 .vite/build/dbWorker.js；
 // 这段只作为打包路径回滚口保留，后续验证 macOS / Windows packaged 后删除。
 const { parentPort, workerData } = require('node:worker_threads');
@@ -422,6 +431,8 @@ function dispatchTransaction(readyDb, payload) {
   const request = asRecord(payload, 'tx args');
   const name = expectString(request.name, 'name');
   switch (name) {
+    case 'usage.recordMediaSpend':
+      return recordMediaSpend(readyDb, request.args);
     case 'authorization.readProjection':
       return readAutoReviewProjection(readyDb, request.args, createAutoReviewIntentProjection);
     case 'codex.importMessages':
@@ -470,6 +481,7 @@ function dispatchTransaction(readyDb, payload) {
       return recentWorkdirsMergeWindowsIdentity(readyDb, request.args);
     case 'recentWorkdirs.removeWindowsIdentity':
       return recentWorkdirsRemoveWindowsIdentity(readyDb, request.args);
+    case 'pluginUsage.execute': return runPluginUsageTransaction(readyDb, request.args);
     case 'taskTags.execute': return runTaskTagsTransaction(readyDb, request.args);
     case 'projectAliases.replaceIdentity':
       return projectAliasesReplaceIdentity(readyDb, request.args);
@@ -1174,7 +1186,16 @@ function sessionsSetTerminalStatus(readyDb, args) {
       'UPDATE sessions SET status = ?, updated_at = ? WHERE id = ? RETURNING id, title, working_dir AS workingDir, workspace_kind AS workspaceKind, remote_host_id AS remoteHostId, source',
     ).get(status, now, sessionId);
     if (!updated) throw Object.assign(new Error('Session not found: ' + sessionId), { code: 'NOT_FOUND' });
-    return { ...updated, sessionId: updated.id, status };
+    const deletedSideChats = status === 'deleted' && existing.source !== 'side-chat'
+      ? readyDb.prepare("UPDATE sessions SET status = 'deleted', updated_at = ? " +
+          "WHERE parent_session_id = ? AND source = 'side-chat' AND status <> 'deleted' " +
+          'RETURNING id AS sessionId, title, working_dir AS workingDir, workspace_kind AS workspaceKind, ' +
+          'remote_host_id AS remoteHostId, source').all(now, sessionId)
+      : [];
+    for (const child of deletedSideChats) {
+      readyDb.prepare(CLOSE_SHARED_TASKS_FOR_SESSION_SQL).run(now, child.sessionId);
+    }
+    return { ...updated, sessionId: updated.id, status, deletedSideChats };
   })();
 }
 
@@ -2040,6 +2061,11 @@ function forkSession(readyDb, args) {
     'INSERT INTO messages (id, client_id, session_id, role, content, tool_use_id, agent_meta, agent_kind, created_at, rewind_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)',
   );
   return readyDb.transaction(() => {
+    if (newSession.source === 'side-chat' && !readyDb.prepare(
+      "SELECT 1 FROM sessions WHERE id = ? AND status = 'active' AND cleared_at IS ?",
+    ).get(sourceSessionId, sourceClearedAt)) {
+      throw invalidArgs('Source task changed while opening side chat');
+    }
     if (payload.recoveryMarker != null && !readyDb.prepare(
       'SELECT 1 FROM sessions WHERE id = ? AND cleared_at IS ?',
     ).get(sourceSessionId, sourceClearedAt)) {
@@ -2057,6 +2083,11 @@ function forkSession(readyDb, args) {
     if (newMessageIds.length !== sourceMessages.length) {
       throw invalidArgs('newMessageIds length mismatch: expected ' + sourceMessages.length + ', got ' + newMessageIds.length);
     }
+    const childCreatedAt = expectNumber(newSession.createdAt, 'newSession.createdAt');
+    // Keep inherited history before the side-chat boundary, preserving relative order.
+    const historyTimeOffset = newSession.source === 'side-chat'
+      ? sourceMessages.reduce((offset, message) => Math.max(offset, message.created_at - childCreatedAt + 1), 0)
+      : 0;
     readyDb.prepare(
       'INSERT INTO sessions (id, title, working_dir, model, provider_id, effort, permission_mode, status, sdk_session_id, total_token_usage, total_cost_usd, context_tokens, context_window, context_window_runtime, fast_mode, cleared_at, pinned_at, user_send_at, agent_kind, workspace_kind, codex_history_has_product_prompt, parent_session_id, forked_at_message_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
     ).run(
@@ -2086,13 +2117,20 @@ function forkSession(readyDb, args) {
       expectNumber(newSession.createdAt, 'newSession.createdAt'),
       expectNumber(newSession.updatedAt, 'newSession.updatedAt'),
     );
+    if (newSession.source === 'side-chat') {
+      readyDb.prepare("UPDATE sessions SET source = 'side-chat', extra_dirs = (SELECT extra_dirs FROM sessions WHERE id = ?), writable_dirs = (SELECT writable_dirs FROM sessions WHERE id = ?) WHERE id = ?")
+        .run(sourceSessionId, sourceSessionId, expectString(newSession.id, 'newSession.id'));
+    }
     for (let i = 0; i < sourceMessages.length; i += 1) {
       const message = sourceMessages[i];
       const ids = newMessageIds[i];
-      insertMessage.run(ids.id, ids.clientId, expectString(newSession.id, 'newSession.id'), message.role, sanitizeForkedMessageContent(message, { detachAgentSwitchSessions, resetHandoffBoundaryClientId }), message.tool_use_id, remapForkedAgentMeta(message.agent_meta, uuidMap, legacyTranscriptParentUuids, toolParentUuids, nativeForkAnchorSessionMap), message.agent_kind, message.created_at);
+      insertMessage.run(ids.id, ids.clientId, expectString(newSession.id, 'newSession.id'), message.role, sanitizeForkedMessageContent(message, { detachAgentSwitchSessions, resetHandoffBoundaryClientId }), message.tool_use_id, remapForkedAgentMeta(message.agent_meta, uuidMap, legacyTranscriptParentUuids, toolParentUuids, nativeForkAnchorSessionMap), message.agent_kind, message.created_at - historyTimeOffset);
     }
     if (payload.recoveryMarker != null) {
       const marker = asRecord(payload.recoveryMarker, 'recoveryMarker');
+      const markerCreatedAt = newSession.source === 'side-chat'
+        ? childCreatedAt
+        : expectNumber(marker.createdAt, 'recoveryMarker.createdAt');
       readyDb.prepare(
         "INSERT INTO messages (id, client_id, session_id, role, content, agent_kind, created_at, rewind_at) VALUES (?, ?, ?, 'context_rebuild', ?, ?, ?, ?)",
       ).run(
@@ -2101,8 +2139,8 @@ function forkSession(readyDb, args) {
         expectString(newSession.id, 'newSession.id'),
         expectString(marker.content, 'recoveryMarker.content'),
         expectString(newSession.agentKind, 'newSession.agentKind'),
-        expectNumber(marker.createdAt, 'recoveryMarker.createdAt'),
-        expectNumber(marker.createdAt, 'recoveryMarker.createdAt'),
+        markerCreatedAt,
+        markerCreatedAt,
       );
       const content = asRecord(JSON.parse(expectString(marker.content, 'recoveryMarker.content')), 'recoveryMarker content');
       insertMessage.run(
@@ -2112,7 +2150,7 @@ function forkSession(readyDb, args) {
         'assistant', '', null,
         JSON.stringify({ contextRebuild: { reason: content.reason, handoff: content.handoff } }),
         expectString(newSession.agentKind, 'newSession.agentKind'),
-        expectNumber(marker.createdAt, 'recoveryMarker.createdAt'),
+        markerCreatedAt,
       );
     }
     return { messageCount: sourceMessages.length };
@@ -2454,16 +2492,6 @@ function truncate(value, max) {
 function stringifyContent(value) {
   const json = JSON.stringify(value);
   return json === undefined ? 'null' : json;
-}
-
-function capToolResultTextForPersist(text) {
-  var limit = 8 * 1024;
-  var suffix = '\\n\\n[tool result truncated: stored first 8KB]';
-  if (text.length <= limit) return text;
-  var cut = Math.max(0, limit - suffix.length);
-  var lastKept = text.charCodeAt(cut - 1);
-  if (cut > 0 && lastKept >= 0xd800 && lastKept <= 0xdbff) cut -= 1;
-  return text.slice(0, cut) + suffix;
 }
 
 function stringifyImportedContent(role, content) {

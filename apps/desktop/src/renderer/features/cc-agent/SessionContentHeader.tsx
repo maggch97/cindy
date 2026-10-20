@@ -23,8 +23,10 @@ import { TaskMigrationStatus } from './TaskMigrationStatus';
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronRight, Ellipsis, Pin } from 'lucide-react';
+import { ArrowLeft, Ellipsis, Pin } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { useNavigate } from 'react-router-dom';
+import { Button } from '@/components/ui/button';
 
 import { cn } from '@/lib/utils';
 import { toast } from '@/lib/toast';
@@ -40,14 +42,7 @@ import { useCCSessions } from '@/hooks/useCCSessions';
 import { useProjectPickerOptions } from '@/hooks/useProjectPickerOptions';
 import { useSessionRunningStatus } from '@/hooks/useSessionRunningStatus';
 import { useConfirmDialog } from '@/components/ui/confirm-dialog-provider';
-import {
-  DropdownMenu,
-  DropdownMenuItem,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu';
+import { DropdownMenu, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { WINDOW_NO_DRAG_STYLE, useManualWindowDrag } from '@/components/layout/windowDrag';
 import { recentWorkdirsStore } from '@/lib/recentWorkdirsStore';
 import { useRegisterContentHeader } from '../feature-context';
@@ -65,18 +60,20 @@ import { isOrcaLeadSession, resolveSessionRoute } from '@/lib/orcaSessionIdentit
 import { revalidateWorkersProjection } from './hooks/workerProjectionStore';
 import { GitContextBadge } from './GitContextBadge';
 import { OrcaRemoteLeadBadge } from './OrcaRemoteLeadBadge';
+import { BotTaskOwnerChip } from '@/features/bots/BotTaskOwnerChip';
 import { SessionRenameInput } from './SessionRenameInput';
 import { useSessionBoundSchedules } from '@/features/scheduler/lib/scheduleSessionBinding';
 import { ScheduleBindingBadge } from './sidebar/ScheduleBindingBadge';
 import { RemoteProjectIcon } from './sidebar/RemoteProjectIcon';
 import { VendorIcon, agentKindToVendor } from '@/components/sidebar/VendorIcon';
-import { MENU_ITEM_CLASS, MENU_ROW_CLASS } from './sidebar/menuStyles';
+import { MENU_ITEM_CLASS } from './sidebar/menuStyles';
 import { SessionProjectMoveSubmenu } from './sidebar/SessionProjectMoveSubmenu';
 import type { SessionMoveTarget } from './sidebar/sessionMoveTarget';
 import { SessionShareExportDialog } from './sidebar/SessionShareExportDialog';
 import { useRemoteProjectSessions } from '@/features/device-link/remoteProjectsStore';
 import { isRemoteSessionWriteBlocked } from './lib/remoteSessionWriteGuard';
 import { Tip } from '@/components/ui/tooltip';
+import { Spinner } from '@/components/ui/spinner';
 import { TaskTagDots, TaskTagMenuSection, TaskTagEditor } from '@/features/task-tags/TaskTags';
 import { isSharedTaskPeer } from '@cindy/device-link';
 import { useDeviceLinkDeviceList } from '@/features/device-link/useDeviceLinkDeviceList';
@@ -142,10 +139,12 @@ function AgentDeviceIndicator({
 export function SessionContentHeaderRegistration({
   session,
   remoteSessionUnavailable = false,
+  remoteSyncing = false,
   readOnly = false,
 }: {
   session: Session;
   remoteSessionUnavailable?: boolean;
+  remoteSyncing?: boolean;
   readOnly?: boolean;
 }) {
   useRegisterContentHeader(
@@ -154,10 +153,11 @@ export function SessionContentHeaderRegistration({
         <SessionContentHeader
           session={session}
           remoteSessionUnavailable={remoteSessionUnavailable}
+          remoteSyncing={remoteSyncing}
           readOnly={readOnly}
         />
       ),
-      [readOnly, session, remoteSessionUnavailable],
+      [readOnly, session, remoteSessionUnavailable, remoteSyncing],
     ),
   );
   return null;
@@ -166,15 +166,18 @@ export function SessionContentHeaderRegistration({
 interface SessionContentHeaderProps {
   session: Session;
   remoteSessionUnavailable?: boolean;
+  remoteSyncing?: boolean;
   readOnly?: boolean;
 }
 
 export function SessionContentHeader({
   session: sessionProp,
   remoteSessionUnavailable = false,
+  remoteSyncing = false,
   readOnly = false,
 }: SessionContentHeaderProps) {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   const { sessions, patchLocal } = useCCSessions();
   const remoteProjectSessions = useRemoteProjectSessions();
   const routeSessionById = useMemo(
@@ -191,8 +194,7 @@ export function SessionContentHeader({
   const sharedGuest = isSharedTaskPeer(session.deviceLinkDeviceId ?? '');
   const { runningSessionIds } = useSessionRunningStatus(session.id);
   const { confirm: confirmDialog } = useConfirmDialog();
-  const { runSessionAction, unarchiveSession, beginRemoteArchive, cancelRemoteArchive } =
-    useSessionLifecycleActions();
+  const { runSessionAction, unarchiveSession } = useSessionLifecycleActions();
 
   const isPinned = session.pinnedAt != null;
   const isArchived = session.status === 'archived';
@@ -480,11 +482,7 @@ export function SessionContentHeader({
     // 一起等,dirty 先返回 clean、接管查询还在飞的那段时间就是 clean 结论的失效窗口。
     // 改成接管结算之后再 resolve —— clean 一律重查(见 worktreeRemovalWarning),
     // 拿到的是此刻的结论;菜单打开时的 prefetch 仍然热了 git cache。
-    // 远程任务的预检是一次完整隧道往返:先乐观隐藏行并跳离,预检干净则沿用同一叠加层
-    // 写库,需要确认时取消再让行回来(与 sidebar 同口径,见 handleActionClick)。
-    const remoteArchiveToken = session.deviceLinkDeviceId
-      ? beginRemoteArchive(session.id, session.deviceLinkDeviceId, session.id)
-      : null;
+    // 预检与确认期间保留当前任务，确定归档后再由 runSessionAction 隐藏并跳离。
     const preflight = await resolveWorktreeRemovalPreflight(session.id, session.deviceLinkDeviceId);
     // 归档不弹确认框 —— 可逆操作(菜单里就有「恢复」),与 sidebar 同口径。
     // 免确认的判据是「**确认**干净」:worktree 脏、或预检失败拿不到结论('unknown')
@@ -502,17 +500,13 @@ export function SessionContentHeader({
         cancelText: t('ccAgent.sidebar.confirmArchive.cancel'),
       });
       if (!ok) {
-        if (remoteArchiveToken) cancelRemoteArchive(remoteArchiveToken);
         return;
       }
     }
     await runSessionAction(session.id, 'archive', {
       activeSessionId: session.id,
-      remoteArchiveToken,
     });
   }, [
-    beginRemoteArchive,
-    cancelRemoteArchive,
     confirmDialog,
     remoteWritesBlocked,
     runSessionAction,
@@ -577,6 +571,16 @@ export function SessionContentHeader({
 
   return (
     <div className="flex min-w-0 items-center gap-0.5 pl-1">
+      {session.source === 'side-chat' && session.parentSessionId && (
+        <Tip text={t('chat.sideChat.returnMain')}>
+          <Button variant="secondary" tone="quiet" size="sm" className="w-7 p-0" style={WINDOW_NO_DRAG_STYLE}
+            aria-label={t('chat.sideChat.returnMain')}
+            onClick={() => void resolveSessionRoute(session.parentSessionId!).then(route => navigate(route))
+              .catch(() => toast.error(t('chat.sideChat.failed')))}>
+            <ArrowLeft size={16} />
+          </Button>
+        </Tip>
+      )}
       {isPinned && (
         <Pin
           size={13}
@@ -644,6 +648,20 @@ export function SessionContentHeader({
         </span>
       )}
 
+      {remoteSyncing && (
+        <Tip text={t('ccAgent.remoteSession.syncing')}>
+          <span
+            role="status"
+            aria-label={t('ccAgent.remoteSession.syncing')}
+            aria-busy="true"
+            className="mx-1 inline-flex shrink-0 text-[var(--text-tertiary)]"
+            style={WINDOW_NO_DRAG_STYLE}
+          >
+            <Spinner size={14} />
+          </span>
+        </Tip>
+      )}
+
       {!isEditing && !!session.tags?.length && (
         <span
           className="mx-1 shrink-0 [--task-tag-ring-bg:hsl(var(--content-area))]"
@@ -654,6 +672,8 @@ export function SessionContentHeader({
       )}
 
       {!isEditing && <OrcaRemoteLeadBadge session={session} />}
+
+      {!isEditing && <BotTaskOwnerChip session={session} />}
 
       {!isEditing && !readOnly && (!sharedGuest || session.status === 'active') && (
         // 菜单打开就把归档/删除的 dirty 预检发出去:用户从展开菜单到点条目至少

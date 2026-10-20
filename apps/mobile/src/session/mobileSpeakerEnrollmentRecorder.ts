@@ -27,6 +27,8 @@ type RecordOptions = {
   /** Elapsed fraction in [0, 1]. */
   onProgress?: (fraction: number) => void;
   signal?: AbortSignal;
+  /** Finish and keep captured audio; `signal` instead cancels and discards it. */
+  stopSignal?: AbortSignal;
   /** Injection point for tests. */
   startAudio?: typeof startMobileRealtimeAudio;
 };
@@ -34,10 +36,11 @@ type RecordOptions = {
 /**
  * Records one read-aloud clip for voiceprint enrollment as PCM16 mono 16 kHz,
  * through the same capture dictation uses, so the voiceprint matches the
- * audio the gate later judges. Stops by itself after `durationMs`.
+ * audio the gate later judges. Stops at `durationMs` or on `stopSignal`.
  */
 export async function recordMobileSpeakerClip(options: RecordOptions): Promise<ArrayBuffer> {
   if (options.signal?.aborted) throw new MobileSpeakerEnrollmentAbortedError();
+  if (options.stopSignal?.aborted) throw new MobileSpeakerEnrollmentNoAudioError();
   const startAudio = options.startAudio ?? startMobileRealtimeAudio;
   const targetSamples = Math.round((options.durationMs / 1000) * SPEAKER_GATE_SAMPLE_RATE);
   const chunks: Int16Array[] = [];
@@ -47,6 +50,12 @@ export async function recordMobileSpeakerClip(options: RecordOptions): Promise<A
   const done = new Promise<void>((resolve) => {
     finish = resolve;
   });
+  let stoppedEarly = false;
+  const onStop = (): void => {
+    stoppedEarly = true;
+    finish();
+  };
+  options.stopSignal?.addEventListener('abort', onStop, { once: true });
 
   const lifecycle = new AbortController();
   const onAbort = (): void => {
@@ -77,13 +86,14 @@ export async function recordMobileSpeakerClip(options: RecordOptions): Promise<A
     });
     if (permission === 'cancelled') throw new MobileSpeakerEnrollmentAbortedError();
     if (permission === 'denied') throw new Error('microphone permission denied');
+    if (stoppedEarly) throw new MobileSpeakerEnrollmentNoAudioError();
     removeBackgroundListener = subscribeToAppState((state) => {
       if (state !== 'active') onAbort();
     });
     stop = await startAudio({
       sampleRate: SPEAKER_GATE_SAMPLE_RATE,
       onChunk: (chunk) => {
-        if (lifecycle.signal.aborted || samples >= targetSamples) return;
+        if (lifecycle.signal.aborted || stoppedEarly || samples >= targetSamples) return;
         const pcm = new Int16Array(chunk.pcm16.slice(0, chunk.pcm16.byteLength - (chunk.pcm16.byteLength % 2)));
         chunks.push(pcm);
         samples += pcm.length;
@@ -104,13 +114,14 @@ export async function recordMobileSpeakerClip(options: RecordOptions): Promise<A
     clearTimeout(watchdog);
     removeBackgroundListener?.();
     options.signal?.removeEventListener('abort', onAbort);
+    options.stopSignal?.removeEventListener('abort', onStop);
     await stop?.().catch(() => undefined);
   }
-  if (lifecycle.signal.aborted) throw new MobileSpeakerEnrollmentAbortedError();
+  if (lifecycle.signal.aborted || options.signal?.aborted) throw new MobileSpeakerEnrollmentAbortedError();
   if (failure) throw failure;
-  if (samples < targetSamples) throw new MobileSpeakerEnrollmentNoAudioError();
+  if (samples === 0 || (!stoppedEarly && samples < targetSamples)) throw new MobileSpeakerEnrollmentNoAudioError();
 
-  const out = new Int16Array(targetSamples);
+  const out = new Int16Array(Math.min(samples, targetSamples));
   let offset = 0;
   for (const chunk of chunks) {
     const take = Math.min(chunk.length, out.length - offset);

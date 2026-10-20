@@ -109,7 +109,9 @@ describe('sendToSession ordering', () => {
     );
 
     expect(helperBlock).toContain('const result = await resolveCollabDispatchResult(');
-    expect(helperBlock).toMatch(/\(\) =>\s+session\.send\(agentMessage, \{/);
+    expect(helperBlock).toMatch(
+      /async \(\) => \{\s+const sendResult = await session\.send\((?:agentMessage|outgoingMessage), \{/,
+    );
     expect(helperBlock).toContain('planMode: false,');
     expect(helperBlock).toContain('throwOnStartFailure: true,');
     expect(helperBlock).toContain('onAccepted: async () => {');
@@ -375,7 +377,9 @@ describe('sendToSession ordering', () => {
     expect(orcaInterAgentDispatcherSource).toContain('resolveCollabDispatchResult');
     expect(helperBlock).toContain('Promise<CollabDirectDispatchResult>');
     expect(helperBlock).toContain('const result = await resolveCollabDispatchResult(');
-    expect(helperBlock).toMatch(/\(\) =>\s+session\.send\(agentMessage, \{/);
+    expect(helperBlock).toMatch(
+      /async \(\) => \{\s+const sendResult = await session\.send\((?:agentMessage|outgoingMessage), \{/,
+    );
     expect(helperBlock).toContain('planMode: false,');
     expect(helperBlock).toContain('throwOnStartFailure: true,');
     expect(helperBlock).not.toContain('await session.send(agentMessage, {');
@@ -636,15 +640,17 @@ describe('sendToSession ordering', () => {
       'const release = await acquireSendToSessionLock(sessionId, undefined, () => stage);',
       'applyPendingAgentSwitchIfIdle(',
     );
-    for (const operation of [
-      'reconcileBotModelRoute', 'applyPendingAgentSwitchIfIdle',
-      'applyScheduledModelSelection', 'prepareUnhealthySession',
+    for (const [operation, call] of [
+      ['reconcileBotModelRoute', 'reconcileBotModelRoute'],
+      ['applyPendingAgentSwitchIfIdle', 'applyPendingAgentSwitchIfIdle'],
+      ['applyScheduledModelSelection', 'applyScheduledProfile'],
+      ['prepareUnhealthySession', 'prepareUnhealthySession'],
     ]) {
-      expectOrder(directSendSwitchBlock, `stage = 'direct-send:${operation}'`, `${operation}(`);
+      expectOrder(directSendSwitchBlock, `stage = 'direct-send:${operation}'`, `${call}(`);
     }
     expectOrder(directSendSwitchBlock, 'prepareUnhealthySession', "stage = 'direct-send:caller-dispatch'");
     expectOrder(directSendSwitchBlock, 'applyPendingAgentSwitchIfIdle(', 'prepareUnhealthySession');
-    expectOrder(directSendSwitchBlock, 'prepareUnhealthySession', 'return { release, selection: resolvedSelection };');
+    expectOrder(directSendSwitchBlock, 'prepareUnhealthySession', 'return { release, selection: resolvedSelection,');
   });
 
   it('仅 Device Link 归一化 SET_MODEL 的 JSON null 可选占位,本地仍走严格校验', () => {

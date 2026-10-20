@@ -4,6 +4,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { BotGroupOpenPlanSummary, BotGroupSummary } from '../../../../shared/botGroupChat';
+import { sidebarOwnerStorageKey } from '@/lib/sidebarOwnerStorage';
+import { botGroupReadKey, markBotRead, resetBotReadStateForTests } from '../botReadState';
 
 vi.mock('@/hooks/useProviderOnboarding', () => ({
   useProviderOnboarding: () => ({ visible: false }),
@@ -147,6 +149,8 @@ async function renderSidebar() {
 }
 
 beforeEach(() => {
+  // These tests are about the menu's own entries; the new-entry hint has its own test file.
+  window.localStorage.setItem(sidebarOwnerStorageKey('sidebar.botMarketEntryHint.v1', 'owner'), 'seen');
   mocks.navigate.mockReset();
   mocks.confirm.mockReset().mockResolvedValue(true);
   mocks.manage.mockReset().mockResolvedValue({ ok: true });
@@ -350,7 +354,7 @@ describe('TeammatesSection group chats', () => {
 
   it('lists groups alongside teammates with an author preview and opens them', async () => {
     mocks.groups = [group(), group({ id: 'g2', name: '读书会', lastMessage: null, updatedAt: 1 })];
-    mocks.params = { groupId: 'g1' };
+    mocks.pathname = '/bots/groups/g1';
     await renderSidebar();
     expect(screen.queryByText('bots.groupChat.sidebar.title')).toBeNull();
     const rows = screen.getAllByRole('button', { current: 'page' });
@@ -374,7 +378,7 @@ describe('TeammatesSection group chats', () => {
     expect(screen.queryByRole('button', { name: 'bots.groupChat.server.join' })).toBeNull();
     fireEvent.keyDown(screen.getByRole('button', { name: 'bots.list.createMenu' }), { key: 'Enter' });
     expect(screen.getAllByRole('menuitem').map(item => item.textContent)).toEqual([
-      'bots.list.createTeammate', 'bots.groupChat.create.title', 'bots.list.joinWithLink',
+      'bots.market.heading', 'bots.list.createTeammate', 'bots.groupChat.create.title', 'bots.list.joinWithLink',
     ]);
     expect(screen.getAllByRole('separator')).toHaveLength(1);
     fireEvent.click(screen.getByRole('menuitem', { name: 'bots.list.joinWithLink' }));
@@ -502,6 +506,25 @@ it('localizes the join preview without presenting its subject as a chat author',
   expect(screen.queryByText(/Fallback text/)).toBeNull();
 });
 
+it('badges the real number of unread group messages, falling back to one on older hosts', async () => {
+  window.localStorage.clear();
+  resetBotReadStateForTests();
+  markBotRead(botGroupReadKey('g1'), 15);
+  markBotRead(botGroupReadKey('g2'), 15);
+  const at = (ms: number) => new Date(ms).toISOString();
+  mocks.groups = [
+    group({ lastReplyAt: 30, incomingMessageTimes: [at(10), at(20), at(30)] } as Partial<BotGroupSummary>),
+    group({ id: 'g2', name: '读书会', lastReplyAt: 30 }),
+  ];
+  try {
+    await renderSidebar();
+    expect(screen.getByLabelText('sidebar.teammateUnreadCount:{"count":2}').textContent).toBe('2');
+    expect(screen.getByLabelText('sidebar.teammateUnreadCount:{"count":1}').textContent).toBe('1');
+  } finally {
+    resetBotReadStateForTests();
+    window.localStorage.clear();
+  }
+});
 it.each([[false, 'bots.groupChat.sidebar.sharedReply:{"name":"Alice"}'], [true, 'bots.groupChat.sidebar.sharedReplyYou']] as const)(
   'names who shared a thread reply without quoting any card text (self: %s)', async (isSelf, label) => {
     mocks.groups = [group({ lastMessage: { authorKind: 'user', isSelf, authorName: 'Alice', threadShare: true,

@@ -10,6 +10,7 @@
  * 受邀者任务里，凭证类操作没有批准时先在本机弹确认卡，等待期间这条连接后面的消息排在它后面。
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -21,6 +22,7 @@ import {
   type RemoteAgentStreamItem,
 } from '@cindy/device-link';
 
+import { readExistingTextSync } from '../executor/files';
 import type { ExecutorAction, ExecutorGateDecision } from '../executor/gate';
 import { resolveExecutorShell } from '../executor/shell';
 import type { ExecutorWorkspace } from '../executor/workspace';
@@ -44,6 +46,11 @@ export interface ExecServerRelayDeps {
   env?: NodeJS.ProcessEnv;
   log?: { warn(message: string, meta?: Record<string, unknown>): void };
   now?: () => number;
+  /**
+   * 由忙转闲：各连接上的工作(在跑的进程含后台终端、启动中的请求、待确认的消息)由有变无，包括进程结束、
+   * 启动失败、确认处理完、带着工作的连接被整条关掉。对连接池来说这是一次活动。
+   */
+  onProcessesEnded?(): void;
 }
 
 /**
@@ -66,6 +73,13 @@ interface Connection {
   closed: boolean;
   /** 有消息在等本机确认时，后面的消息按顺序排在它后面。 */
   queue?: Promise<void>;
+  /**
+   * 还在运行的进程(`process/start` 起的，收到 `process/closed` / `process/exited` 或启动失败前都算)。
+   * Codex 的后台终端就是这些：编号在对方的 Codex 里，进程在这里，连接一断就没了。
+   */
+  processes: Set<string>;
+  /** 启动请求 id → 进程编号(启动失败时据此移除)。 */
+  starting: Map<string, string>;
 }
 
 /** `["/bin/zsh","-lc","cmd"]` → `cmd`；其它形态按空格拼接。 */
@@ -114,16 +128,16 @@ export function execServerActions(method: string, params: unknown, cwd: string):
     .map((key) => fromFileUrl(record[key], cwd))
     .filter((value): value is string => !!value);
   if (TREE_READ_METHODS.has(method)) return paths.map((target) => ({ kind: 'read', path: target, scope: 'tree' }));
-  // fs/open also handles writes: Codex replace/write mode creates or truncates a file, while
-  // the later fs/writeBlock request carries only a handle and no path. Check the write at open.
-  // An omitted mode is the legacy read-only shape; every explicit unknown mode is fail-closed.
+  // Pinned Codex 0.159.2 uses a read-only fs/open and writes through fs/writeFile.
+  // Keep explicit non-read modes fail-closed for newer protocols; they are not evidence that
+  // their later handle-based write methods are supported by this relay.
   const readOnlyOpen = method !== 'fs/open' || record.mode === undefined || record.mode === 'read';
   const kind = READ_METHODS.has(method) && readOnlyOpen ? 'read' : 'write';
   return paths.map((target) => ({ kind, path: target }) as ExecutorAction);
 }
 
 /** 映射协议路径、命令和可逆的 UTF-8 文件数据；二进制内容保持原样。 */
-export function mapExecServerParams(value: unknown, workspace: ExecutorWorkspace, method?: string): unknown {
+export function mapExecServerParams(value: unknown, workspace: ExecutorWorkspace, method?: string, mapFileData = true): unknown {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
   const result = { ...value as Record<string, unknown> };
   for (const key of ['cwd', 'path', 'sourcePath', 'destinationPath', 'source', 'destination', 'from', 'to', 'target']) {
@@ -137,10 +151,145 @@ export function mapExecServerParams(value: unknown, workspace: ExecutorWorkspace
   }
   if (Array.isArray(result.argv)) result.argv = result.argv.map((part) => typeof part === 'string' ? workspace.mapCommand(part, resolveExecutorShell().dialect) : part);
   if (typeof result.command === 'string') result.command = workspace.mapCommand(result.command, resolveExecutorShell().dialect);
-  if (method?.startsWith('fs/write') && typeof result.dataBase64 === 'string') {
-    result.dataBase64 = workspace.mapInputFromAgent(Buffer.from(result.dataBase64, 'base64')).toString('base64');
+  if (result.sandbox !== undefined) result.sandbox = mapExecServerSandbox(result.sandbox, workspace);
+  return mapFileData ? mapExecServerFileData(result, workspace, method) : result;
+}
+
+type JsonRecord = Record<string, unknown>;
+
+function asJsonRecord(value: unknown): JsonRecord | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as JsonRecord : null;
+}
+
+/**
+ * 本机能用的绝对路径：任务电脑是 Windows 时必须带盘符或是 UNC，以 `/` 开头的 POSIX 路径不算；
+ * 是 POSIX 时 `//server/share` 是 Windows 网络路径(本机 exec-server 不认带主机名的 file URI)，也不算。
+ */
+function isLocalAbsolutePath(value: string): boolean {
+  return process.platform === 'win32'
+    ? /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/])/.test(value)
+    : path.posix.isAbsolute(value) && !/^[\\/]{2}/.test(value);
+}
+
+/** 转换沙箱用到的 Agent 一侧信息：它的路径约定按虚拟工作区(Agent 主机上的路径)判断，不按单个 URI 的长相猜。 */
+interface SandboxMapping {
+  workspace: ExecutorWorkspace;
+  windowsAgent: boolean;
+}
+
+/** Agent 发来的 file URI 还原成它那边的路径写法(Windows Agent：`file:///C:/x` → `C:/x`；UNC 带回主机名)。 */
+function agentPathFromUri(value: unknown, windowsAgent: boolean): string | null {
+  if (typeof value !== 'string' || !value.startsWith('file://')) return null;
+  try {
+    const url = new URL(value);
+    const pathname = decodeURIComponent(url.pathname);
+    if (url.host) return `//${url.host}${pathname}`;
+    // POSIX 上 `/C:/secret` 是根目录下的普通路径，只有 Windows Agent 才去掉盘符前的 `/`。
+    return windowsAgent ? pathname.replace(/^\/([A-Za-z]:)/, '$1') : pathname;
+  } catch {
+    return null;
+  }
+}
+
+/** 虚拟工作区内的 file URI 换成本机 file URI；Agent 主机自己的路径返回 null。 */
+function localUriFromAgent(value: unknown, { workspace, windowsAgent }: SandboxMapping): string | null {
+  const agentPath = agentPathFromUri(value, windowsAgent);
+  const local = agentPath === null ? null : workspace.localPathFromAgent(agentPath);
+  return local === null ? null : pathToFileURL(local).href;
+}
+
+/**
+ * 沙箱上下文里解释权限条目用的目录(policyContext 里同名字段同样处理)。用户目录对不上时用本机的：
+ * Codex 缺了它会把 `~/…` 规则当作解析失败、一律拒绝读取。
+ */
+function mapSandboxDirs(record: JsonRecord, mapping: SandboxMapping): JsonRecord {
+  const result = { ...record };
+  if (result.cwd !== undefined) {
+    const local = localUriFromAgent(result.cwd, mapping);
+    if (local === null) delete result.cwd;
+    else result.cwd = local;
+  }
+  if (result.userHomeDir !== undefined) {
+    result.userHomeDir = localUriFromAgent(result.userHomeDir, mapping) ?? pathToFileURL(os.homedir()).href;
+  }
+  for (const key of ['workspaceRoots', 'temporaryDirectories']) {
+    const items = result[key];
+    if (Array.isArray(items)) result[key] = items.flatMap((item) => localUriFromAgent(item, mapping) ?? []);
   }
   return result;
+}
+
+/**
+ * 一条文件权限：虚拟工作区内的路径换成本机路径。Agent 主机自己的路径(如它的 Codex 记忆目录)在本机
+ * 没有对应位置，读写授权直接丢掉，只收不放。禁止规则不因转换失效：路径条目在本机也是合法绝对路径时
+ * 原样保留(不合法的会让本机 exec-server 拒绝整个请求)；没映射上的禁止 glob 一律原样保留——相对的由本机
+ * 按工作目录解释，Agent 主机的绝对路径在本机匹配不到东西，无需判断它是不是绝对路径。特殊路径(`:tmpdir`、
+ * 项目根等)由本机 exec-server 按映射后的目录解释。
+ */
+function mapSandboxEntry(entry: unknown, mapping: SandboxMapping): unknown[] {
+  const record = asJsonRecord(entry);
+  const target = asJsonRecord(record?.path);
+  if (!record || !target) return [entry];
+  const deny = record.access === 'deny' || record.access === 'none';
+  if (target.type === 'path') {
+    const local = localUriFromAgent(target.path, mapping);
+    if (local !== null) return [{ ...record, path: { ...target, path: local } }];
+    const agentPath = agentPathFromUri(target.path, mapping.windowsAgent);
+    return deny && agentPath !== null && isLocalAbsolutePath(agentPath) ? [entry] : [];
+  }
+  if (target.type === 'glob_pattern' && typeof target.pattern === 'string') {
+    const local = mapping.workspace.localGlobFromAgent(target.pattern);
+    if (local !== null) return [{ ...record, path: { ...target, pattern: local } }];
+    // 读写 glob 只有明确是绝对路径(盘符加分隔符、`/` 开头、`\\server`)才是 Agent 主机的路径，丢掉；判断不准只会少放。
+    return deny || !/^(?:[A-Za-z]:[\\/]|\/|\\\\)/.test(target.pattern) ? [entry] : [];
+  }
+  return [entry];
+}
+
+/**
+ * Codex 请求(process/start、fs/*)里的 `sandbox`：权限条目和解释它们用的目录都是 Agent 主机上看到的
+ * file URI。原样转给本机 exec-server，两端系统不同时会因路径不属于本机被拒(`invalid sandbox
+ * permission path URI`)，相同时则放行的是本机不存在的虚拟目录。这里换成本机路径，规则见 mapSandboxEntry。
+ */
+function mapExecServerSandbox(value: unknown, workspace: ExecutorWorkspace): unknown {
+  const record = asJsonRecord(value);
+  const agentPrefixes = workspace.agentPathPrefixes();
+  if (!record || agentPrefixes.length === 0) return value;
+  const mapping: SandboxMapping = { workspace, windowsAgent: /^(?:[A-Za-z]:|[\\/]{2})/.test(agentPrefixes[0]) };
+  const sandbox = mapSandboxDirs(record, mapping);
+  const policyContext = asJsonRecord(sandbox.policyContext);
+  if (policyContext) sandbox.policyContext = mapSandboxDirs(policyContext, mapping);
+  const permissions = asJsonRecord(sandbox.permissions);
+  const fileSystem = asJsonRecord(permissions?.file_system);
+  if (permissions && fileSystem && Array.isArray(fileSystem.entries)) {
+    const entries = fileSystem.entries.flatMap((entry) => mapSandboxEntry(entry, mapping));
+    sandbox.permissions = { ...permissions, file_system: { ...fileSystem, entries } };
+  }
+  return sandbox;
+}
+
+/**
+ * 授权通过后、实际转发前才读写入目标的原内容，排队中的请求也在出队后读取最新内容。
+ * 路径与命令的映射仍在权限检查前完成，确保 gate 检查的是实际执行的操作。
+ */
+function mapExecServerFileData(value: unknown, workspace: ExecutorWorkspace, method?: string): unknown {
+  if (!method?.startsWith('fs/write') || !value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const result = value as Record<string, unknown>;
+  if (typeof result.dataBase64 !== 'string') return value;
+  return { ...result, dataBase64: workspace.mapInputFromAgent(Buffer.from(result.dataBase64, 'base64'),
+    existingTextFor(result.path, workspace)).toString('base64') };
+}
+
+/** 旧内容仅用于还原写入路径的原写法，不回给 Agent；凭证类文件不预读。 */
+function existingTextFor(target: unknown, workspace: ExecutorWorkspace): string | null {
+  if (typeof target !== 'string') return null;
+  let local: string;
+  try {
+    local = target.startsWith('file://') ? fileURLToPath(target) : target;
+  } catch {
+    return null;
+  }
+  return workspace.isSensitive(local) ? null : readExistingTextSync(local);
 }
 
 /** JSON 层逐字符串投影；文件 base64 数据保持原始字节，进程输出单独解码。 */
@@ -209,6 +358,31 @@ export class ExecServerRelay {
     }
   }
 
+  /**
+   * 还有放不下的工作：有进程在跑(含 Codex 的后台终端)、有消息在等本机确认，或还有帧没推完。
+   * 这时断开对方的 Agent 会丢掉它们，连接池不让出名额。
+   */
+  busy(): boolean {
+    return this.outbox.length > 0 || Boolean(this.flushing) || this.hasWork();
+  }
+
+  /** 各条连接上还有没有工作(在跑的进程、启动中的请求、待确认的消息)；还没推完的帧不算。 */
+  private hasWork(): boolean {
+    for (const connection of this.connections.values()) {
+      if (connection.processes.size || connection.starting.size || connection.queue) return true;
+    }
+    return false;
+  }
+
+  /**
+   * 对方的 Agent 已断开(连接池让出名额)：关掉本机为它起的 exec-server，中继本身留给连回来的 Agent。
+   */
+  reset(): void {
+    if (this.closed) return;
+    this.outbox = [];
+    for (const connId of [...this.connections.keys()]) this.dropConnection(connId, false);
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -235,7 +409,7 @@ export class ExecServerRelay {
       this.send({ connId, kind: 'close' });
       return;
     }
-    const connection: Connection = { child, buffer: '', closed: false };
+    const connection: Connection = { child, buffer: '', closed: false, processes: new Set(), starting: new Map() };
     this.connections.set(connId, connection);
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk: string) => {
@@ -245,7 +419,10 @@ export class ExecServerRelay {
         if (index < 0) break;
         const line = connection.buffer.slice(0, index);
         connection.buffer = connection.buffer.slice(index + 1);
-        if (line.trim()) this.sendMessage(connId, this.projectOutbound(line));
+        if (line.trim()) {
+          this.trackOutbound(connection, line);
+          this.sendMessage(connId, this.projectOutbound(line));
+        }
       }
       if (connection.buffer.length > MAX_LINE_CHARS) {
         this.deps.log?.warn('remote agent: exec-server line too long; closing', { connId });
@@ -271,12 +448,22 @@ export class ExecServerRelay {
     let actions: ExecutorAction[] = [];
     if (message && typeof message.method === 'string' && message.id !== undefined) {
       this.counts.requests += 1;
-      message.params = mapExecServerParams(message.params, this.deps.workspace, message.method);
+      message.params = mapExecServerParams(message.params, this.deps.workspace, message.method, false);
       data = JSON.stringify(message);
       actions = execServerActions(message.method, message.params, this.deps.cwd);
+      if (message.method === 'process/start') {
+        const processId = (message.params as { processId?: unknown } | undefined)?.processId;
+        if (typeof processId === 'string') connection.starting.set(JSON.stringify(message.id), processId);
+      }
     }
     const id = message?.id;
-    const line = `${data}\n`;
+    // 延迟到所有 action 获准之后，不能为了内容保真提前读取被拒绝的目标。
+    const line = () => {
+      if (message && typeof message.method === 'string' && message.id !== undefined) {
+        return JSON.stringify({ ...message, params: mapExecServerFileData(message.params, this.deps.workspace, message.method) }) + '\n';
+      }
+      return data + '\n';
+    };
     if (connection.queue) {
       this.enqueue(connection, () => this.deliver(connId, connection, id, line, actions));
       return;
@@ -293,7 +480,7 @@ export class ExecServerRelay {
       this.enqueue(connection, () => this.deliver(connId, connection, id, line, rest));
       return;
     }
-    connection.child.stdin.write(line);
+    connection.child.stdin.write(line());
   }
 
   private enqueue(connection: Connection, task: () => Promise<void>): void {
@@ -302,11 +489,14 @@ export class ExecServerRelay {
     });
     connection.queue = next;
     void next.then(() => {
-      if (connection.queue === next) connection.queue = undefined;
+      if (connection.queue !== next) return;
+      const hadWork = this.hasWork();
+      connection.queue = undefined;
+      this.settleWork(hadWork);
     });
   }
 
-  private async deliver(connId: string, connection: Connection, id: unknown, line: string, actions: ExecutorAction[]): Promise<void> {
+  private async deliver(connId: string, connection: Connection, id: unknown, line: () => string, actions: ExecutorAction[]): Promise<void> {
     for (const action of actions) {
       let decision = this.deps.authorize(action);
       if (!decision.ok && this.deps.confirm && await this.deps.confirm(action)) decision = this.deps.authorize(action);
@@ -316,11 +506,52 @@ export class ExecServerRelay {
         return;
       }
     }
-    if (!connection.closed) connection.child.stdin.write(line);
+    if (!connection.closed) connection.child.stdin.write(line());
+  }
+
+  /** 记下 exec-server 报的进程起止(只看编号，不改消息)。 */
+  private trackOutbound(connection: Connection, line: string): void {
+    // 大段文件内容不必再解析一遍：进程通知带方法名，启动回包很短。
+    if (!line.includes('"process/') && !(connection.starting.size && line.length < 64 * 1024)) return;
+    let message: { id?: unknown; method?: unknown; params?: { processId?: unknown }; result?: unknown; error?: unknown };
+    try {
+      message = JSON.parse(line) as typeof message;
+    } catch {
+      return;
+    }
+    if (!message || typeof message !== 'object') return;
+    if (message.id !== undefined && message.method === undefined) {
+      const key = JSON.stringify(message.id);
+      const processId = connection.starting.get(key);
+      if (processId === undefined) return;
+      const hadWork = this.hasWork();
+      connection.starting.delete(key);
+      // 启动失败(JSON-RPC 错误)不会留下进程；等了很久才失败时同样是一次由忙转闲。
+      if (message.error === undefined) connection.processes.add(processId);
+      this.settleWork(hadWork);
+      return;
+    }
+    if ((message.method === 'process/closed' || message.method === 'process/exited') && typeof message.params?.processId === 'string') {
+      const processId = message.params.processId;
+      const hadWork = this.hasWork();
+      connection.processes.delete(processId);
+      for (const [key, starting] of connection.starting) if (starting === processId) connection.starting.delete(key);
+      this.settleWork(hadWork);
+    }
+  }
+
+  /**
+   * 改动连接上的工作记录之后调用：由有工作变为没有工作，就是一次由忙转闲(对连接池来说是一次活动)。
+   * 进程结束、启动失败、待确认的消息处理完、连接被整条删掉，都经过这里。
+   */
+  private settleWork(hadWork: boolean): void {
+    if (hadWork && !this.hasWork()) this.deps.onProcessesEnded?.();
   }
 
   private reject(connId: string, id: unknown, decision: ExecutorGateDecision): void {
     this.counts.rejected += 1;
+    // 被闸门拦下的启动没有到 exec-server，不会有进程。
+    this.connections.get(connId)?.starting.delete(JSON.stringify(id));
     this.sendMessage(connId, JSON.stringify({
       id,
       error: { code: -32001, message: this.deps.workspace.mapTextForAgent(decision.reason ?? 'Not allowed in this workspace.') },
@@ -338,6 +569,9 @@ export class ExecServerRelay {
   private dropConnection(connId: string, notifyRemote: boolean): void {
     const connection = this.connections.get(connId);
     if (!connection || connection.closed) return;
+    // 连接带着在跑的进程、启动中的请求或待确认的消息被整条删掉(异常退出、交付失败、对方关闭)，同样是一次
+    // 由忙转闲。只看各连接上的工作：本机这侧断开时紧接着排进去的关闭帧不算忙。
+    const hadWork = this.hasWork();
     connection.closed = true;
     this.connections.delete(connId);
     try {
@@ -347,6 +581,7 @@ export class ExecServerRelay {
       // 进程已退出。
     }
     if (notifyRemote) this.send({ connId, kind: 'close' });
+    this.settleWork(hadWork);
   }
 
   /** 一条消息：超过单帧上限时拆成多段(除最后一段外带 more)。 */

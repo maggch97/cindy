@@ -17,7 +17,7 @@ const h = vi.hoisted(() => ({
   groupTargetsSeen: [] as unknown[],
   create: {} as any, chrome: {} as any, titleArgs: [] as number[], nativeHeader: true, headerHeight: 106, barEdge: 'none',
   cloud: { supported: false, actors: [] as Array<{ id: string; kind: string; externalId: string; name: string; avatar: null; homeDeviceId: string | null }>,
-    refresh: vi.fn(), setHome: vi.fn() },
+    deviceNames: new Map<string, string>(), refresh: vi.fn(), setHome: vi.fn() },
 }));
 vi.mock('react-native', async () => {
   const { createElement: el } = await import('react');
@@ -93,10 +93,27 @@ beforeEach(() => {
   h.modeMenu = {}; h.nativeMenus = true; h.nativeHeader = true; h.headerHeight = 106; h.barEdge = 'none'; h.chrome = {};
   h.groups.loading = false; h.groups.refreshing = false; h.groups.error = null;
   h.roster.loading = false; h.roster.error = null; h.roster.isOnline.mockReturnValue(true);
-  h.cloud.supported = false; h.cloud.actors = [];
+  h.cloud.supported = false; h.cloud.actors = []; h.cloud.deviceNames = new Map();
 });
 afterEach(() => { act(() => root?.unmount()); root = undefined; });
 describe('teammate home entry', () => {
+  it('keeps a known conversation while discovery is pending instead of replacing it with a read-only cloud row', async () => {
+    const known: HostedRemoteCollectionItem = { ...teammate, item: { ...teammate.item,
+      display: { title: 'Writer', preview: 'Latest reply', timestamp: 123 },
+      links: [{ rel: 'conversation', target: { kind: 'session', sessionId: 'existing-chat' } }] } };
+    h.roster.items = [known];
+    h.roster.loading = true; h.roster.error = null;
+    await render();
+    expect(h.list.items).toEqual([known]);
+    h.cloud.supported = true;
+    h.cloud.actors = [{ id: 'actor', kind: 'bot', externalId: 'writer', name: 'Writer', avatar: null, homeDeviceId: 'mac' }];
+    await render();
+    expect(h.list.items).toHaveLength(1);
+    expect(h.list.items[0]).toBe(known);
+    await act(async () => h.list.onSelect(h.list.items[0]));
+    expect(h.nav.openTeammate).toHaveBeenCalledWith(known);
+    expect(h.push).not.toHaveBeenCalled();
+  });
   it('lands on the roster and never opens the remembered teammate on its own', async () => {
     // A remembered, online teammate on a settled roster used to be reopened at launch (#4912); the
     // roster is the destination now, in every focus, refresh and remount.
@@ -219,16 +236,28 @@ describe('server groups in the actual teammate home', () => {
 describe('cloud companions (main computer offline)', () => {
   const actorId = '00000000-0000-4000-8000-000000000001';
   const copy = (deviceId: string): HostedRemoteCollectionItem => ({ ...teammate, key: `${deviceId}:writer`, host: { deviceId, deviceName: deviceId.toUpperCase() } });
-  it('opens the cloud view for an offline main computer and hides demoted copies', async () => {
+  it('keeps a listed companion quiet and in its normal chat while its main computer looks offline', async () => {
     h.cloud.supported = true;
     h.cloud.actors = [{ id: actorId, kind: 'bot', externalId: 'writer', name: 'Writer', avatar: null, homeDeviceId: 'mac' }];
     h.roster.items = [teammate, copy('pc')];
     h.roster.isOnline.mockReturnValue(false);
     await render();
     expect(h.list.items.map((row: HostedRemoteCollectionItem) => row.key)).toEqual(['mac:bot']);
-    expect(h.list.cloudOpenable(teammate)).toBe(true);
-    expect(h.list.cloudOpenable(copy('pc'))).toBe(false);
+    expect(h.list.quietPresence(teammate)).toBe(true);
     await act(async () => h.list.onSelect(teammate));
+    expect(h.nav.openTeammate).toHaveBeenCalledExactlyOnceWith(teammate);
+    expect(h.push).not.toHaveBeenCalledWith(expect.objectContaining({ pathname: '/companions/cloud/[actorId]' }));
+  });
+  it('opens the cloud conversation only for a companion this phone knows from the cloud alone', async () => {
+    h.cloud.supported = true;
+    h.cloud.deviceNames = new Map([['mac', 'Mac']]);
+    h.cloud.actors = [{ id: actorId, kind: 'bot', externalId: 'writer', name: 'Writer', avatar: null, homeDeviceId: 'mac' }];
+    h.roster.items = [copy('pc')];
+    await render();
+    const [row] = h.list.items as HostedRemoteCollectionItem[];
+    expect(row.item.revision).toBe('cloud');
+    expect(h.list.quietPresence(row)).toBe(true);
+    await act(async () => h.list.onSelect(row));
     expect(h.push).toHaveBeenLastCalledWith({ pathname: '/companions/cloud/[actorId]',
       params: { actorId, botId: 'writer', deviceId: 'mac', deviceName: 'Mac', title: 'Writer' } });
     expect(h.nav.openTeammate).not.toHaveBeenCalled();
@@ -258,7 +287,7 @@ describe('cloud companions (main computer offline)', () => {
     h.roster.isOnline.mockReturnValue(false);
     await render();
     expect(h.list.items).toHaveLength(2);
-    expect(h.list.cloudOpenable(teammate)).toBe(false);
+    expect(h.list.quietPresence(teammate)).toBe(false);
     h.cloud.supported = true; h.roster.isOnline.mockReturnValue(true);
     await render();
     await act(async () => h.list.onSelect(teammate));

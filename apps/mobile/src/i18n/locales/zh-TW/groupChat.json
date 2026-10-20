@@ -179,7 +179,7 @@
     "speakingMode": "發言方式",
     "speakingModeAuto": "自動",
     "speakingModeSequential": "一律輪流",
-    "speakingModeAutoNote": "沒有 @ 人或 @所有人時，第一輪大家同時想，之後輪流接話；@ 了夥伴就按 @ 的先後輪流。",
+    "speakingModeAutoNote": "未 @ 人或 @所有人時，首輪同時思考，之後輪流；@ 夥伴按提及順序輪流。",
     "speakingModeSequentialNote": "每次只有一位夥伴發言，後說的能看到前面的回答。",
     "speakingModeSaveFailed": "發言方式沒能儲存，請再試一次",
     "setOrganizer": "設為負責人",

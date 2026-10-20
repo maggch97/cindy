@@ -29,7 +29,7 @@ import { useTeammateRoster } from './useTeammateRoster';
 import { useBotGroupRoster } from './useBotGroupRoster';
 import { useTeammateNavigation } from './useTeammateNavigation';
 import { remoteSessionStore } from './remoteSessionStore';
-import { cloudActorForRow, cloudCompanionRows } from '@/chat/cloudCompanion';
+import { CLOUD_ROW_REVISION, cloudActorForRow, cloudCompanionRows } from '@/chat/cloudCompanion';
 import { useCloudCompanionHome } from '@/chat/useCloudCompanion';
 import { cloudCompanionRoute } from './teammateNavigation';
 import type { HostedRemoteCollectionItem } from '@/device-link/remoteResources';
@@ -53,9 +53,14 @@ export function TeammateHomeScreen({ active = true }: { active?: boolean }) {
   // Main computers (cloud-companions.md): only with a server that declares companionHome.
   const cloud = useCloudCompanionHome(focused);
   // One row per companion, under its main computer (a row built from the cloud when none is listed).
+  // Loading is freshness, not identity: preserve known conversation links and previews.
+  // Otherwise an unrelated slow host turns a cached chat into a read-only cloud entry.
   const items = useMemo(() => cloud.supported ? cloudCompanionRows(roster.items, cloud.actors, cloud.deviceNames) : roster.items,
     [cloud.actors, cloud.deviceNames, cloud.supported, roster.items]);
-  const cloudActor = (row: HostedRemoteCollectionItem) => cloud.supported && !roster.isOnline(row.host) ? cloudActorForRow(cloud.actors, row) : null;
+  // A cloud companion opens its normal chat (cached when its computer is unreachable). Only a row
+  // this phone knows from the cloud alone (never listed by its computer) opens the cloud conversation.
+  const cloudActor = (row: HostedRemoteCollectionItem) => cloud.supported && row.item.revision === CLOUD_ROW_REVISION ? cloudActorForRow(cloud.actors, row) : null;
+  const quietPresence = (row: HostedRemoteCollectionItem) => cloud.supported && !!cloudActorForRow(cloud.actors, row);
   // A companion moved by another device shows up as changed roster rows (a new row, or a cached
   // row whose computer re-listed it): re-read the main computers then, not only on focus.
   const listedCompanions = roster.items.map(row => `${row.key}\t${row.item.revision}`).sort().join('\n');
@@ -158,10 +163,10 @@ export function TeammateHomeScreen({ active = true }: { active?: boolean }) {
     </View>
     </>}
     <TeammateList key={searchEpoch} {...roster} items={items}
-      cloudOpenable={(row) => !!cloudActor(row)}
+      quietPresence={quietPresence}
       topInset={nativeHeader ? headerHeight : undefined}
       notice={navigation.saveFailed ? <Text accessibilityRole="alert" style={styles.notice}>{t('devices.companions.preferenceSaveFailed')}</Text> : null} autoFocusSearch={searchEpoch > 0}
-      loading={roster.items.length + groups.items.length === 0 && (roster.loading || groups.loading)}
+      loading={roster.loading || groups.loading}
       refreshing={roster.refreshing || groups.refreshing}
       error={groups.error ?? roster.error}
       onRefresh={() => { void roster.refresh(); void cloud.refresh(); if (groups.supported) void groups.refresh(); }}

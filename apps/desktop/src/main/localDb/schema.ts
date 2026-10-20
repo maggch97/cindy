@@ -20,6 +20,46 @@ import {
 
 import type { SessionSource } from '../../shared/sessionSource.js';
 
+/** Historical source identity survives uninstall; revision is only a continuity witness. */
+export const pluginUsageSubjects = sqliteTable('plugin_usage_subjects', {
+  id: text('id').primaryKey(),
+  stableKey: text('stable_key'),
+  sourceKind: text('source_kind').notNull(),
+  pluginId: text('plugin_id'),
+  organizationId: text('organization_id'),
+  sourceKey: text('source_key'),
+  serverRoot: text('server_root'),
+  ghostId: text('ghost_id').notNull(),
+  displayName: text('display_name').notNull(),
+  bindingRevision: text('binding_revision'),
+  recordingStartedAt: integer('recording_started_at').notNull(),
+  historyGeneration: integer('history_generation').notNull().default(0),
+}, (t) => ({
+  bySource: uniqueIndex('plugin_usage_subjects_source_idx').on(t.stableKey),
+  byBinding: index('plugin_usage_subjects_binding_idx').on(t.ghostId, t.bindingRevision),
+}));
+
+/** Dispatch facts only: no arguments, response bodies, credentials or title snapshots. */
+export const pluginUsageEvents = sqliteTable('plugin_usage_events', {
+  callId: text('call_id').primaryKey(),
+  subjectId: text('subject_id').notNull().references(() => pluginUsageSubjects.id),
+  historyGeneration: integer('history_generation').notNull(),
+  occurredAt: integer('occurred_at').notNull(),
+  toolName: text('tool_name').notNull(),
+  sessionId: text('session_id'),
+  version: text('version'),
+  releaseId: text('release_id'),
+  outcome: text('outcome').notNull().default('unknown'),
+  reportTarget: text('report_target'),
+  reportState: text('report_state').notNull().default('not-applicable'),
+  nextAttemptAt: integer('next_attempt_at'),
+  attemptCount: integer('attempt_count').notNull().default(0),
+}, (t) => ({
+  byTime: index('plugin_usage_events_time_idx').on(t.subjectId, t.occurredAt),
+  byTask: index('plugin_usage_events_task_idx').on(t.subjectId, t.sessionId, t.occurredAt),
+  pendingReports: index('plugin_usage_events_pending_idx').on(t.nextAttemptAt, t.occurredAt).where(sql`${t.reportState} = 'pending'`),
+}));
+
 /** Per-profile authority journal. Snapshots are recovery/audit data, not offline grants. */
 export const sharedTaskEvents = sqliteTable('shared_task_events', {
   id: integer('id').primaryKey({ autoIncrement: true }),
@@ -48,6 +88,7 @@ const SESSION_SOURCES = [
   'scheduler',
   'learn',
   'review',
+  'side-chat',
   'shared',
   'plugin',
   'bot',
@@ -70,6 +111,8 @@ export const sessions = sqliteTable(
       .notNull()
       .default('project'),
     model: text('model').notNull().default('claude-sonnet-4-6'),
+    /** Owner's selection while an automation temporarily uses another runtime. */
+    scheduledModelBaseline: text('scheduled_model_baseline'),
     effort: text('effort', {
       enum: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
     })
@@ -377,7 +420,8 @@ export const botSessionLinks = sqliteTable(
       .references(() => sessions.id, { onDelete: 'cascade' }),
     /** ProfileVersion pinned when this Session became canonical/delegation-linked. */
     profileVersion: integer('profile_version').notNull().default(1),
-    role: text('role', { enum: ['canonical', 'history', 'delegation', 'group'] }).notNull(),
+    // TS-only enum (SQLite `text`, no CHECK): `channel` = 伙伴接管的个人 IM 群 / 话题专线。
+    role: text('role', { enum: ['canonical', 'history', 'delegation', 'group', 'channel'] }).notNull(),
     routeKey: text('route_key'),
     createdAt: integer('created_at').notNull(),
     archivedAt: integer('archived_at'),

@@ -69,6 +69,22 @@ export function hasLearningEvidence(
   );
 }
 
+/**
+ * 按序累加,遇到第一个放不下的就停:返回的是连续前缀,供缺口回补据此推进覆盖水位
+ * (跳过中间一条就不能说"连续处理到了这里")。
+ */
+export function learningSnapshotPrefix<T>(records: readonly T[], maxChars: number): T[] {
+  const selected: T[] = [];
+  let remaining = maxChars;
+  for (const record of records) {
+    const size = JSON.stringify(record).length;
+    if (size > remaining) break;
+    selected.push(record);
+    remaining -= size;
+  }
+  return selected;
+}
+
 /** Keep whole records within the review budget; omitted records can never be overwritten. */
 export function learningSnapshotBudget<T>(records: readonly T[], maxChars: number): T[] {
   const selected: T[] = [];

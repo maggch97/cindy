@@ -3,10 +3,13 @@
  * 组只是「这台电脑上这个供应商」的一项设置，没有账号级的组(docs/product-rules/provider-groups.md §3)。
  */
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 
 import { activeOwnerScopeKey, ownerScopedUserDataPath } from '../appSessionState.js';
 import { desktopMakerLogger } from '../maker-host/logger-adapter.js';
 import { createOverrideSettingsFile } from '../maker-host/override-settings-file.js';
+import { throwIpcError } from '../utils/ipcValidate.js';
+import { captureProviderManagementScope, withProviderGroupMutation } from './managementScope.js';
 import {
   isProviderGroupProviderId,
   normalizeProviderGroupConfig,
@@ -15,8 +18,17 @@ import {
 
 interface ProviderGroupFile {
   groups: Record<string, ProviderGroupConfig>;
+  /** 组修改已提交但绑定可能尚未解除；重新加入也不能撤销这次清理。 */
+  bindingCleanups?: Record<string, ProviderGroupBindingCleanup>;
   /** 分享来的电脑离开全部组后，等空名单确认再删除；代次防止迟到确认吞掉再次移出的清理。 */
   reshareCleanups?: Record<string, string>;
+}
+
+export interface ProviderGroupBindingCleanup {
+  token: string;
+  /** 多次移出取交集，null 表示整组删除；不能被后续重新加入覆盖。 */
+  keepMemberKeys: string[] | null;
+  at: number;
 }
 
 /** 防止损坏文件无限膨胀的存储边界，远高于实际用量。 */
@@ -40,7 +52,23 @@ function normalize(raw: unknown): ProviderGroupFile {
       }
     }
   }
-  return { groups: out, ...(Object.keys(reshareCleanups).length > 0 ? { reshareCleanups } : {}) };
+  const bindingCleanups: Record<string, ProviderGroupBindingCleanup> = {};
+  if (source?.bindingCleanups && typeof source.bindingCleanups === 'object' && !Array.isArray(source.bindingCleanups)) {
+    for (const [providerId, cleanup] of Object.entries(source.bindingCleanups)) {
+      if (!isProviderGroupProviderId(providerId) || !cleanup || typeof cleanup !== 'object') continue;
+      const { token, keepMemberKeys, at } = cleanup;
+      if (typeof token !== 'string' || !/^[0-9a-f-]{36}$/.test(token)) continue;
+      if (typeof at !== 'number' || !Number.isFinite(at) || at <= 0) continue;
+      if (keepMemberKeys !== null && (!Array.isArray(keepMemberKeys)
+        || !keepMemberKeys.every((key) => typeof key === 'string' && /^[A-Za-z0-9_.:-]{1,300}$/.test(key)))) continue;
+      bindingCleanups[providerId] = { token, keepMemberKeys, at };
+    }
+  }
+  return {
+    groups: out,
+    ...(Object.keys(reshareCleanups).length > 0 ? { reshareCleanups } : {}),
+    ...(Object.keys(bindingCleanups).length > 0 ? { bindingCleanups } : {}),
+  };
 }
 
 /** 同一分享可能同时加入几个组；最后一个引用移出时才清空这台电脑的转分享名单。 */
@@ -78,10 +106,18 @@ export function listProviderGroups(): Record<string, ProviderGroupConfig> {
 export async function writeProviderGroup(
   providerId: string,
   config: unknown,
+  expectedConfig?: ProviderGroupConfig | null,
 ): Promise<ProviderGroupConfig | null> {
+  const assertCurrent = captureProviderManagementScope();
   if (!isProviderGroupProviderId(providerId)) throw new Error('Invalid provider id');
   const normalized = config === null ? null : normalizeProviderGroupConfig(config, providerId);
-  const next = await store.updateAtomic(({ value }) => {
+  const expected = expectedConfig === undefined ? undefined : normalizeProviderGroupConfig(expectedConfig, providerId);
+  const next = await withProviderGroupMutation(() => store.updateAtomic(({ value }) => {
+    assertCurrent();
+    // 必须在已有跨进程写锁内重读并比较，不能在等待目录或写锁前检查后再无条件覆盖。
+    if (expected !== undefined && !isDeepStrictEqual(value.groups[providerId] ?? null, expected)) {
+      throwIpcError('PROVIDER_GROUP_CHANGED', 'The provider group changed while it was being edited');
+    }
     const groups = { ...value.groups };
     if (normalized) groups[providerId] = normalized;
     else delete groups[providerId];
@@ -90,10 +126,41 @@ export async function writeProviderGroup(
     for (const device of sharedDevices(value.groups)) {
       if (!remaining.has(device)) reshareCleanups[device] = randomUUID();
     }
+    const bindingCleanups = { ...value.bindingCleanups };
+    const keep = normalized?.members.map((member) => member.key) ?? null;
+    if (keep === null || value.groups[providerId]?.members.some((member) => !keep.includes(member.key))) {
+      const previousKeep = bindingCleanups[providerId]?.keepMemberKeys;
+      bindingCleanups[providerId] = {
+        token: randomUUID(),
+        keepMemberKeys: previousKeep === null || keep === null
+          ? null
+          : previousKeep === undefined ? keep : keep.filter((key) => previousKeep.includes(key)),
+        at: Date.now(),
+      };
+    }
     // 与移出组同一把锁、同一次原子替换：崩溃、离线、重新加入都不能丢掉清空旧同意的意图。
-    return { groups, reshareCleanups };
-  });
+    return { groups, reshareCleanups, bindingCleanups };
+  }));
+  assertCurrent();
   return next.groups[providerId] ?? null;
+}
+
+export function listProviderGroupBindingCleanups(): Readonly<Record<string, ProviderGroupBindingCleanup>> {
+  store.invalidateIfChanged();
+  return store.read().bindingCleanups ?? {};
+}
+
+/** 绑定与解除记录已经原子提交，只确认本次清理；迟到回执不清掉下一次移出的意图。 */
+export async function completeProviderGroupBindingCleanup(providerId: string, token: string): Promise<void> {
+  const assertCurrent = captureProviderManagementScope();
+  await store.updateAtomic(({ value }) => {
+    assertCurrent();
+    if (value.bindingCleanups?.[providerId]?.token !== token) return {};
+    const bindingCleanups = { ...value.bindingCleanups };
+    delete bindingCleanups[providerId];
+    return { bindingCleanups };
+  });
+  assertCurrent();
 }
 
 /** 在同一把写锁内基于最新组配置做最小更新；更新器返回 undefined 表示放弃写入。 */

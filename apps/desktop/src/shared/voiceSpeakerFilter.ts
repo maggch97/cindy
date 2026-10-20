@@ -5,6 +5,8 @@
  * encrypted per account, and the renderer only ever sees whether one exists.
  */
 
+import { SPEAKER_ENROLLMENT_MAX_CLIP_SEC } from '@cindy/voice-input-core';
+
 export const VOICE_SPEAKER_FILTER_CHANNELS = {
   getStatus: 'voice-input:speaker:get-status',
   downloadModels: 'voice-input:speaker:download-models',
@@ -32,9 +34,9 @@ export type VoiceSpeakerFilterStatus = {
 /** Read-aloud clips collected during enrollment. */
 export const VOICE_SPEAKER_ENROLLMENT_CLIP_COUNT = 3;
 /** Each clip is PCM16 mono 16 kHz; anything longer is rejected by main. */
-export const VOICE_SPEAKER_ENROLLMENT_MAX_CLIP_SEC = 20;
+export const VOICE_SPEAKER_ENROLLMENT_MAX_CLIP_SEC = SPEAKER_ENROLLMENT_MAX_CLIP_SEC;
 /** Recording UI stops each clip automatically after this long. */
-export const VOICE_SPEAKER_ENROLLMENT_TARGET_CLIP_SEC = 6;
+export const VOICE_SPEAKER_ENROLLMENT_TARGET_CLIP_SEC = SPEAKER_ENROLLMENT_MAX_CLIP_SEC;
 
 export type VoiceSpeakerEnrollRequest = {
   /** PCM16 little-endian mono 16 kHz clips. */

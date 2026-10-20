@@ -27,7 +27,7 @@ export interface ViewerClipboardFailure {
   code: string;
   /** Status key for the viewer window; null keeps whatever is shown. */
   notice: string | null;
-  /** Milliseconds until the next attempt; null waits for an explicit retry. */
+  /** Milliseconds until the next attempt; null waits for focus or a copy/paste wakeup. */
   delay: number | null;
   /** Settles by itself (locked computer, a copy mid-read); never grows the backoff. */
   transient: boolean;
@@ -70,9 +70,8 @@ export class ViewerSafety {
   idle(): Promise<void> {
     return this.settled;
   }
-  /** Regained focus or a copy/paste: retry now, unless sync waits for a permission. */
+  /** User returned or copied/pasted: permissions may have changed in Settings. */
   wake(): void {
-    if (this.retryAt === Infinity) return;
     this.retryAt = 0;
     this.failures = 0;
   }
@@ -80,6 +79,7 @@ export class ViewerSafety {
   private localReadCache: LocalClipboardReadCache = {};
   private applied = new Map<string, boolean>();
   private notices = new Map<string, string>();
+  private clipboardNoticeVersion = 0;
   private retryAt = 0;
   private failures = 0;
   private privacyActive = false;
@@ -105,17 +105,11 @@ export class ViewerSafety {
         this.notices.get('clipboardSync') ??
         null,
       clipboardProgress: null,
+      clipboardNoticeVersion: this.clipboardNoticeVersion,
     };
   }
   private recordClipboardFailure(error: unknown): void {
     const failure = viewerClipboardFailure(error, this.failures);
-    if (failure.code === 'CLIPBOARD_CONFLICT') {
-      // Preserve counters so an idle poll cannot choose a winner. Forget the
-      // conflicting digests so the next copy selects that side even when its
-      // content is unchanged; a successful transfer restores normal deduping.
-      delete this.baseline.localDigest;
-      delete this.baseline.remoteDigest;
-    }
     if (!failure.transient) this.failures++;
     // Only the computer refusing sync needs it re-enabled; a local helper failure does not.
     if (failure.code === 'DESKTOP_CLIPBOARD_UNAVAILABLE') this.applied.delete('clipboardSync');
@@ -218,11 +212,21 @@ export class ViewerSafety {
         readLocal: () => local(options.clipboard!.read(current)),
         writeLocal: (json, version) => local(options.clipboard!.write(json, version, current)),
         localReadCache: this.localReadCache,
-        trace: (stage) => {
+        trace: (stage, code) => {
           if (!valid()) return;
-          if (stage === 'content-skipped')
-            this.notices.set('clipboardSync', 'clipboardSyncSkipped');
-          else if (['phone-to-computer-complete', 'computer-to-phone-complete'].includes(stage))
+          if (stage === 'content-skipped') {
+            this.notices.set(
+              'clipboardSync',
+              code === 'CLIPBOARD_TOO_LONG' ? 'clipboardSyncTooLarge' : 'clipboardSyncSkipped',
+            );
+          } else if (
+            [
+              'phone-to-computer-complete',
+              'computer-to-phone-complete',
+              'unchanged-content',
+              'content-empty',
+            ].includes(stage)
+          )
             this.notices.delete('clipboardSync');
         },
         digest: (json) => {
@@ -236,6 +240,7 @@ export class ViewerSafety {
     );
     // Authority changes stop pending reads. Their late results must not count
     // as sync failures for the next control session.
+    const { local: previousLocal, remote: previousRemote } = this.baseline;
     try {
       await engine.tick();
       if (current()) {
@@ -251,6 +256,16 @@ export class ViewerSafety {
       if (!current()) return this.snapshot();
       this.recordClipboardFailure(error);
     }
+    // Count accepted snapshots once, after skipped-content can become a conflict.
+    // Idle polls, backoff and rejected/stale reads must not replay the old toast.
+    if (
+      current() &&
+      (this.baseline.local !== previousLocal || this.baseline.remote !== previousRemote) &&
+      ['clipboardSyncSkipped', 'clipboardSyncTooLarge', 'clipboardSyncConflict'].includes(
+        this.notices.get('clipboardSync') ?? '',
+      )
+    )
+      this.clipboardNoticeVersion++;
     return this.snapshot();
   }
 }

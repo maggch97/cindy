@@ -24,6 +24,8 @@
  *
  * 边界:远程会话(remoteHostId)仍不支持切换(UNSUPPORTED_CAPABILITY)。Orca Lead/Worker
  * 复用同一交接与停泊事务，协同身份由 vendorOptions/DB 在重建时恢复。
+ * Orca Lead 的 Agent 在另一台电脑时，关闭旧远程会话若因链路失败(离线/不可达/超时/拥塞/无响应)
+ * 而没送到对方，不挡住 Lead 离开那台电脑；其它错误仍原样抛出。
  * turn 进行中登记 pending 推迟到下一条消息发送时刻执行。
  *
  * 远程 Agent 换电脑(agentDeviceId 变化,null = 任务所在电脑):原生会话记录在原来运行 Agent
@@ -51,6 +53,40 @@ function throwIfAgentSwitchAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) {
     throw new Error('agent switch aborted');
   }
+}
+
+/**
+ * closeSession 失败时仍可切回本机的链路错误码。两侧都认：
+ * 裸码 = main→main 经 remoteAgentLinkError 保留的 DeviceLinkError.code；
+ * DEVICE_LINK_* = ipc.ts DEVICE_LINK_CODE_MAP 给 renderer 的映射名（消息里的前缀）。
+ * 不认：REMOTE_DISABLED / CHANNEL_NOT_ALLOWED / ACCESS_REVOKED / VERSION_MISMATCH / 裸 TIMEOUT / 无 code 的 REMOTE_AGENT_UNAVAILABLE。
+ * 改这里时对照 apps/desktop/src/main/device-link/ipc.ts 的 DEVICE_LINK_CODE_MAP。
+ */
+const AGENT_SWITCH_LINK_CLOSE_CODES = new Set([
+  'DEVICE_OFFLINE',
+  'INVOKE_TIMEOUT',
+  'DEVICE_UNRESPONSIVE',
+  'NOT_CONNECTED',
+  'LINK_NOT_OPEN',
+  'PEER_RESET',
+  'BACKPRESSURE',
+  'DEVICE_LINK_DEVICE_OFFLINE',
+  'DEVICE_LINK_TIMEOUT',
+  'DEVICE_LINK_DEVICE_UNRESPONSIVE',
+  'DEVICE_LINK_NOT_CONNECTED',
+  'DEVICE_LINK_BUSY',
+]);
+
+function agentSwitchLinkCloseErrorCode(error: unknown): string | null {
+  const tokens = new Set<string>();
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === 'string' && code) tokens.add(code);
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  for (const match of message.matchAll(/\[([A-Z_]+)\]/g)) tokens.add(match[1]!);
+  for (const token of tokens) {
+    if (AGENT_SWITCH_LINK_CLOSE_CODES.has(token)) return token;
+  }
+  return null;
 }
 
 /** Phase 2:目标引擎的停泊原生会话绑定(localDb findParkedEngineSession 的投影)。 */
@@ -329,6 +365,8 @@ export interface PendingAgentSwitchIntent {
    * 落地时不给任务打「脱离跟随」标记。用户 picker 选择不带此标(PR #5155)。
    */
   configStaged?: boolean;
+  /** Auto 跟随登记时验证的两端身份；仅内存使用，目录移除来源后仍可撤销/改登记。 */
+  cindyAutoRelocation?: { fromProviderId: string; targetProviderId: string };
   /** SET_MODEL intent: apply the route without a cross-engine handoff. */
   sameAgentSelection?: boolean;
   targetAgentKind: AgentKind;
@@ -356,6 +394,13 @@ export interface PendingAgentSwitchIntent {
      */
     handoffClearEpoch?: number;
   };
+}
+
+/** 用户 picker 意图的统一来源判据；引擎与执行电脑是否改变不影响归属。 */
+export function isUserPendingAgentSwitchIntent(
+  intent: PendingAgentSwitchIntent | undefined,
+): intent is PendingAgentSwitchIntent {
+  return !!intent && intent.configStaged !== true && intent.runtimeSource !== 'agent';
 }
 
 /** 控制端可见的 pending intent 投影；刻意排除 main 内部恢复载荷。 */
@@ -863,10 +908,25 @@ export async function performSessionAgentSwitch(
     handoff = buildFullHandoff();
   }
 
+  // Orca Lead 的 Agent 在另一台电脑时,旧远程 Session 的 close 请求可能因对方不可达而没送到;
+  // 这种链路失败不该挡住 Lead 离开那台电脑(普通任务与 Worker 的关闭失败语义不变)。
+  const orcaLeadLeavingRemote = row.orcaRole === 'lead' && currentAgentDeviceId !== null;
+
   return deps.withCloseSuppressed(sessionId, async () => {
     throwIfAgentSwitchAborted(signal);
     if (live) {
-      await deps.closeSession(sessionId);
+      try {
+        await deps.closeSession(sessionId);
+      } catch (error) {
+        const linkCode = orcaLeadLeavingRemote ? agentSwitchLinkCloseErrorCode(error) : null;
+        if (!linkCode) throw error;
+        // 旧远程 Session 的 close 已在本地 finish/dispose；链路失败只表示 close 请求没送到对方。
+        // Maker 把该实例标成 error 仍占 activeSessions，bootstrap/lazy-create 会再 close 一次后换新。
+        deps.log.warn('agent-switch: close failed while an orca lead leaves its remote computer; continuing', {
+          sessionId,
+          code: linkCode,
+        });
+      }
     }
 
     // 停用轴:提交点重裁决(PR #744 review 第十五轮)—— parked 数据加载、handoff
@@ -1115,7 +1175,7 @@ async function noteLandedUserRouteSelection(
   sessionId: string,
   intent: PendingAgentSwitchIntent,
 ): Promise<void> {
-  if (intent.configStaged === true || intent.runtimeSource === 'agent') return;
+  if (!isUserPendingAgentSwitchIntent(intent)) return;
   try {
     await deps.onUserRouteSelectionLanded?.(sessionId);
   } catch (err) {

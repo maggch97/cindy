@@ -176,8 +176,9 @@ export interface BotGroupMessageView {
   threadShare?: BotGroupThreadShareView;
 }
 
-/** A root message previews at most this many of its newest replies. */
+/** Spoken summaries and distinct responders have independent limits. */
 export const BOT_GROUP_THREAD_PREVIEW_REPLIES = 2;
+export const BOT_GROUP_THREAD_PREVIEW_RESPONDERS = 3;
 
 /**
  * Main-chat share of a thread reply. The card stores only the two IDs; clients resolve the
@@ -239,6 +240,8 @@ export interface BotGroupThreadPreviewReply {
 export interface BotGroupThreadPreview {
   /** Chronological, newest last. */
   replies: BotGroupThreadPreviewReply[];
+  /** Distinct server authors from the fetched window, oldest last-reply first. Older hosts omit this. */
+  responders?: Array<Pick<BotGroupThreadPreviewReply, 'id' | 'authorKind' | 'authorBotId' | 'authorName'>>;
 }
 
 /**
@@ -330,6 +333,8 @@ export interface BotGroupPlanStepView {
   botName: string;
   task: string;
   status: BotGroupPlanStepStatus;
+  /** The step's latest hand-off message (a redo replaces it); absent where the host does not report it. */
+  resultMessageId?: string | null;
 }
 
 export interface BotGroupPlanView {
@@ -418,6 +423,12 @@ export interface BotGroupSummary {
   lastMessage: BotGroupLastMessage | null;
   /** Latest visible incoming message (Bot or another human), excluding self and runtime activity. Older hosts omit it. */
   lastReplyAt?: number;
+  /**
+   * ISO `createdAt` of the newest (up to 99) messages from someone else — Bots and other people,
+   * not this account, notices, round/plan endings or system events — oldest first. Derived from
+   * the messages the host already read. Older hosts omit it.
+   */
+  incomingMessageTimes?: string[];
   speakingBotIds: string[];
   /** The organizer while it works out a plan (sidebar 「正在安排」). */
   planningBotId: string | null;

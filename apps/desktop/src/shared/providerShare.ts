@@ -2,6 +2,9 @@
  * 供应商分享的 Renderer ↔ Main 契约(只在本机进程之间；服务端契约见
  * docs/provider-sharing-contract.md)。身份只有昵称与头像。
  */
+import type { RemoteAgentIdleRelease, RemoteAgentIdleReleaseView } from './remoteAgentIdleRelease';
+import type { RemoteAgentLimits, RemoteAgentLimitsView } from './remoteAgentLimits';
+
 import type {
   ProviderShareLinkPreview,
   ProviderShareMember,
@@ -10,6 +13,7 @@ import type {
   ProviderShareRequestState,
 } from '@cindy/device-link';
 import type { DataOwnerPushStamp } from './dataOwnerPush';
+import type { ProviderShareInsights, ProviderShareQuotaAccount, ProviderShareVisibility } from './providerShareInsights';
 
 /** 本机收藏清理依据。未加载、断线和账号切换的空列表不能用于撤权清理。 */
 export interface ProviderShareReceivedSnapshot {
@@ -83,6 +87,8 @@ export interface ProviderShareReshareView {
 }
 
 export interface ProviderShareMemberView extends ProviderShareMember {
+  /** 分享者给这个成员设置的备注；只用于管理页，不向受邀者公开。旧电脑可能缺省。 */
+  note?: string | null;
   lastUsedAt: number | null;
   runningTasks: number;
   models: ProviderShareModelUsageView[];
@@ -124,20 +130,60 @@ export interface ProviderOwnUsageView {
   relays: ProviderPartyUsageView[];
 }
 
+/** 按天明细里的一行：那台电脑本地日期的一天，按(Agent、供应商、模型、组内电脑)分行。 */
+export interface ProviderUsageDayView extends ProviderShareModelUsageView {
+  /** YYYY-MM-DD，供应商所在电脑的本地日期。 */
+  day: string;
+}
+
+/** 一个使用方按天的用量；最近使用时间与 own-usage / owned 同口径。 */
+export interface ProviderUsageHistoryPartyView {
+  lastUsedAt: number | null;
+  /** 新的日子在前。 */
+  days: ProviderUsageDayView[];
+}
+
+/**
+ * 「远程与分享」页「用量」块的按天明细(provider-groups.md §7)：时间段、使用方与组内电脑都由界面按天筛选，
+ * 与设置 → 用量同一种做法。日期一律是供应商所在电脑的本地日期，`todayKey` 是那台电脑的今天。
+ */
+export interface ProviderUsageHistoryView {
+  providerId: string;
+  todayKey: string;
+  /** 行数或 UTF-8 字节超出回包预算、裁掉较早行时，留下的最早一天；没有裁剪为 null。 */
+  coverageStart: string | null;
+  /** 你自己：本机与同账号其他电脑经这个供应商(组)的合计。 */
+  self: ProviderUsageHistoryPartyView;
+  /** 同账号的组所在电脑替它的受邀者转来的，每台一项(看不到最终使用者)。 */
+  relays: Array<ProviderUsageHistoryPartyView & { deviceId: string; deviceName: string | null }>;
+  /** 这个供应商的分享里现在的成员，按人。 */
+  members: Array<ProviderUsageHistoryPartyView & { shareId: string; memberId: string }>;
+}
+
 export interface ProviderShareOwnerState {
   /** 分享服务可用(已登录、设备互联已连上本区域服务)。 */
   ready: boolean;
   shares: ProviderShareOwnedView[];
+  /** 本机分享里、链接由同账号另一台电脑生成的申请：由那台弹审批窗，本机只在管理页与提示点显示。 */
+  quietRequestIds?: string[];
+  /** 本机为同账号另一台电脑上的分享生成链接后收到的申请：由本机弹审批窗，处理转交那台电脑。 */
+  watchedRequests?: ProviderShareRequestedEvent[];
 }
 
 export interface ProviderShareLinkCreated {
   link: string;
   expiresAt: string;
+  /** Non-secret per-link identifier; absent when the host or server predates exact approval routing. */
+  linkId?: string;
 }
 
 export interface ProviderShareRequestedEvent {
   request: ProviderShareRequestItem;
   share: { shareId: string; providerId: string; providerLabel: string };
+  /** 分享在同账号另一台电脑上(本机生成了链接，由本机弹窗)；本机的分享不带。 */
+  hostDeviceId?: string;
+  /** true = 链接由同账号另一台电脑生成，由那台弹窗，本机不弹。 */
+  quiet?: boolean;
 }
 
 export interface ProviderShareSettledEvent {
@@ -146,12 +192,26 @@ export interface ProviderShareSettledEvent {
 }
 
 export type ProviderShareCommand =
+  | { action: 'get-visibility'; providerId: string }
+  | { action: 'set-visibility'; providerId: string; visibility: Partial<ProviderShareVisibility> }
+  | { action: 'quota-account'; providerId: string }
+  | { action: 'insights'; shareId: string; includeUsage: boolean }
+  | { action: 'get-run-limits' }
+  | { action: 'reset-run-limits' }
+  | { action: 'set-run-limits'; limits: Partial<RemoteAgentLimits> }
+  /** 本机作为使用方的闲置让出设置；只在本机窗口可用，不进同账号管理通道。 */
+  | { action: 'get-idle-release' }
+  | { action: 'reset-idle-release' }
+  | { action: 'set-idle-release'; value: RemoteAgentIdleRelease }
   | { action: 'owned'; range: ProviderShareUsageRange }
   /** 这个供应商按使用方的用量(本机与我的其他电脑)。不依赖分享服务。 */
   | { action: 'own-usage'; providerId: string; range: ProviderShareUsageRange }
+  /** 这个供应商的用量按天明细(你自己、转来的与分享的人)，「用量」块据此按时间段、人与电脑筛选。 */
+  | { action: 'usage-history'; providerId: string }
   | { action: 'create-link'; providerId: string }
   | { action: 'approve' | 'reject'; requestId: string }
   | { action: 'set-member'; memberId: string; status: 'pause' | 'resume' | 'remove' }
+  | { action: 'set-member-note'; memberId: string; note: string }
   /** 转分享：同意或拒绝(拒绝已同意的 = 撤回)。 */
   | { action: 'reshare-decide'; id: string; decision: 'approve' | 'reject' }
   | { action: 'received' }
@@ -171,12 +231,24 @@ export interface ProviderShareCredentialConsentView {
 }
 
 export interface ProviderShareCommandResult {
+  'get-visibility': ProviderShareVisibility;
+  'set-visibility': ProviderShareVisibility;
+  'quota-account': ProviderShareQuotaAccount;
+  insights: ProviderShareInsights;
+  'get-run-limits': RemoteAgentLimitsView;
+  'set-run-limits': RemoteAgentLimitsView;
+  'reset-run-limits': RemoteAgentLimitsView;
+  'get-idle-release': RemoteAgentIdleReleaseView;
+  'set-idle-release': RemoteAgentIdleReleaseView;
+  'reset-idle-release': RemoteAgentIdleReleaseView;
   owned: ProviderShareOwnerState;
   'own-usage': ProviderOwnUsageView;
+  'usage-history': ProviderUsageHistoryView;
   'create-link': ProviderShareLinkCreated;
   approve: { ok: true };
   reject: { ok: true };
   'set-member': { ok: true };
+  'set-member-note': { ok: true };
   'reshare-decide': { ok: true };
   received: ProviderShareReceived[];
   'received-snapshot': ProviderShareReceivedSnapshot;

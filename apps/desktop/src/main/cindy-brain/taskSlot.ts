@@ -61,7 +61,8 @@ export function validPluginTaskRequest(value: unknown): value is PluginTaskReque
   if (kind === 'setHidden' && typeof value.hidden !== 'boolean') return false;
   if (value.hidden !== undefined && typeof value.hidden !== 'boolean') return false;
   if (['getRun', 'cancel'].includes(value.kind) && !requires('runId')) return false;
-  if (kind === 'setModel' && (!object(value.route) || !Number.isSafeInteger(value.expectedRevision) || (value.expectedRevision as number) < 0)) return false;
+  const pluginDefault = kind === 'setModel' && value.route === 'plugin-default';
+  if (kind === 'setModel' && ((!pluginDefault && !object(value.route)) || !Number.isSafeInteger(value.expectedRevision) || (value.expectedRevision as number) < 0)) return false;
   if (value.callId !== undefined && !text(value.callId, 128)) return false;
   if (value.isolatedWorkspace !== undefined && typeof value.isolatedWorkspace !== 'boolean') return false;
   if (value.kind === 'create' && !text(value.title, 100)) return false;
@@ -95,7 +96,7 @@ export function validPluginTaskRequest(value: unknown): value is PluginTaskReque
       labels.add(String(item.label));
     }
   }
-  if (value.route !== undefined) {
+  if (value.route !== undefined && !pluginDefault) {
     const r = value.route;
     if (
       !object(r) ||
@@ -154,6 +155,7 @@ export async function handlePluginTaskRequest(
         targets: ['own-plugin-local-session'],
         maxPageSize: 100,
         exactRoute: true,
+        pluginDefaultModel: true,
         sourceCallContext: true,
         hiddenTasks: declaresHiddenTasks(),
       },

@@ -61,6 +61,37 @@ if (capabilities.operations.includes('models')) {
 连接存在不等于远端凭证、配额和请求一定成功。保存、创建、发送／改模仍分别验证，错误应显示给用户，
 允许恢复连接或明确改选同一任务的模型；不得自动改成另一型号、另一个账号或清掉历史后重建。
 
+持续复用任务的插件若要在新输入前同步插件当前保存的模型设置，必须同时确认
+`capabilities.operations.includes('setModel')` 和 `capabilities.pluginDefaultModel === true`，
+再调用 `setModel({taskId, expectedRevision, route: 'plugin-default'})`。仅存在 `setModel`
+operation 不代表支持这个特殊 route；它只适用于 `setModel`，不能传给 `create`。
+
+```js
+let currentTask = await cindy.tasks.get({ taskId });
+if (capabilities.operations.includes('setModel') && capabilities.pluginDefaultModel === true) {
+  const result = await cindy.tasks.setModel({
+    taskId, expectedRevision: currentTask.revision, route: 'plugin-default',
+  });
+  currentTask = result.task;
+}
+// 仅用于尚未发送的新输入；之前已接受或结果不确定的输入须先恢复其原回执。
+const nextRun = await cindy.tasks.send({
+  taskId, expectedRevision: currentTask.revision, requestKey: nextRequestKey, text: nextText,
+});
+```
+
+Host 每次调用都重新读取本插件的模型设置，复用创建任务的模型解析规则；没有完整插件覆盖时
+可继承当前新任务选择。只同步模型、Agent、供应商、推理强度和 Fast，不修改权限、工作目录
+或任务历史。返回 `{status, task}`；组合相同返回 `unchanged`，不重复切换运行时。
+后续 `send.expectedRevision` 使用返回的 `task.revision`，不能继续使用切换前的 revision。
+
+解析或运行时写入前若任务 revision、插件模型偏好或所继承的新任务默认组合变化，会返回
+`STALE_REVISION`。调用方应重新 `get` 获取最新任务 revision，再重试同一次模型同步，成功后
+才发送新输入；不得沿用过期 route。该重试不授权重发已经接受或结果不确定的旧输入，旧输入
+仍按原 requestKey／run 回执恢复。不可用模型等其他错误应按原因处理，不静默换模型。
+旧 Host 未声明 `pluginDefaultModel: true` 时不发送该特殊 route，保留任务已有模型和原有发送
+流程；显式 `selected.route` 的调用契约不变。
+
 `setModel` 返回 `deferred` 时，当前执行仍按原模型完成，下一条输入才应用新组合。
 任务 `resolvedConfig` 与 revision 表示宿主已接受的下一条输入配置；在切换实际生效前后保持
 一致，避免先用旧模型登记发送回执、再因新模型生效而拒绝首条续发。读取历史不受切模影响。
@@ -82,6 +113,11 @@ if (capabilities.operations.includes('models')) {
 2026-10-01 确认的默认行为：新建任务沿用发起任务的模型；从面板直接新建时使用当前
 新任务选择；用户可为插件单独覆盖。模型、Agent、供应商、推理强度和 Fast 作为完整组合
 解析，绝不从另一 Agent 的历史草稿拼出一组值。权限独立设置，不随模型来源继承。
+
+插件可在 `ghost.json` 顶层声明 `showTaskPreferences: false`，隐藏 Desktop 和手机上的
+宿主「模型与任务」默认配置卡，并在自己的设置界面提供配置。省略或设为 `true` 保持原有显示条件。
+此字段仅控制卡片显示；以下任务 API、模型优先级、已有默认配置和权限检查全部保持原样。
+旧客户端不识别该字段时仍显示原卡片。
 
 | 入口 | 模型来源与复用 | 权限与结果 |
 | --- | --- | --- |

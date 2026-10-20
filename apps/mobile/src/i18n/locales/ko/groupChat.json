@@ -179,7 +179,7 @@
     "speakingMode": "발언 순서",
     "speakingModeAuto": "자동",
     "speakingModeSequential": "항상 차례대로",
-    "speakingModeAutoNote": "멘션이 없거나 @모두일 때는 첫 순서에서 모두 동시에 생각하고, 이후에는 차례대로 이어서 말합니다. 멘션한 동료는 멘션한 순서대로 답합니다.",
+    "speakingModeAutoNote": "멘션이 없거나 @모두이면 첫 라운드는 동시에 생각하고 이후에는 번갈아 답합니다. 동료를 멘션하면 멘션 순서대로 답합니다.",
     "speakingModeSequentialNote": "한 번에 한 동료만 말하며, 뒤에 말하는 동료는 앞의 답을 보고 답합니다.",
     "speakingModeSaveFailed": "발언 순서를 저장하지 못했습니다. 다시 시도해 주세요.",
     "setOrganizer": "담당자로 지정",

@@ -5,8 +5,22 @@
  * ipcMain.handle 只做 adapter),__tests__ 用内存 harness 直接调 handler body。
  */
 
+import { promises as pluginFileFs } from 'node:fs';
+import { PLUGIN_MEMBER_UPLOAD_MAX_ARCHIVE_BYTES } from '@cindy/plugin-protocol';
+import { capturePluginOauthPeer } from '../plugin-oauth/runtime.js';
+import { openRemotePluginSettings, closeRemotePluginSettings, answerRemotePluginSettingsDirectory } from '../cindy-brain/remotePluginSettingsController.js';
+import { REMOTE_PLUGIN_SETTINGS_OPEN, REMOTE_PLUGIN_SETTINGS_CLOSE, REMOTE_PLUGIN_SETTINGS_DIRECTORY_ANSWER } from '../../shared/remotePluginSettings.js';
+import {
+  REMOTE_RESOURCE_MANIFEST_CHANNEL,
+  REMOTE_RESOURCE_INVOKE_CHANNEL,
+  REMOTE_RESOURCE_PROTOCOL_VERSION,
+  isProviderSharePeer,
+} from '@cindy/device-link';
+import { confirmRemoteSkillMutation, isRemoteSkillApproval } from './remoteSkillConfirmation';
+import { t } from '../i18n';
 import { createHash, randomBytes } from 'node:crypto';
-import { ipcMain, shell, clipboard } from 'electron';
+import { ipcMain, shell, clipboard, dialog, BrowserWindow } from 'electron';
+import { MCP_APPS_INVOKE } from '../../shared/mcpApps.js';
 import { currentOauthIdentityScope, trustOauthPeer } from '../plugin-oauth/desktopIdentity.js';
 import { RemotePluginOauthUnsupportedError, resolveOauthPeerIdentity } from '../plugin-oauth/identityResolver.js';
 import { getDeviceId } from '../authManager.js';
@@ -64,6 +78,7 @@ import {
 } from './index';
 import { getActiveControllers } from './dispatch';
 import { rewriteOutboundMedia, withPeerAttachmentUpload } from './outboundMedia';
+import { createSentImageRetainer } from './remoteMediaPersistentCache';
 import { withOutboundReviewConfirmation } from '../maker-ipc/reviewOutboundInput.js';
 import { confirmReviewArtifacts } from '../reviewer/confirmReviewArtifacts.js';
 import { tryUploadPeerAttachment } from './filePeer';
@@ -132,7 +147,7 @@ export interface DeviceLinkIpcDeps {
   apiFetch<T>(path: string, opts?: { method?: string; body?: unknown }): Promise<T>;
   openLink(deviceId: string): Promise<LinkAcceptPayload>;
   closeLink(deviceId: string): void;
-  invoke(deviceId: string, channel: string, args: unknown[]): Promise<InvokeResultPayload>;
+  invoke(deviceId: string, channel: string, args: unknown[], options?: { background?: boolean }): Promise<InvokeResultPayload>;
   /** 分享者电脑的只读请求：先建后台链路再发(relay 只在建链时登记受邀者的电脑)。缺省时用 invoke。 */
   invokeProviderShareHost?(target: string, channel: string, args: unknown[]): Promise<InvokeResultPayload>;
   subscribe(deviceId: string, topics: string[]): Promise<InvokeResultPayload>;
@@ -375,8 +390,7 @@ export function handleListDevices(
   const directoryRequestSequence = deps.beginControllerDisplayNameDirectoryRefresh();
   const requestEpoch = deps.captureControllerDisplayNameRequestEpoch();
   const presenceRequestEpoch = deps.captureControllerPresenceRequestEpoch();
-  let request!: Promise<DeviceListResult>;
-  request = deps.apiFetch<{ devices: DeviceLinkServerDeviceView[] }>(
+  const request = deps.apiFetch<{ devices: DeviceLinkServerDeviceView[] }>(
     '/api/device-link/devices',
   ).then(
     async (result) => {
@@ -593,6 +607,7 @@ export async function handleInvoke(
   deviceId: unknown,
   channel: unknown,
   args: unknown,
+  scheduling?: unknown,
 ): Promise<unknown> {
   if (typeof deviceId !== 'string' || !deviceId.trim()) {
     throwIpcError('INVALID_PARAMS', 'deviceId is required');
@@ -602,6 +617,9 @@ export async function handleInvoke(
   if (typeof channel !== 'string' || !channel.trim()) {
     throwIpcError('INVALID_PARAMS', 'channel is required');
   }
+  // App RPCs require the dedicated Main/frame binding, including for remote cards.
+  // Never forward Renderer-supplied View IDs through the general preload bridge.
+  if (channel === MCP_APPS_INVOKE) throwIpcError('PERMISSION_DENIED', 'MCP_APP_FRAME_REQUIRED');
   if (channel === PLUGIN_OAUTH_CHANNEL || channel === PLUGIN_SECRET_LOCAL_CHANNEL || channel === PLUGIN_CONNECTION_LOCAL_CHANNEL
     || channel === INPUT_HANDOFF_LOCAL_CHANNEL || channel === INPUT_HANDOFF_REMOTE_LOCAL_CHANNEL
     || channel === INPUT_HANDOFF_LOCAL_PICTURE_CHANNEL || channel === INPUT_HANDOFF_REMOTE_PICTURE_CHANNEL
@@ -704,7 +722,8 @@ export async function handleInvoke(
       }
       callArgs = await withPeerAttachmentUpload((source, mime) => peer ? Promise.resolve(null) : tryUploadPeerAttachment(normalizedDeviceId, source, mime, deps.invoke), () =>
         withSharedTaskMedia(peer?.role === 'host' ? peer.sharedTaskId : undefined,
-          () => existing ? deps.rewriteOutboundMedia!(channel, callArgs, existing) : deps.rewriteOutboundMedia!(channel, callArgs)));
+          () => existing ? deps.rewriteOutboundMedia!(channel, callArgs, existing) : deps.rewriteOutboundMedia!(channel, callArgs)),
+        createSentImageRetainer(normalizedDeviceId));
      } catch (err) {
        if (isIpcError(err) && err.code === 'DEVICE_LINK_CHANNEL_NOT_ALLOWED') {
          throw err;
@@ -730,7 +749,12 @@ export async function handleInvoke(
 
   let result: InvokeResultPayload;
   try {
-    result = await deps.invoke(normalizedDeviceId, channel, callArgs);
+    // Local admission hint only: never forward this field or change authorization.
+    const background = scheduling && typeof scheduling === 'object'
+      && 'background' in scheduling && scheduling.background === true;
+    result = background
+      ? await deps.invoke(normalizedDeviceId, channel, callArgs, { background: true })
+      : await deps.invoke(normalizedDeviceId, channel, callArgs);
   } catch (err) {
     rethrowDeviceLinkError(err);
   }
@@ -1410,8 +1434,8 @@ export async function retryUnsubscribeAfterWindowGone(
 
 export function registerDeviceLinkIpc(deps: DeviceLinkIpcDeps = defaultDeps()): void {
   const diagnosticsLog = createLogger('device-link:ipc-diagnostics');
-  const diagnostics = createDeviceLinkIpcDiagnostics((event, fields) =>
-    diagnosticsLog.info(event, fields),
+  const diagnostics = createDeviceLinkIpcDiagnostics((event, fields, level) =>
+    level === 'debug' ? diagnosticsLog.debug(event, fields) : diagnosticsLog.info(event, fields),
   );
   // Submit the final partial interval at shutdown start, giving the async log
   // writer the subsequent cleanup phases to drain before app.exit().
@@ -1430,6 +1454,104 @@ export function registerDeviceLinkIpc(deps: DeviceLinkIpcDeps = defaultDeps()): 
     const scope = deviceCodeScope(event);
     try { return await deviceCodes.handle(scope, raw); }
     catch { throwIpcError('PRECONDITION_FAILED', 'Authorization code unavailable; retry from the current card'); }
+  });
+  const skillConfirmations = new Set<number>();
+  ipcMain.handle('device-link:confirm-skill-mutation', async (event, raw: unknown) => {
+    assertTrustedAppRendererEvent(event);
+    requireDeviceLinkCapability();
+    const request = (raw ?? {}) as { deviceId?: unknown; operationId?: unknown };
+    const deviceId = requireString(request.deviceId, 'deviceId');
+    const operationId = requireString(request.operationId, 'operationId');
+    if (
+      deviceId.length > 256 || operationId.length > 64 || parseSharedTaskPeer(deviceId) ||
+      isProviderSharePeer(deviceId) || deviceId === getDeviceId()
+    ) throwIpcError('INVALID_PARAMS', 'Expected a same-account computer');
+    const owner = activeOwnerScopeKey();
+    const peerCurrent = capturePluginOauthPeer(deviceId);
+    const parent = BrowserWindow.fromWebContents(event.sender);
+    if (!parent || parent.isDestroyed() || skillConfirmations.has(event.sender.id)) {
+      throwIpcError('PRECONDITION_FAILED', 'Skill confirmation unavailable');
+    }
+    let navigated = false;
+    const invalidate = () => { navigated = true; };
+    event.sender.on('did-start-navigation', invalidate);
+    const current = () => {
+      peerCurrent();
+      assertTrustedAppRendererEvent(event);
+      assertControlTargetEnabled(deps, deviceId);
+      if (
+        navigated || parent.isDestroyed() || event.sender.isDestroyed() ||
+        isAppSessionBoundaryPending() || owner !== activeOwnerScopeKey()
+      ) throwIpcError('PRECONDITION_FAILED', 'Skill confirmation expired');
+    };
+    skillConfirmations.add(event.sender.id);
+    try {
+      return await confirmRemoteSkillMutation({
+        current,
+        invoke: async (action, input) => {
+          const response = await deps.invoke(deviceId, REMOTE_RESOURCE_INVOKE_CHANNEL, [{
+            collectionId: 'skills', actionId: `management:${action}`,
+            client: { protocolVersion: REMOTE_RESOURCE_PROTOCOL_VERSION, primitives: [] }, input,
+          }]);
+          if (!response.ok) throwIpcError('PRECONDITION_FAILED', 'Skill confirmation unavailable');
+          return (response.result as { result?: unknown })?.result;
+        },
+        prompt: async facts => {
+          const device = deps.readLastKnownDeviceNames()[deviceId] ?? deviceId;
+          const message = t(`skillhub.remote.confirm.${facts.kind}`)
+            .replace('{{name}}', () => facts.name)
+            .replace('{{device}}', () => device)
+            .replace('{{version}}', () => facts.version ?? '');
+          const detail = facts.kind === 'uninstall'
+            ? t(facts.linkOnly ? 'skillhub.management.unlinkDescription' : 'skillhub.management.trashDescription')
+            : t('skillhub.remote.confirm.installDescription');
+          const { response } = await dialog.showMessageBox(parent, {
+            type: 'warning', title: message, message, detail,
+            buttons: [t('commonUi.confirmDialog.confirm'), t('commonUi.confirmDialog.cancel')],
+            defaultId: 1, cancelId: 1, noLink: true,
+          });
+          return response === 0;
+        },
+      }, operationId);
+    } finally {
+      skillConfirmations.delete(event.sender.id);
+      event.sender.removeListener('did-start-navigation', invalidate);
+    }
+  });
+  // The native picker grants only this file; no renderer-supplied filesystem path.
+  ipcMain.handle('device-link:pick-plugin-package', async (event, raw: unknown) => {
+    assertTrustedAppRendererEvent(event);
+    requireDeviceLinkCapability();
+    const deviceId = requireString(raw, 'deviceId');
+    if (parseSharedTaskPeer(deviceId) || isProviderSharePeer(deviceId) || deviceId === getDeviceId()) throwIpcError('INVALID_PARAMS', 'Expected a same-account target computer');
+    const owner = activeOwnerScopeKey(), peerCurrent = capturePluginOauthPeer(deviceId);
+    const assertCurrent = () => {
+      peerCurrent(); assertTrustedAppRendererEvent(event);
+      if (event.sender.isDestroyed() || isAppSessionBoundaryPending() || owner !== activeOwnerScopeKey())
+        throwIpcError('PRECONDITION_FAILED', 'Plugin upload is no longer current');
+      assertControlTargetEnabled(deps, deviceId);
+    };
+    assertCurrent();
+    await deps.openLink(deviceId);
+    assertCurrent();
+    const caps = await deps.invoke(deviceId, REMOTE_RESOURCE_MANIFEST_CHANNEL, [{ client: { protocolVersion: REMOTE_RESOURCE_PROTOCOL_VERSION, primitives: [] } }]);
+    assertCurrent();
+    const manifest = caps.ok ? caps.result as { collections?: Array<{ id: string; actions?: Array<{ id: string }> }> } : null;
+    if (!manifest?.collections?.some(c => c.id === 'plugins' && c.actions?.some(a => a.id === 'management:snapshot')))
+      throwIpcError('UNSUPPORTED_CAPABILITY', 'Update Cindy on the target computer');
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const options = { filters: [{ name: t('settings.ghosts.detail.exportFileType'), extensions: ['cindy'] }], properties: ['openFile' as const] };
+    const picked = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options);
+    assertCurrent();
+    if (picked.canceled || picked.filePaths.length !== 1) return null;
+    const file = picked.filePaths[0];
+    const stat = await pluginFileFs.lstat(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > PLUGIN_MEMBER_UPLOAD_MAX_ARCHIVE_BYTES) throwIpcError('GHOST_FILE_INVALID', 'Invalid plugin file');
+    assertCurrent();
+    const attachment = await tryUploadPeerAttachment(deviceId, file, 'application/octet-stream', deps.invoke);
+    assertCurrent();
+    if (!attachment) throwIpcError('UNSUPPORTED_CAPABILITY', 'Secure plugin file transfer is unavailable');
+    return { attachment };
   });
   const localOauthDeps = (event: import('electron').IpcMainInvokeEvent): LocalOauthDeps => ({
     owner: () => !isAppSessionBoundaryPending() && getActiveAppSession().mode === 'cloud' ? activeOwnerScopeKey() : null,
@@ -1458,6 +1580,23 @@ export function registerDeviceLinkIpc(deps: DeviceLinkIpcDeps = defaultDeps()): 
       throwIpcError('UNSUPPORTED_CAPABILITY', 'Update Cindy on the remote device to use remote plugin authorization');
     throwIpcError('PRECONDITION_FAILED', 'Remote authorization unavailable; retry from the current card');
   };
+  ipcMain.handle(REMOTE_PLUGIN_SETTINGS_OPEN, async (event, raw: unknown) => {
+    assertTrustedAppRendererEvent(event);
+    try {
+      return await openRemotePluginSettings(event.sender, localOauthDeps(event), raw);
+    } catch {
+      throwIpcError('PRECONDITION_FAILED', 'Remote plugin settings unavailable');
+    }
+  });
+  ipcMain.handle(REMOTE_PLUGIN_SETTINGS_CLOSE, (event, id: unknown) => {
+    assertTrustedAppRendererEvent(event);
+    closeRemotePluginSettings(event.sender, id);
+  });
+  ipcMain.handle(REMOTE_PLUGIN_SETTINGS_DIRECTORY_ANSWER, async (event, raw: unknown) => {
+    assertTrustedAppRendererEvent(event);
+    try { await answerRemotePluginSettingsDirectory(event.sender, raw); }
+    catch { throwIpcError('PRECONDITION_FAILED', 'Remote plugin directory request unavailable'); }
+  });
   const authorizationHandler = (mode: 'oauth' | 'secret' | 'connection' | 'input') => async (event: import('electron').IpcMainInvokeEvent, raw: unknown) => {
     assertTrustedAppRendererEvent(event);
     requireDeviceLinkCapability();
@@ -1536,7 +1675,8 @@ export function registerDeviceLinkIpc(deps: DeviceLinkIpcDeps = defaultDeps()): 
   });
   ipcMain.handle(DEVICE_LINK_INVOKE.INVOKE, (e, payload: unknown) => {
     requireDeviceLinkCapability();
-    const p = (payload ?? {}) as { deviceId?: unknown; channel?: unknown; args?: unknown };
+    const p = (payload ?? {}) as { deviceId?: unknown; channel?: unknown; args?: unknown; scheduling?: unknown };
+    if (isRemoteSkillApproval(p.channel, p.args)) throwIpcError('PERMISSION_DENIED', 'Skill approval requires the native confirmation');
     if (typeof p.deviceId === 'string' && parseProviderShareAgentDeviceId(p.deviceId)) {
       assertTrustedAppRendererEvent(e);
       return handleProviderShareInvoke(deps, p.deviceId, p.channel, p.args);
@@ -1548,7 +1688,7 @@ export function registerDeviceLinkIpc(deps: DeviceLinkIpcDeps = defaultDeps()): 
         () => handleInvoke(diagnostics.forWindow(deps, e.sender.id), p.deviceId, p.channel, p.args),
       );
     }
-    return handleInvoke(diagnostics.forWindow(deps, e.sender.id), p.deviceId, p.channel, p.args);
+    return handleInvoke(diagnostics.forWindow(deps, e.sender.id), p.deviceId, p.channel, p.args, p.scheduling);
   });
   // 多窗口订阅引用计数:每个发起订阅的窗口(WebContents)挂一次 'destroyed' 清理,
   // 窗口关闭时释放它持有的全部引用,聚合出降零 topics 才向 relay 发 unsubscribe

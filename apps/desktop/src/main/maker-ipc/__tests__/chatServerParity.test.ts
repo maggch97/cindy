@@ -279,7 +279,10 @@ describe('server group feature parity', () => {
     expect(fixture.handle.mock.calls.find(([route]) => route.endsWith('/cancel-planning'))?.[2].failed).toBe(true);
     expect(fixture.handle.mock.calls.some(([route]) => route.endsWith('/continue'))).toBe(false);
   });
-  it('keeps a stored quote reply\'s snapshot until the whole send succeeds, so a retry cannot drop the quote', async () => {
+  // The send is answered once its message is stored; replacing the earlier arrangement continues
+  // afterwards. Formerly a failed cancel of that arrangement failed the whole (already stored) send
+  // and relied on the user retrying it with the same quote snapshot.
+  it('answers a stored quote reply at once and retries a failed cancel of the replaced arrangement', async () => {
     const quotedId = '80000000-0000-4000-8000-000000000002';
     arrange();
     const base = fixture.handle.getMockImplementation()!;
@@ -299,15 +302,19 @@ describe('server group feature parity', () => {
     deps.decidePlan = vi.fn(() => new Promise(() => {})) as typeof deps.decidePlan;
     // A: an ordinary request whose arrangement is still being decided.
     expect((await send({ clientId: 'parity:message:a' })).ok).toBe(true); await flush();
-    // B: stored by the server, then the bookkeeping that replaces A's intent fails.
+    // B: stored by the server; the bookkeeping that replaces A's intent fails once, after the answer.
     const quoteReply = { clientId: 'parity:message:b', text: 'Do this one', quote: { messageId: quotedId } };
-    expect(await send(quoteReply)).toMatchObject({ ok: false });
+    expect(await send(quoteReply)).toEqual({ ok: true, messageId: 'stored:parity:message:b' });
+    await flush();
+    const cancels = fixture.handle.mock.calls.filter(([route]) => route === `/conversations/${roomId}/messages/stored:parity:message:a/cancel-planning`);
+    expect(cancels).toHaveLength(2);
+    expect(cancels[1]![2]).toEqual(cancels[0]![2]);
+    // A repeat of the answered send returns its receipt without posting or reading the quote again.
     originalVisible = false;
     expect(await send(quoteReply)).toEqual({ ok: true, messageId: 'stored:parity:message:b' });
     const posts = fixture.handle.mock.calls.filter(([route, method, data]) => route.endsWith('/messages') && method === 'POST' && data.operationId === 'parity:message:b');
-    expect(posts).toHaveLength(2);
-    expect(posts[1]![2].content).toEqual(posts[0]![2].content);
-    expect(posts[1]![2].content[0]).toMatchObject({ namespace: 'cindy.quote' });
+    expect(posts).toHaveLength(1);
+    expect(posts[0]![2].content[0]).toMatchObject({ namespace: 'cindy.quote' });
     expect(fixture.handle.mock.calls.filter(([route]) => route === `/conversations/${roomId}/messages/${quotedId}`)).toHaveLength(1);
   });
   it('keeps legacy servers without a watermark on the bounded text page', async () => {

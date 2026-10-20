@@ -18,6 +18,10 @@ import { refreshBotGroups } from './botGroupStore';
 import { chatGroupMembership } from '@cindy/maker-shared/botGroupPresentation';
 
 const key = (name: string) => `bots.groupChat.server.settings.${name}`;
+/** Labels shared with the local group settings, so both read the same. */
+const shared = (name: string) => `bots.groupChat.settings.${name}`;
+const REPLY_MODE_LABELS = { all: shared('replyModeAll'), mentioned: shared('replyModeMentioned') } as const;
+const SPEAKING_MODE_LABELS = { auto: shared('speakingModeAuto'), sequential: shared('speakingModeSequential') } as const;
 const api = () => window.electronAPI.maker.chatServer;
 
 /** Shared group identity and companion grants are server-authoritative. */
@@ -123,11 +127,11 @@ export function ChatGroupSettings({ group }: { group: BotGroupSummary }) {
           onChange={event => { editGroup(); setTopic(event); }} />}</FormField>
         <FormField label={t(key('description'))}>{props => <Input {...props} value={description} maxLength={2000} disabled={!manager || busy}
           onChange={event => { editGroup(); setDescription(event); }} />}</FormField>
-        <FormField label={t(key('replyMode'))}>{props => <Select {...props} label={t(key('replyMode'))} value={replyMode}
-          disabled={!manager || busy} options={['all', 'mentioned'].map(value => ({ value, label: t(key(value)) }))}
+        <FormField label={t(shared('replyMode'))}>{props => <Select {...props} label={t(shared('replyMode'))} value={replyMode}
+          disabled={!manager || busy} options={(['all', 'mentioned'] as const).map(value => ({ value, label: t(REPLY_MODE_LABELS[value]) }))}
           onValueChange={value => { editGroup(); setReplyMode(value as typeof replyMode); }} />}</FormField>
-        <FormField label={t(key('speakingMode'))}>{props => <Select {...props} label={t(key('speakingMode'))} value={speakingMode}
-          disabled={!manager || busy} options={['auto', 'sequential'].map(value => ({ value, label: t(key(value)) }))}
+        <FormField label={t(shared('speakingMode'))}>{props => <Select {...props} label={t(shared('speakingMode'))} value={speakingMode}
+          disabled={!manager || busy} options={(['auto', 'sequential'] as const).map(value => ({ value, label: t(SPEAKING_MODE_LABELS[value]) }))}
           onValueChange={value => { editGroup(); setSpeakingMode(value as typeof speakingMode); }} />}</FormField>
         {manager && <Button type="submit" size="sm" variant="secondary" disabled={busy || !name.trim()}>{t(key('save'))}</Button>}
       </form>
@@ -199,7 +203,7 @@ export function ChatGroupSettings({ group }: { group: BotGroupSummary }) {
               {manageable && <div className="flex flex-wrap gap-2">
                 <Button size="sm" variant="secondary" disabled={busy} onClick={() => void mutate({ type: 'member', actorId, action: 'role', role: member.role === 'admin' ? 'member' : 'admin' })}>
                   {t(key(member.role === 'admin' ? 'removeAdmin' : 'makeAdmin'))}</Button>
-                <Button size="sm" variant="secondary" disabled={busy} onClick={() => void confirmed({ type: 'member', actorId, action: 'remove' }, t(key('removeTitle'), { name: member.name }), t(key('removeHint')))}>{t(key('remove'))}</Button>
+                <Button size="sm" variant="secondary" disabled={busy} onClick={() => void confirmed({ type: 'member', actorId, action: 'remove' }, t(key('removeTitle'), { name: member.name }), t(key('removeHint')))}>{t(shared('remove'))}</Button>
               </div>}
             </div>}
           </div>;

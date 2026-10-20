@@ -2,6 +2,7 @@ import { completePrecreatedWorktreeRecovery } from '@/session/completePrecreated
 import { recentTaskKey } from '@/session/recentTasks';
 import { readComposerEntry } from '@/session/composerMorph';
 import { RecentMessageHistoriesProvider } from '@/session/RecentMessageHistories';
+import { McpAppViewsProvider } from '@/session/McpAppViews';
 import { ResidentHomeListProvider } from '@/session/ResidentHomeList';
 import { AndroidUpdateSheet } from '@/update/AndroidUpdateSheet';
 import { PeerFileTransport } from '@/device-link/peerFileTransport';
@@ -170,6 +171,7 @@ function NavigationGate() {
         />
       ) : null}
       <RemoteDesktopHost>
+        <McpAppViewsProvider>
         <RecentMessageHistoriesProvider key={auth.accountGeneration}>
         <ResidentHomeListProvider>
         <Stack
@@ -208,6 +210,7 @@ function NavigationGate() {
         </Stack>
         </ResidentHomeListProvider>
         </RecentMessageHistoriesProvider>
+        </McpAppViewsProvider>
       </RemoteDesktopHost>
     </NavigationThemeProvider>
   );

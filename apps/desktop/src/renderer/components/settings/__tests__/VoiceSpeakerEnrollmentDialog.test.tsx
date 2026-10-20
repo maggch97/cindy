@@ -45,6 +45,32 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe('VoiceSpeakerEnrollmentDialog', () => {
+  it('lets the user finish each clip early, then submit the three captured clips', async () => {
+    const clips: ArrayBuffer[] = [];
+    mocks.record.mockImplementation((options) => {
+      expect(options.durationMs).toBe(30_000);
+      options.onProgress(0.4);
+      return new Promise<ArrayBuffer>((resolve) => {
+        options.stopSignal.addEventListener('abort', () => {
+          expect(options.signal.aborted).toBe(false);
+          const clip = new ArrayBuffer(12 * 16_000 * 2);
+          clips.push(clip);
+          resolve(clip);
+        }, { once: true });
+      });
+    });
+    mocks.enroll.mockResolvedValue({ ok: true, status: {} });
+    render(<Harness />);
+    await openDialog();
+    for (let index = 0; index < 3; index += 1) {
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: key('record') })); });
+      expect(screen.getByRole('button', { name: key('submit') }).hasAttribute('disabled')).toBe(true);
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: key('stop') })); });
+    }
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: key('submit') })); });
+    expect(mocks.enroll).toHaveBeenCalledExactlyOnceWith(clips);
+  });
+
   it('restores the opener after cancelling', async () => {
     render(<Harness />);
     const opener = await openDialog();

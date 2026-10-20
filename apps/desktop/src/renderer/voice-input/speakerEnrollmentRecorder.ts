@@ -11,6 +11,8 @@ export type SpeakerEnrollmentClipOptions = {
   /** Elapsed fraction in [0, 1]. */
   onProgress?: (fraction: number) => void;
   signal?: AbortSignal;
+  /** Finish and keep captured audio; `signal` instead cancels and discards it. */
+  stopSignal?: AbortSignal;
 };
 
 export class SpeakerEnrollmentNoAudioError extends Error {
@@ -35,10 +37,11 @@ export class SpeakerEnrollmentAbortedError extends Error {
  *
  * Uses the dictation capture profile (same processing, no keep-alive) so the
  * enrolled voice sounds like the audio the gate later judges. Stops by
- * itself after `durationMs`; aborting releases the microphone and rejects.
+ * itself at `durationMs` or on `stopSignal`; aborting `signal` discards the clip.
  */
 export async function recordSpeakerEnrollmentClip(options: SpeakerEnrollmentClipOptions): Promise<ArrayBuffer> {
   if (options.signal?.aborted) throw new SpeakerEnrollmentAbortedError();
+  if (options.stopSignal?.aborted) throw new SpeakerEnrollmentNoAudioError();
   const engine = new WebMicAudioEngine({
     workletUrl: getVoiceInputWorkletUrl(),
     deviceId: options.deviceId,
@@ -51,9 +54,15 @@ export async function recordSpeakerEnrollmentClip(options: SpeakerEnrollmentClip
   const done = new Promise<void>((resolve) => {
     finish = resolve;
   });
+  let stoppedEarly = false;
+  const onStop = (): void => {
+    stoppedEarly = true;
+    finish();
+  };
+  options.stopSignal?.addEventListener('abort', onStop, { once: true });
 
   engine.onPcm16k(({ pcm16k }) => {
-    if (samples >= targetSamples) return;
+    if (options.signal?.aborted || stoppedEarly || samples >= targetSamples) return;
     const chunk = new Int16Array(pcm16k.slice(0));
     chunks.push(chunk);
     samples += chunk.length;
@@ -81,10 +90,11 @@ export async function recordSpeakerEnrollmentClip(options: SpeakerEnrollmentClip
   } finally {
     clearTimeout(watchdog);
     options.signal?.removeEventListener('abort', onAbort);
+    options.stopSignal?.removeEventListener('abort', onStop);
     await engine.stop().catch(() => undefined);
   }
   if (options.signal?.aborted) throw new SpeakerEnrollmentAbortedError();
-  if (stalled && samples < targetSamples) throw new SpeakerEnrollmentNoAudioError();
+  if (samples === 0 || (stalled && !stoppedEarly && samples < targetSamples)) throw new SpeakerEnrollmentNoAudioError();
 
   const out = new Int16Array(Math.min(samples, targetSamples));
   let offset = 0;

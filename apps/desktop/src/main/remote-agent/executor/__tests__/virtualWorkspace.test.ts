@@ -19,6 +19,15 @@ let root: string;
 beforeEach(() => { root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-virtual-workspace-'))); });
 afterEach(() => { fs.rmSync(root, { recursive: true, force: true }); });
 
+/** Agent 写进文件的路径还原到本机时沿用它的分隔符，源码字符串里不会冒出 `\f`、`\b` 这类转义。 */
+function written(local: string, virtual: string): string { return virtual.startsWith('C:') ? local : local.replace(/\\/g, '/'); }
+
+/** 转发给 exec-server 的 Codex 请求里与沙箱有关的字段。 */
+interface MappedSandboxRequest {
+  cwd?: string;
+  sandbox: { cwd?: string; userHomeDir?: string; permissions: { file_system: { entries: unknown[] } } };
+}
+
 function setup(virtual: string) {
   const project = path.join(root, 'real project');
   fs.mkdirSync(project);
@@ -131,6 +140,57 @@ describe('virtual workspace', () => {
     await executor.close();
   });
 
+  // 2026-10 实际问题：Agent 在 Windows、任务在 Mac 时，Agent 按 bash 规矩把双引号里的反斜杠写成两个，
+  // 命令原样送到 Mac 执行而找不到目录。
+  it('maps bash-escaped Windows virtual paths in commands and Agent text', async () => {
+    const virtual = 'C:\\Agent\\workspace';
+    const { workspace, project, executor } = setup(virtual);
+    const real = project.replace(/\\/g, '/');
+    const escaped = virtual.replace(/\\/g, '\\\\');
+    expect(workspace.mapCommand('ls "' + escaped + '\\\\目录 空格\\\\a.txt"'))
+      .toBe('ls "' + real + '/目录 空格/a.txt"');
+    expect(workspace.mapCommand('cd ' + escaped + '\\\\src && ls')).toBe("cd '" + real + "'/src && ls");
+    expect(workspace.mapCommand("cat '" + escaped + "\\\\src'")).toBe("cat '" + real + "/src'");
+    // 后面不是目录名的 `\\` 仍是转义，原样留给 shell。
+    expect(workspace.mapCommand('printf "%s" "' + escaped + '\\\\dir\\\\"'))
+      .toBe('printf "%s" "' + real + '/dir\\\\"');
+    // 回复正文同样还原；本机是 Windows 时保留 Agent 的转义写法。
+    const local = process.platform === 'win32'
+      ? project.replace(/\\/g, '\\\\') + '\\\\src\\\\a.txt'
+      : project + '/src/a.txt';
+    expect(workspace.mapTextFromAgent('见 "' + escaped + '\\\\src\\\\a.txt"')).toBe('见 "' + local + '"');
+    await executor.close();
+  });
+
+  it('does not treat the leading backslashes of a network share path as an escaped separator', () => {
+    const aliases = [{ from: '//server/share/project', to: 'C:\\Agent\\workspace' }];
+    // 本机 → Agent：不认转义写法的方向保持原行为。
+    expect(projectPathText('cat \\\\server\\share\\project\\file', aliases)).toBe('cat C:\\Agent\\workspace\\file');
+    // Agent → 本机方向即使认转义，UNC 开头的 `\\server` 也不是转义。
+    expect(projectPathText('cat \\\\server\\share\\project\\file', aliases, 'text', undefined, { escapedSeparators: true }))
+      .toBe('cat C:\\Agent\\workspace\\file');
+  });
+
+  it.skipIf(process.platform === 'win32')('keeps Windows paths in local output intact when the task computer uses POSIX paths', () => {
+    const mirror = 'C:\\Users\\XD\\AppData\\Roaming\\Cindy\\remote-agent\\workspaces\\c\\s\\fs';
+    const shadow = mirror + '\\workspace\\p\\p';
+    const workspace = new ExecutorWorkspace({
+      workingDir: '/Users/xw/heartopia',
+      aliases: [
+        { from: shadow, to: '/Users/xw/heartopia' },
+        { from: mirror + '\\workspace\\p', to: '/Users/xw' },
+        { from: mirror + '\\workspace', to: '/Users' },
+      ],
+    });
+    workspace.setVirtualRoot(mirror);
+    // Mac 上的报错带着没能还原的 Windows 路径：`\Users`、`C:/Users` 不是本机的 /Users，不能再被投影一遍。
+    const error = 'ls: C:\\Users\\XD\\AppData\\Roaming\\Cindy\\x: No such file or directory';
+    expect(workspace.mapTextForAgent(error)).toBe(error);
+    expect(workspace.mapTextForAgent('cat C:/Users/XD/notes.txt')).toBe('cat C:/Users/XD/notes.txt');
+    // 真正的本机路径照常投影成 Agent 那边的路径。
+    expect(workspace.mapTextForAgent('ls /Users/xw/heartopia/src')).toBe('ls ' + shadow + '\\src');
+  });
+
   it.each([
     '$file', '$' + '{file}', '$(printf "%s" "$file")', String.fromCharCode(96) + 'printf "%s" "$file"' + String.fromCharCode(96), '\\$file', '\\"quoted\\"', '*.txt',
   ])('preserves Bash syntax in a quoted POSIX path suffix: %s', (expression) => {
@@ -198,12 +258,12 @@ describe('virtual workspace', () => {
     const { project, workspace } = setup(virtual);
     const native = virtual.startsWith('C:') ? path.win32 : path.posix;
     const input = Buffer.from(native.join(virtual, 'a.ts') + ' ' + native.join(virtual, 'src', 'b.ts') + ' links to /api/v1');
-    const real = Buffer.from(path.join(project, 'a.ts') + ' ' + path.join(project, 'src', 'b.ts') + ' links to /api/v1');
+    const real = Buffer.from(written(path.join(project, 'a.ts'), virtual) + ' ' + written(path.join(project, 'src', 'b.ts'), virtual) + ' links to /api/v1');
     expect(workspace.mapInputFromAgent(input)).toEqual(real);
     expect(workspace.mapOutputForAgent(real)).toEqual(input);
     const quoted = 'The docs say "' + native.join(virtual, 'README.md') + ' links to /api/v1"';
     expect(workspace.mapInputFromAgent(Buffer.from(quoted)))
-      .toEqual(Buffer.from('The docs say "' + path.join(project, 'README.md') + ' links to /api/v1"'));
+      .toEqual(Buffer.from('The docs say "' + written(path.join(project, 'README.md'), virtual) + ' links to /api/v1"'));
   });
 
   it.each([
@@ -228,7 +288,7 @@ describe('virtual workspace', () => {
     const { project, executor } = setup(virtual);
     const native = virtual.startsWith('C:') ? path.win32 : path.posix;
     const prose = native.join(virtual, 'README.md') + ' links to /api/v1 and relative/input.txt';
-    const localProse = path.join(project, 'README.md') + ' links to /api/v1 and relative/input.txt';
+    const localProse = written(path.join(project, 'README.md'), virtual) + ' links to /api/v1 and relative/input.txt';
     const documents = (value: string) => [
       JSON.stringify(value),
       '[\r\n  ' + JSON.stringify(value) + ', [' + JSON.stringify(value) + '], 1.00e0, "\\u4e2d"\r\n]\r\n',
@@ -289,7 +349,7 @@ describe('virtual workspace', () => {
       file, [file, [directory]], { paths: [future, [future]], nested: { file_paths: [future] } },
     ];
     const input = values(remote, native.dirname(remote), remoteFuture);
-    const expected = values(local, path.dirname(local), localFuture);
+    const expected = values(written(local, virtual), written(path.dirname(local), virtual), written(localFuture, virtual));
     expect(fs.existsSync(localFuture)).toBe(false);
     for (let index = 0; index < input.length; index += 1) {
       const remoteBytes = Buffer.from(JSON.stringify(input[index]));
@@ -319,10 +379,10 @@ describe('virtual workspace', () => {
     fs.writeFileSync(existing, 'console.log(1);');
     const existingVirtual = native.join(virtual, '目录 空格', 'run.js');
     const source = JSON.stringify({ script: native.join(virtual, 'run.js') + ' --url /api/v1' });
-    const sourceExpected = JSON.stringify({ script: path.join(project, 'run.js') + ' --url /api/v1' });
+    const sourceExpected = JSON.stringify({ script: written(path.join(project, 'run.js'), virtual) + ' --url /api/v1' });
     expect(workspace.mapInputFromAgent(Buffer.from(source))).toEqual(Buffer.from(sourceExpected));
     const pathValue = JSON.stringify({ script: existingVirtual });
-    const pathExpected = JSON.stringify({ script: existing });
+    const pathExpected = JSON.stringify({ script: written(existing, virtual) });
     expect(workspace.mapInputFromAgent(Buffer.from(pathValue))).toEqual(Buffer.from(pathExpected));
     expect(workspace.mapOutputForAgent(Buffer.from(pathExpected))).toEqual(Buffer.from(pathValue));
   });
@@ -338,6 +398,124 @@ describe('virtual workspace', () => {
     expect(Buffer.from(output.params.chunk, 'base64').toString()).toBe('/Users/agent/workspace');
     const fileData = { result: { dataBase64: Buffer.from(project).toString('base64') } };
     expect(Buffer.from((mapExecServerResult(fileData, workspace) as any).result.dataBase64, 'base64').toString()).toBe(project);
+    await executor.close();
+  });
+
+  it.skipIf(process.platform === 'win32')('maps Codex sandbox permissions from a Windows agent and drops paths that only exist on the agent computer', () => {
+    const project = path.join(root, 'real project');
+    const temp = path.join(root, 'temp');
+    fs.mkdirSync(project);
+    fs.mkdirSync(temp);
+    const workspace = new ExecutorWorkspace({ workingDir: project, aliases: [
+      { from: 'C:\\Agent\\mirror\\workspace', to: project },
+      { from: 'C:\\Agent\\mirror\\tmp', to: temp },
+    ] });
+    workspace.setVirtualRoot('C:\\Agent\\mirror');
+    const local = (target: string) => pathToFileURL(target).href;
+    const sandbox = {
+      permissions: { type: 'managed', network: 'restricted', file_system: { type: 'restricted', entries: [
+        { path: { type: 'special', value: { kind: 'root' } }, access: 'read' },
+        { path: { type: 'path', path: 'file:///C:/Agent/mirror/workspace' }, access: 'write' },
+        { path: { type: 'path', path: 'file:///c:/agent/mirror/workspace/.git' }, access: 'read' },
+        { path: { type: 'glob_pattern', pattern: 'C:\\Agent\\mirror\\workspace\\**\\*.env' }, access: 'deny' },
+        { path: { type: 'glob_pattern', pattern: '**/*.pem' }, access: 'deny' },
+        { path: { type: 'path', path: 'file:///C:/Agent/codex-home/memories' }, access: 'write' },
+        { path: { type: 'glob_pattern', pattern: 'C:\\Agent\\codex-home\\**' }, access: 'write' },
+        { path: { type: 'path', path: 'file:///C:/Agent/secrets' }, access: 'deny' },
+        // Windows 网络路径：POSIX 本机的 exec-server 不认带主机名的 file URI，留下会让每条命令都被拒。
+        { path: { type: 'path', path: 'file://server/share/secret' }, access: 'deny' },
+        // 没映射上的禁止 glob 原样保留：在本机匹配不到东西，也不会让请求被拒。
+        { path: { type: 'glob_pattern', pattern: '\\\\server\\share\\**' }, access: 'deny' },
+      ] } },
+      cwd: 'file:///C:/Agent/mirror/workspace',
+      policyContext: { cwd: 'file:///C:/Agent/mirror/workspace', workspaceRoots: ['file:///C:/Agent/mirror/workspace', 'file:///C:/Agent/other'] },
+      userHomeDir: 'file:///C:/Agent/home',
+      temporaryDirectories: ['file:///C:/Agent/mirror/tmp', 'file:///C:/Agent/AppTemp'],
+      windowsSandboxLevel: 'disabled',
+    };
+    const params = mapExecServerParams({ argv: ['/bin/zsh', '-lc', 'true'], cwd: 'file:///C:/Agent/mirror/workspace', sandbox }, workspace, 'process/start') as MappedSandboxRequest;
+    expect(params.cwd).toBe(local(project));
+    expect(params.sandbox).toEqual({
+      permissions: { type: 'managed', network: 'restricted', file_system: { type: 'restricted', entries: [
+        { path: { type: 'special', value: { kind: 'root' } }, access: 'read' },
+        { path: { type: 'path', path: local(project) }, access: 'write' },
+        { path: { type: 'path', path: local(path.join(project, '.git')) }, access: 'read' },
+        { path: { type: 'glob_pattern', pattern: project + '/**/*.env' }, access: 'deny' },
+        { path: { type: 'glob_pattern', pattern: '**/*.pem' }, access: 'deny' },
+        { path: { type: 'glob_pattern', pattern: '\\\\server\\share\\**' }, access: 'deny' },
+      ] } },
+      cwd: local(project),
+      policyContext: { cwd: local(project), workspaceRoots: [local(project)] },
+      // 对不上的用户目录换成本机的：Codex 缺了它会把 `~/…` 规则当解析失败、一律拒绝读取。
+      userHomeDir: local(os.homedir()),
+      temporaryDirectories: [local(temp)],
+      windowsSandboxLevel: 'disabled',
+    });
+    // fs/* 请求带同一个沙箱上下文。
+    const read = mapExecServerParams({ path: 'file:///C:/Agent/mirror/workspace/a.txt', sandbox }, workspace, 'fs/readFile') as MappedSandboxRequest;
+    expect(read.sandbox).toEqual(params.sandbox);
+  });
+
+  it('keeps glob characters in the local directory name literal when mapping absolute sandbox globs', () => {
+    const project = path.join(root, 'project[1]{a}');
+    fs.mkdirSync(project);
+    const workspace = new ExecutorWorkspace({ workingDir: project, aliases: [{ from: 'C:\\Agent\\mirror\\workspace', to: project }] });
+    workspace.setVirtualRoot('C:\\Agent\\mirror');
+    const literal = path.join(root, 'project[[]1[]][{]a[}]');
+    expect(workspace.localGlobFromAgent('C:\\Agent\\mirror\\workspace\\**\\*.env')).toBe(literal + '/**/*.env');
+    expect(workspace.localGlobFromAgent('C:\\Agent\\mirror\\workspace')).toBe(literal);
+    expect(workspace.localGlobFromAgent('C:\\Agent\\other\\**')).toBeNull();
+    // POSIX Agent 的模式里反斜杠是转义，不能当成分隔符。
+    const posix = new ExecutorWorkspace({ workingDir: project, aliases: [{ from: '/home/agent/workspace', to: project }] });
+    expect(posix.localGlobFromAgent('/home/agent/workspace/\\*.lock')).toBe(literal + '/\\*.lock');
+  });
+
+  it.skipIf(process.platform === 'win32')('escapes a backslash in a POSIX local directory name when mapping absolute sandbox globs', () => {
+    // POSIX 目录名可以含反斜杠；Codex 的 POSIX glob 把它当转义符，不转义的话禁止规则会对不上真实目录。
+    const project = path.join(root, 'project\\name');
+    fs.mkdirSync(project);
+    const workspace = new ExecutorWorkspace({ workingDir: project, aliases: [{ from: 'C:\\Agent\\mirror\\workspace', to: project }] });
+    expect(workspace.localGlobFromAgent('C:\\Agent\\mirror\\workspace\\**\\*.env')).toBe(root + '/project\\\\name/**/*.env');
+  });
+
+  it('maps Codex sandbox permissions from a POSIX agent and keeps deny rules that are valid on this computer', async () => {
+    const { workspace, project, executor } = setup('/home/agent/workspace');
+    const sandbox = {
+      permissions: { type: 'managed', network: 'restricted', file_system: { type: 'restricted', entries: [
+        { path: { type: 'path', path: 'file:///home/agent/workspace' }, access: 'write' },
+        { path: { type: 'path', path: 'file:///home/agent/.codex/memories' }, access: 'write' },
+        { path: { type: 'path', path: 'file:///home/agent/.ssh' }, access: 'deny' },
+        // POSIX Agent 的 `/C:/secret` 是根目录下的普通路径，不是 Windows 盘符。
+        { path: { type: 'path', path: 'file:///C:/secret' }, access: 'deny' },
+        // 相对 glob 不能被误认成绝对路径丢掉：以转义开头(名字就叫 `*.pem` 的文件)、文件名里带冒号。
+        { path: { type: 'glob_pattern', pattern: '\\*.pem' }, access: 'deny' },
+        { path: { type: 'glob_pattern', pattern: 'a:*.pem' }, access: 'deny' },
+        { path: { type: 'glob_pattern', pattern: 'a:*.cache' }, access: 'write' },
+        // Agent 主机自己的绝对路径：写入授权丢掉，禁止规则保留。
+        { path: { type: 'glob_pattern', pattern: '/home/agent/.codex/**' }, access: 'write' },
+        { path: { type: 'glob_pattern', pattern: '/home/agent/.aws/**' }, access: 'deny' },
+      ] } },
+      cwd: 'file:///home/agent/workspace',
+      userHomeDir: 'file:///home/agent',
+    };
+    const params = mapExecServerParams({ path: 'file:///home/agent/workspace/a.txt', sandbox }, workspace, 'fs/readFile') as MappedSandboxRequest;
+    expect(params.sandbox.permissions.file_system.entries).toEqual([
+      { path: { type: 'path', path: pathToFileURL(project).href }, access: 'write' },
+      // 任务电脑是 Windows 时 POSIX 路径不是本机路径，禁止条目也无从对应。
+      ...(process.platform === 'win32' ? [] : [
+        { path: { type: 'path', path: 'file:///home/agent/.ssh' }, access: 'deny' },
+        { path: { type: 'path', path: 'file:///C:/secret' }, access: 'deny' },
+      ]),
+      { path: { type: 'glob_pattern', pattern: '\\*.pem' }, access: 'deny' },
+      { path: { type: 'glob_pattern', pattern: 'a:*.pem' }, access: 'deny' },
+      { path: { type: 'glob_pattern', pattern: 'a:*.cache' }, access: 'write' },
+      { path: { type: 'glob_pattern', pattern: '/home/agent/.aws/**' }, access: 'deny' },
+    ]);
+    expect(params.sandbox.cwd).toBe(pathToFileURL(project).href);
+    expect(params.sandbox.userHomeDir).toBe(pathToFileURL(os.homedir()).href);
+    // 没有虚拟工作区(旧版对端)时沙箱原样转发，与之前一致。
+    const plain = new ExecutorWorkspace({ workingDir: project });
+    expect((mapExecServerParams({ sandbox }, plain) as MappedSandboxRequest).sandbox).toBe(sandbox);
     await executor.close();
   });
 
@@ -577,7 +755,7 @@ describe('virtual workspace', () => {
     }
   });
 
-  it('maps workbench project paths in direct and stringified generic-tool arguments', async () => {
+  it('maps path fields in direct and stringified generic-tool arguments, leaving opaque todo labels alone', async () => {
     const virtual = '/Users/agent/workspace';
     const { project, executor } = setup(virtual);
     const forwarded: Array<Record<string, unknown>> = [];
@@ -593,21 +771,21 @@ describe('virtual workspace', () => {
       },
     });
     try {
-      for (const args of [
-        { project: virtual },
-        JSON.stringify({ project: virtual }),
-        { items: [{ project: virtual }] },
-      ]) {
+      // 伙伴待办里的 project 只是原样回传的标签(2026-10-17 放弃「项目」后不再授权),不做路径还原。
+      const calls: Array<[string, unknown]> = [
+        ['list_dir', { path: virtual }],
+        ['list_dir', JSON.stringify({ path: virtual })],
+        ['preflight_teammate_todo_events', { events: [{ source: 's', sequence: 1, key: 'k', project: virtual }] }],
+      ];
+      for (const [name, args] of calls) {
         await router({ method: 'POST', path: '/mcp/cindy_helper', headers: [], body: Buffer.from(JSON.stringify({
-          jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'call_tool', arguments: {
-            name: args && typeof args === 'object' && !Array.isArray(args) && 'items' in args ? 'set_workbench_tasks' : 'set_workbench_task', args,
-          } },
+          jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'call_tool', arguments: { name, args } },
         })).toString('base64') });
       }
       expect(forwarded).toEqual([
-        { name: 'set_workbench_task', args: { project } },
-        { name: 'set_workbench_task', args: JSON.stringify({ project }) },
-        { name: 'set_workbench_tasks', args: { items: [{ project }] } },
+        { name: 'list_dir', args: { path: project } },
+        { name: 'list_dir', args: JSON.stringify({ path: project }) },
+        { name: 'preflight_teammate_todo_events', args: { events: [{ source: 's', sequence: 1, key: 'k', project: virtual }] } },
       ]);
     } finally {
       await executor.close();
@@ -644,7 +822,9 @@ describe('virtual workspace', () => {
       expect(actualNative).toEqual({ cwd: expect.any(String), script, argument: project });
       expect(fs.realpathSync.native(actualNative.cwd)).toBe(fs.realpathSync.native(fixtureDir));
       await executor.handle('fs.write', { path: agentPath.join(virtualDir, 'returned.json'), data: Buffer.from(lines[1]).toString('base64') });
-      expect(JSON.parse(fs.readFileSync(path.join(fixtureDir, 'returned.json'), 'utf8'))).toEqual(nativeResult);
+      expect(JSON.parse(fs.readFileSync(path.join(fixtureDir, 'returned.json'), 'utf8'))).toEqual({
+        cwd: written(fixtureDir, virtual), script: written(script, virtual), argument: written(project, virtual),
+      });
     } finally {
       await executor.close();
     }

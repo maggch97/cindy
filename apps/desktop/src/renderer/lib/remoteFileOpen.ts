@@ -1,4 +1,5 @@
 import { shouldShowOpenPathError } from '../../shared/openPathResult';
+import { isDangerousAttachmentName } from '../../shared/attachmentSafety';
 /**
  * remoteFileOpen — 聊天流文件类交互的远程分流入口(renderer 侧)。
  * ---------------------------------------------------------------------------
@@ -75,7 +76,7 @@ export async function fetchChatFileWithToasts(
   workdir: string,
   absPath: string,
 ): Promise<string | null> {
-  const progress = createFileTransferToast();
+  const progress = createFileTransferToast(absPath);
   try {
     const res = await fetchChatFileToCache(origin, workdir, absPath, progress.requestId);
     if (progress.cancelled) return null;
@@ -96,8 +97,18 @@ export async function openRemoteChatFile(
   workdir: string,
   absPath: string,
 ): Promise<void> {
+  // Remote scripts/installers follow the attachment save-only policy. Guard the
+  // common entry so menu, modifier-click and ordinary fallback cannot diverge.
+  if (isDangerousAttachmentName(absPath)) {
+    await downloadRemoteChatEntry(origin, workdir, absPath);
+    return;
+  }
   const cachePath = await fetchChatFileWithToasts(origin, workdir, absPath);
   if (!cachePath) return;
+  if (isDangerousAttachmentName(cachePath)) {
+    await downloadRemoteChatEntry(origin, workdir, absPath);
+    return;
+  }
   const res = await window.electronAPI.openPath(cachePath);
   if (shouldShowOpenPathError(res)) toast.error(res.error || i18n.t('logic.errors.openFileFailed'));
 }
@@ -122,7 +133,7 @@ export async function downloadRemoteChatEntry(
   workdir: string,
   absPath: string,
 ): Promise<void> {
-  const progress = createFileTransferToast();
+  const progress = createFileTransferToast(absPath);
   const wireOrigin =
     origin.kind === 'device'
       ? ({ kind: 'device', deviceId: origin.deviceId } as const)

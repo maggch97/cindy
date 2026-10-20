@@ -298,32 +298,37 @@ describe('额度类终态错误', () => {
     'You hit your spend cap set by the owner of your workspace. Ask them to raise it to keep using Codex.';
   const PERSONAL = { surface: 'personal', supportsModelCommand: true } as const;
 
-  it('花费上限: 说清哪个供应商、什么原因、怎么处理, 并附上游原文', () => {
-    const text = terminalErrorText({ message: SPEND_CAP }, { ...PERSONAL, providerLabel: 'OpenAI' });
+  it('花费上限: 定位 bot、任务、模型和供应商，只给当前任务的恢复动作', () => {
+    const text = terminalErrorText({ message: SPEND_CAP }, { ...PERSONAL, providerLabel: 'OpenAI',
+      botLabel: 'Telegram 个人 bot · 测试助手', modelLabel: 'GPT-6 Astra', taskLabel: '我的任务（12345678）' });
     expect(text.startsWith(QUOTA_FAILURE_NOTICE_PREFIX)).toBe(true);
     expect(text).toContain('「OpenAI」已达到工作区所有者设置的花费上限');
-    expect(text).toContain('Cindy 不会自动更换模型或供应商');
+    expect(text).toContain('Telegram 个人 bot · 测试助手');
+    expect(text).toContain('GPT-6 Astra');
+    expect(text).toContain('我的任务（12345678）');
+    expect(text).toContain('联系工作区管理员');
     expect(text).toContain('/model');
-    expect(text).toContain('设置 → IM 机器人');
-    expect(text).toContain(`上游原文：${SPEND_CAP}`);
+    expect(text).not.toContain('设置 →');
+    expect(text).not.toContain(SPEND_CAP);
   });
 
-  it('处理方式按入口指到对的设置: 个人 bot 指自己的卡片, 官方 bot 指工作目录并接 /new', () => {
+  it('个人 /model 改当前任务，官方指向 Cindy 当前任务，不指向目录默认', () => {
     const personal = terminalErrorText({ message: SPEND_CAP }, PERSONAL);
-    expect(personal).toContain('「Telegram 机器人」');
-    expect(personal).toContain('新对话配置');
+    expect(personal).toContain('个人 bot');
+    expect(personal).toContain('/model');
+    expect(personal).not.toContain('新对话配置');
     expect(personal).not.toContain('工作目录');
     const official = terminalErrorText({ message: SPEND_CAP }, { surface: 'official' });
-    expect(official).toContain('官方 bot 卡片的工作目录');
-    expect(official).toContain('已有任务保持原模型');
-    expect(official).toContain('/new');
-    expect(official).not.toContain('Telegram 机器人');
+    expect(official).toContain('官方 bot');
+    expect(official).toContain('在 Cindy 里打开这个任务');
+    expect(official).not.toContain('/model');
+    expect(official).not.toContain('/new');
   });
 
   it.each([false, undefined])('个人渠道未支持 /model (%s) 时只指向 Cindy 当前任务', (supportsModelCommand) => {
     const text = terminalErrorText({ message: SPEND_CAP }, { surface: 'personal', supportsModelCommand });
     expect(text).toContain('在 Cindy 里打开这个任务');
-    expect(text).toContain('换一个供应商或模型');
+    expect(text).toContain('更换供应商或模型');
     expect(text).toContain('回到这里重发这条消息');
     expect(text).not.toContain('/model');
     expect(text).not.toContain('新对话配置');
@@ -362,8 +367,9 @@ describe('额度类终态错误', () => {
     );
   });
 
-  it('上游原文脱敏后再附上', () => {
-    const text = terminalErrorText({ message: 'insufficient_quota for key sk-abcdefghijklmnop' }, PERSONAL);
+  it('不外发上游原文，显示标签中的敏感信息仍脱敏', () => {
+    const text = terminalErrorText({ message: 'insufficient_quota for key sk-abcdefghijklmnop' },
+      { ...PERSONAL, taskLabel: 'key sk-abcdefghijklmnop' });
     expect(text).not.toContain('sk-abcdefghijklmnop');
   });
 });

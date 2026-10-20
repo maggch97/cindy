@@ -72,8 +72,9 @@ vi.mock('@/hooks/useSessionRunningStatus', () => ({
 vi.mock('react-router-dom', async importOriginal => ({
   ...await importOriginal<typeof import('react-router-dom')>(),
   useNavigate: () => mocks.navigate,
-  useLocation: () => ({ pathname: '/bots', search: '', hash: '' }),
-  useParams: () => mocks.params,
+  useLocation: () => ({ pathname: mocks.params.deviceId
+    ? `/bots/remote/${mocks.params.deviceId}/${mocks.params.botId}`
+    : mocks.params.botId ? `/bots/${mocks.params.botId}` : '/bots', search: '', hash: '' }),
 }));
 vi.mock('../botStore', () => ({
   useBotProfiles: () => mocks.profiles,
@@ -94,7 +95,9 @@ vi.mock('../BotDeleteDialog', () => ({
 
 import { TeammatesSection } from '../TeammatesSection';
 import { BotConnectionStatus } from '../BotConnectionStatus';
+import { resetBotMarketEntryHintForTest } from '../botMarketEntryHint';
 import { markBotRead, resetBotReadStateForTests } from '../botReadState';
+import { sidebarOwnerStorageKey } from '@/lib/sidebarOwnerStorage';
 import { readTeammatesSectionCollapsed } from '../teammatesSectionPrefs';
 
 interface BotFixture {
@@ -134,6 +137,7 @@ async function renderSidebar() {
 beforeEach(() => {
   messageListeners = [];
   window.localStorage.clear();
+  resetBotMarketEntryHintForTest();
   resetBotReadStateForTests();
   mocks.navigate.mockReset();
   mocks.observeSession.mockReset();
@@ -189,7 +193,7 @@ describe('one Cindy entry across devices', () => {
     expect(screen.queryByRole('combobox', { name: /bots.devicePicker.switchDevice/ })).toBeNull();
     expect(screen.queryByTestId('cindy-device-row')).toBeNull();
     expect(screen.queryByText('bots.devicePicker.local')).toBeNull();
-    expect(screen.getByText('bots.remote.online')).toBeTruthy();
+    expect(screen.queryByText('bots.remote.online')).toBeNull();
     fireEvent.click(screen.getByText('Local preview').closest('button')!);
     expect(mocks.navigate).toHaveBeenCalledWith('/bots/cindy-default');
 
@@ -204,7 +208,7 @@ describe('one Cindy entry across devices', () => {
     expect(screen.queryByRole('combobox', { name: /bots.devicePicker.switchDevice/ })).toBeNull();
     expect(screen.queryByTestId('cindy-device-row')).toBeNull();
     expect(screen.queryByText('bots.devicePicker.local')).toBeNull();
-    expect(screen.getByText('bots.remote.online')).toBeTruthy();
+    expect(screen.queryByText('bots.remote.online')).toBeNull();
     expect(screen.getByText('Local preview')).toBeTruthy();
   });
 
@@ -310,10 +314,10 @@ describe('teammate host labels', () => {
       name: 'Cindy', avatar: '🤖', avatarColor: 'violet', description: '', preview: 'Remote preview',
       activityAt: 1, sessionId: 'remote-session', online: true }];
     const view = await renderSidebar();
-    expect(screen.getByText('bots.remote.online')).toBeTruthy();
+    expect(screen.queryByText('bots.remote.online')).toBeNull();
     expect(view.container.innerHTML).not.toContain('MBP-M5');
     expect(screen.queryByRole('img', { name: /bots.remote.online/ })).toBeNull();
-    expect(screen.getByText('bots.remote.online · Mac-Studio')).toBeTruthy();
+    expect(screen.getByText('Mac-Studio')).toBeTruthy();
     expect(screen.getByText('Local preview')).toBeTruthy();
     const remoteRow = screen.getByText('Remote preview').closest('button')!;
     fireEvent.click(remoteRow);
@@ -328,12 +332,12 @@ describe('teammate host labels', () => {
   it('keeps local status free of device labels before and after directory updates', async () => {
     mocks.profiles = [bot({ id: 'local-bot', name: 'Cindy' })];
     const view = await renderSidebar();
-    expect(screen.getByText('bots.remote.online')).toBeTruthy();
+    expect(screen.queryByText('bots.remote.online')).toBeNull();
     expect(view.container.innerHTML).not.toContain('bots.remote.thisDevice');
     expect(view.container.textContent).not.toContain(' · ');
     mocks.devices = [{ deviceId: 'local-device', name: 'Renamed Mac', isSelf: true }];
     view.rerender(<TeammatesSection />);
-    expect(screen.getByText('bots.remote.online')).toBeTruthy();
+    expect(screen.queryByText('bots.remote.online')).toBeNull();
     expect(view.container.innerHTML).not.toContain('Renamed Mac');
     expect(view.container.textContent).not.toContain(' · ');
   });
@@ -347,13 +351,13 @@ describe('teammate host labels', () => {
       activityAt: 1, sessionId: 'remote-session', online: true,
     }));
     const view = await renderSidebar();
-    expect(screen.getByText('bots.remote.online · Shared Mac (host-a)')).toBeTruthy();
-    expect(screen.getByText('bots.remote.online · Shared Mac (host-b)')).toBeTruthy();
+    expect(screen.getByText('Shared Mac (host-a)')).toBeTruthy();
+    expect(screen.getByText('Shared Mac (host-b)')).toBeTruthy();
     expect(view.container.innerHTML).not.toContain('local-device');
     mocks.remoteBots = mocks.remoteBots.map((entry) => ({ ...entry, deviceName: entry.deviceId === 'host-a' ? 'Studio' : 'Mini' }));
     view.rerender(<TeammatesSection />);
-    expect(screen.getByText('bots.remote.online · Studio')).toBeTruthy();
-    expect(screen.getByText('bots.remote.online · Mini')).toBeTruthy();
+    expect(screen.getByText('Studio')).toBeTruthy();
+    expect(screen.getByText('Mini')).toBeTruthy();
   });
 
   it.each(['Thinking', 'Generating'])('preserves %s while hiding the local host and idle status', async (compactDetail) => {
@@ -371,7 +375,7 @@ describe('teammate host labels', () => {
     mocks.islandActivity.clear();
     view.rerender(<TeammatesSection />);
     expect(screen.queryByText(compactDetail)).toBeNull();
-    expect(screen.getByText('bots.remote.online')).toBeTruthy();
+    expect(screen.queryByText('bots.remote.online')).toBeNull();
     expect(screen.getByText('Previous reply')).toBeTruthy();
   });
 
@@ -394,6 +398,25 @@ describe('teammate host labels', () => {
 
 describe('TeammatesSection header', () => {
   const header = () => screen.getByRole('button', { name: 'bots.title' });
+
+  // #6444: six rows used to shrink to five before SectionCollapse could animate.
+  // Existing tests cover the avatar end state, not the closing interval. Unit tier:
+  // render the real section with six entries and advance fake time (no real wait).
+  it('keeps the full list mounted until the section collapse finishes', () => {
+    vi.useFakeTimers();
+    mocks.profiles = Array.from({ length: 6 }, (_, index) => bot({
+      id: `mate-${index}`, name: `Mate ${index}`, lastMessagePreview: 'Ready',
+    }));
+    render(<TeammatesSection />);
+    fireEvent.click(screen.getByRole('button', { name: 'ccAgent.sidebar.showAllSessions:{"count":6}' }));
+    expect(screen.getAllByText('Ready')).toHaveLength(6);
+    fireEvent.click(header());
+    expect(screen.getAllByText('Ready')).toHaveLength(6);
+    act(() => vi.advanceTimersByTime(200));
+    expect(screen.queryByText('Ready')).toBeNull();
+    fireEvent.click(header());
+    expect(screen.getAllByText('Ready')).toHaveLength(5);
+  });
 
   it('starts expanded and collapses into a row of avatars that is remembered per account', async () => {
     mocks.profiles = [
@@ -579,8 +602,7 @@ describe('TeammatesSection rows', () => {
   });
 
   it('shows the latest message and its time instead of a channel label', async () => {
-    const at = new Date();
-    at.setHours(9, 7, 0, 0);
+    const at = new Date(Date.now() - 5 * 60_000);
     mocks.profiles = [
       bot({
         id: 'bot-1',
@@ -594,7 +616,7 @@ describe('TeammatesSection rows', () => {
     const view = await renderSidebar();
 
     expect(screen.getByText('Two checks are still red on #2829')).toBeTruthy();
-    expect(screen.getByText('09:07')).toBeTruthy();
+    expect(screen.getByText(translate('ccAgent.time.relative.minute', { count: 5 }))).toBeTruthy();
     expect(view.container.textContent).not.toContain('Local');
     expect(screen.queryByText('Delivery steward')).toBeNull();
   });
@@ -823,7 +845,7 @@ describe('cloud companions in the roster', () => {
     const rows = screen.getAllByText('Mia');
     expect(rows).toHaveLength(1);
     const row = rows[0]!.closest('button')!;
-    expect(row.textContent).toContain('bots.cloud.homeOfflineShort');
+    expect(row.textContent).not.toContain('bots.remote.offline');
     fireEvent.click(row);
     expect(mocks.navigate).toHaveBeenCalledWith('/bots/remote/laptop/mia');
   });
@@ -838,5 +860,31 @@ describe('cloud companions in the roster', () => {
     expect(screen.queryByText('Local preview')).toBeNull();
     expect(screen.queryByTestId('cindy-device-row')).toBeNull();
     expect(screen.getByText('Laptop preview')).toBeTruthy();
+  });
+});
+
+describe('new-entry hint on the header plus', () => {
+  const hiddenUntilHover = (el: HTMLElement) => {
+    for (let node: HTMLElement | null = el; node; node = node.parentElement) {
+      if (node.className.toString().includes('opacity-0')) return true;
+    }
+    return false;
+  };
+
+  it('keeps the plus visible until it is opened once, then goes back to hover-only', async () => {
+    await renderSidebar();
+    const unseen = screen.getByRole('button', { name: 'bots.list.createMenu · sidebar.navigation.new' });
+    expect(hiddenUntilHover(unseen)).toBe(false);
+
+    fireEvent.keyDown(unseen, { key: 'Enter' });
+    fireEvent.keyDown(screen.getByRole('menu'), { key: 'Escape' });
+    expect(hiddenUntilHover(screen.getByRole('button', { name: 'bots.list.createMenu' }))).toBe(true);
+  });
+
+  it('shows the same visible plus while the section is collapsed', async () => {
+    window.localStorage.setItem(sidebarOwnerStorageKey('sidebar.teammatesSection.v1', 'fixture-owner'), 'collapsed');
+    await renderSidebar();
+    const unseen = screen.getByRole('button', { name: 'bots.list.createMenu · sidebar.navigation.new' });
+    expect(hiddenUntilHover(unseen)).toBe(false);
   });
 });

@@ -31,11 +31,12 @@ function deferred<T>() {
 function harness() {
   const bindings = {
     abortRef: { current: null as AbortController | null },
+    stopRef: { current: null as AbortController | null },
     clipsRef: { current: [null, null, null] },
     recording: false, saving: false, current: 0,
-    CLIP_INDEXES: [0, 1, 2], CLIP_SECONDS: 6,
+    CLIP_INDEXES: [0, 1, 2], CLIP_SECONDS: 30,
     setClips: vi.fn(), setCurrent: vi.fn(), setRecording: vi.fn(),
-    setProgress: vi.fn(), setSaving: vi.fn(), setEnrollError: vi.fn(), setEnrolling: vi.fn(),
+    setProgress: vi.fn(), setSaving: vi.fn(), setEnrollError: vi.fn(), setEnrolling: vi.fn(), setRetryIndex: vi.fn(),
     setMobileSpeakerFilterEnabled: vi.fn(async () => {}),
     reportActionFailure: vi.fn(),
     recordMobileSpeakerClip: vi.fn(),
