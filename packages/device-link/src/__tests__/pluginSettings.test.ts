@@ -25,6 +25,10 @@ describe("sealed original settings commands", () => {
     { kind: "post", channel: "one", data: { type: "status" } },
     { kind: "poll", after: 0 },
     { kind: "confirm", requestId: "confirm-1", accepted: true },
+    { kind: 'answer-model-picker', requestId: 'model-1', route: null },
+    { kind: 'answer-model-picker', requestId: 'model-1', route: {
+      agentKind: 'codex', providerId: 'provider', model: 'model', effort: 'high', fastMode: 'ultrafast',
+    } },
     {
       kind: "answer-directory",
       requestId: "directory-1",
@@ -32,6 +36,7 @@ describe("sealed original settings commands", () => {
     },
     { kind: "authorize", path: "/oauth/account/connect" },
     { kind: "authorization-result", requestId: "authorization-1" },
+    { kind: "document", epoch: 1 },
     { kind: "close" },
   ])("parses the settings envelope for $kind", (command) => {
     expect(parsePluginSettingsRequest(request(command))).toEqual(
@@ -69,9 +74,17 @@ describe("sealed original settings commands", () => {
     { kind: "post", channel: "unsafe/channel", data: {} },
     { kind: "poll", after: Number.MAX_SAFE_INTEGER + 1 },
     { kind: "confirm", requestId: "confirm-1", accepted: "yes" },
+    { kind: 'answer-model-picker', requestId: 'model-1', route: { model: 'partial' } },
+    { kind: 'answer-model-picker', requestId: 'model-1', route: {
+      agentKind: 'codex', providerId: 'provider', model: 'model', effort: 'high', fastMode: false, apiKey: 'private',
+    } },
     { kind: "answer-directory", requestId: "directory-1", path: 42 },
     { kind: "authorization-result", requestId: "../elsewhere" },
     { kind: "close", path: "/kv" },
+    { kind: "document", epoch: 0 },
+    { kind: "document", epoch: 1.5 },
+    { kind: "document", epoch: Number.MAX_SAFE_INTEGER + 1 },
+    { kind: "document", epoch: 1, sourceId: "forged" },
     { kind: "unknown" },
   ])("rejects malformed or ambiguous $kind commands", (command) => {
     expect(parsePluginSettingsRequest(request(command))).toBeNull();

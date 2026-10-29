@@ -30,11 +30,45 @@ vi.mock('../bindings.js', () => ({ listProviderGroupBindings: () => ({}) }));
 vi.mock('../store.js', () => ({ readProviderGroup: io.group }));
 vi.mock('../coolingStore.js', () => ({ readProviderGroupCooling: () => ({}), writeProviderGroupCooling: vi.fn() }));
 
-const { getProviderGroupDirectory, getProviderGroupOwnerScope, getProviderGroupRouter, setProviderGroupClaudeUsageReader, setProviderGroupCodexUsageReader } = await import('../runtime.js');
+const { getProviderGroupDirectory, getProviderGroupOwnerScope, getProviderGroupRouter, setProviderGroupClaudeUsageReader, setProviderGroupCodexUsageReader,
+  getProviderGroupApplicationLoad, setProviderGroupApplicationLoadListener } = await import('../runtime.js');
 
 afterEach(() => { setProviderGroupClaudeUsageReader(null); setProviderGroupCodexUsageReader(null); io.group.mockReset(); vi.useRealTimers(); });
 
 describe('provider group runtime', () => {
+  // PR #7697: local group scheduling must count app bindings without sending
+  // them through a loopback remote lease. A remote group's binding is excluded.
+  it('counts local application bindings in the owning group only', () => {
+    owner = 'local-app-group-owner';
+    const load = getProviderGroupApplicationLoad();
+    const native = { isTurnRunning: () => true, onEvent: () => () => {}, onStatusChange: () => () => {} };
+    load.track('local-app', { providerId: 'member', groupAssigned: true,
+      groupBinding: { providerId: 'group', memberKey: 'device:member' } }, native);
+    load.track('other-group-app', { providerId: 'member', groupAssigned: true,
+      groupBinding: { providerId: 'group', memberKey: 'device:member', groupDeviceId: 'other' } }, native);
+    expect(getProviderGroupRouter().running('group', 'device:member')).toBe(1);
+  });
+  it('follows login and account changes without re-registering IPC or accepting old application callbacks', () => {
+    owner = 'signed-out-load';
+    getProviderGroupApplicationLoad();
+    const changed = vi.fn();
+    setProviderGroupApplicationLoadListener(changed);
+    const native = { isTurnRunning: () => true, onEvent: () => () => {}, onStatusChange: () => () => {} };
+    owner = 'first-load-owner';
+    const first = getProviderGroupApplicationLoad();
+    first.track('first', { providerId: 'p' }, native);
+    expect(changed).toHaveBeenLastCalledWith('first');
+    expect(getProviderGroupApplicationLoad().runningProviders()).toEqual(['p']);
+    owner = 'second-load-owner';
+    expect(getProviderGroupApplicationLoad().runningProviders()).toEqual([]);
+    changed.mockClear();
+    first.track('late', { providerId: 'p' }, native);
+    expect(changed).not.toHaveBeenCalled();
+    getProviderGroupApplicationLoad().track('second', { providerId: 'q' }, native);
+    expect(changed).toHaveBeenCalledExactlyOnceWith('second');
+    expect(getProviderGroupApplicationLoad().runningProviders()).toEqual(['q']);
+    setProviderGroupApplicationLoadListener(() => {});
+  });
   it('keeps the affected model through the runtime facade', () => {
     owner = 'model-cooldown-owner';
     const router = getProviderGroupRouter();
@@ -225,8 +259,8 @@ describe('provider group runtime quota account selection', () => {
     await vi.advanceTimersByTimeAsync(PROVIDER_GROUP_USAGE_READ_TIMEOUT_MS);
     for (const member of await firstRead) {
       expect(providerGroupMemberUsageState(member, 'gpt-5.3-codex', Date.now(), fastKind))
-        .toMatchObject({ limited: true, usagePercent: 100 });
-      expect(providerGroupMemberUsageState(member, 'gpt-5.3-codex', Date.now(), slowKind).usagePercent).toBeNull();
+        .toMatchObject({ limited: true, urgency: 0 });
+      expect(providerGroupMemberUsageState(member, 'gpt-5.3-codex', Date.now(), slowKind).urgency).toBeNull();
     }
     const secondRead = h.read();
     await vi.advanceTimersByTimeAsync(PROVIDER_GROUP_USAGE_READ_TIMEOUT_MS);
@@ -243,7 +277,7 @@ describe('provider group runtime quota account selection', () => {
     for (const member of await h.read()) {
       expect(providerGroupMemberUsageState(member, 'gpt-5.3-codex', Date.now(), fastKind).limited).toBe(true);
       expect(providerGroupMemberUsageState(member, 'gpt-5.3-codex', Date.now(), slowKind))
-        .toMatchObject({ limited: false, usagePercent: 25 });
+        .toMatchObject({ limited: false, urgency: expect.any(Number) });
       expect(member.codexUsage?.appServerBuckets?.__default__?.updatedAt).toBe(native ? startedAt : completedAt);
       expect(member.codexUsage?.webSnapshot?.updatedAt).toBe(native ? completedAt : startedAt);
     }
@@ -288,7 +322,7 @@ describe('provider group runtime quota account selection', () => {
     expect(result).toMatchObject({ kind: 'member', member: { key: 'local' } });
     if (result.kind === 'member') {
       expect(providerGroupMemberUsageState(result.resolved[0], model, Date.now(), native ? 'codex' : 'pi'))
-        .toMatchObject({ limited: true, usagePercent: 100 });
+        .toMatchObject({ limited: true, urgency: 0 });
     }
     await vi.advanceTimersByTimeAsync(PROVIDER_GROUP_USAGE_READ_TIMEOUT_MS);
   });

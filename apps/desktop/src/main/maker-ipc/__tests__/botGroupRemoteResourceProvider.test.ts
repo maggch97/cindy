@@ -245,6 +245,13 @@ describe('bot group remote resources', () => {
     } });
   });
 
+  it('uses creation for empty group ordering without publishing a creation notice or counting settings edits', () => {
+    const group = summary({ createdAt: 70, updatedAt: 100, lastMessage: null, openPlan: null });
+    expect(botGroupRemoteItem(group).display).toMatchObject({ timestamp: 70 });
+    expect(botGroupRemoteItem(group).display.preview).toBeUndefined();
+    expect(botGroupRemoteItem({ ...group, lastMessage: summary().lastMessage }).display.timestamp).toBe(70);
+  });
+
   it('names who shared a thread reply, never the card text, the way the desktop sidebar does', () => {
     const share = (extra: Record<string, unknown>) => botGroupRemotePreview(summary({ openPlan: null,
       lastMessage: { authorName: '小满', preview: '', createdAt: 50, threadShare: true, ...extra } as never }));
@@ -291,12 +298,18 @@ describe('bot group remote resources', () => {
   it('forwards actions to the group service and reports its error code when refused', async () => {
     const send = await remoteResourceRegistry.invoke(context, {
       client: client(), collectionId: BOT_GROUP_REMOTE_COLLECTION_ID, actionId: 'send', resourceRef: ref('g1'),
-      input: { text: '安排一下', mentions: { all: false, botIds: [] }, clientId: 'c1', division: true },
+      input: { text: '安排一下', mentions: { all: false, botIds: [] }, clientId: 'c1', division: true, quote: { messageId: 'm2' } },
     });
     expect(service.sendMessage).toHaveBeenCalledWith({
-      groupId: 'g1', text: '安排一下', mentions: { all: false, botIds: [] }, clientId: 'c1', division: true,
+      groupId: 'g1', text: '安排一下', mentions: { all: false, botIds: [] }, clientId: 'c1', division: true, quote: { messageId: 'm2' },
     }, { controllerDeviceId: 'phone-1' });
     expect(send.effects).toEqual([{ kind: 'refresh-resource', ref: ref('g1') }]);
+
+    service.getGroup.mockResolvedValueOnce({ ok: true, group: detail({ serverBacked: true }) });
+    const read = await remoteResourceRegistry.invoke(context, { client: client(), collectionId: BOT_GROUP_REMOTE_COLLECTION_ID,
+      actionId: 'read', resourceRef: ref('g1'), input: { messageId: 'm2' } });
+    expect(service.chatServer.manage).toHaveBeenCalledWith({ groupId: 'g1', action: { type: 'read', messageId: 'm2' } });
+    expect(read.effects).toEqual([]);
 
     await remoteResourceRegistry.invoke(context, {
       client: client(), collectionId: BOT_GROUP_REMOTE_COLLECTION_ID, actionId: 'plan-continue', resourceRef: ref('g1'),

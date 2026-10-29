@@ -2,6 +2,7 @@
  * Raw imports embed the same shipped Markdown in dev, tests and packaged builds.
  */
 import overview from '../../../resources/system-skills/cindy-plugin-creator/references/plugin-overview.md?raw';
+import sourceVerification from '../../../resources/system-skills/cindy-plugin-creator/references/plugin-source-verification.md?raw';
 import routineEvents from '../../../resources/system-skills/cindy-plugin-creator/references/plugin-routine-events.md?raw';
 import design from '../../../resources/system-skills/cindy-plugin-creator/references/plugin-design.md?raw';
 import structure from '../../../resources/system-skills/cindy-plugin-creator/references/plugin-structure.md?raw';
@@ -30,6 +31,7 @@ import bundledSkillsLegacy from '../../../resources/system-skills/cindy-plugin-c
 import workspaceSessions from '../../../resources/system-skills/cindy-plugin-creator/references/plugin-workspace-sessions.md?raw';
 import confirmDialog from '../../../resources/system-skills/cindy-plugin-creator/references/plugin-confirm-dialog.md?raw';
 import mainView from '../../../resources/system-skills/cindy-plugin-creator/references/plugin-main-view.md?raw';
+import taskView from '../../../resources/system-skills/cindy-plugin-creator/references/plugin-task-view.md?raw';
 import recommendations from '../../../resources/system-skills/cindy-plugin-creator/references/plugin-recommendations.md?raw';
 import panels from '../../../resources/system-skills/cindy-plugin-creator/references/plugin-panels.md?raw';
 import mobilePages from '../../../resources/system-skills/cindy-plugin-creator/references/plugin-mobile-pages.md?raw';
@@ -40,6 +42,7 @@ import compatibility from '../../../resources/system-skills/cindy-plugin-creator
 
 export const FORGE_GUIDE = [
   overview,
+  sourceVerification,
   routineEvents,
   design,
   structure,
@@ -68,6 +71,7 @@ export const FORGE_GUIDE = [
   workspaceSessions,
   confirmDialog,
   mainView,
+  taskView,
   recommendations,
   panels,
   mobilePages,

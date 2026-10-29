@@ -22,7 +22,8 @@ import type {
   PiExtraSpawnConfigContext,
   StartSessionOptions,
 } from '@cindy/maker-core';
-import { resolveMemoryScopeKey } from '@cindy/maker-core';
+import { LOCAL_AGENT_CLIENT, resolveMemoryScopeKey } from '@cindy/maker-core';
+import { createLogger } from '../../logger.js';
 
 import { credentialGrantFor } from '../executor/credentialGrants';
 import type { ExecutorCaptureHooks } from '../executor/executor';
@@ -32,12 +33,13 @@ import { RemoteConnectionPool } from './connectionPool';
 import { remoteAgentEventMapper } from './eventMap';
 import {
   collectAncestorInstructionFiles,
+  collectAncestorMarkers,
   collectInstructionImports,
   collectPersonalConfig,
   collectProjectInstructionFiles,
 } from './projectFiles';
 import type { LocalMcpTarget } from './router';
-import { RemoteAgentPoller, remoteAgentInvoker } from './runClient';
+import { RemoteAgentPoller, RemoteAgentRunClient, remoteAgentInvoker } from './runClient';
 import { startRemoteAgentSession, type PreparedRemoteMcp } from './startRemote';
 
 export interface DeviceAgentServiceDeps {
@@ -80,11 +82,6 @@ export interface DeviceAgentServiceDeps {
   webFetch?: GuardedFetch;
   /** 受邀者任务里凭证类操作确认卡上的说明(按界面语言)。 */
   sharedProviderCredentialNotice?(): string;
-  /**
-   * 名额紧张时，闲置满多少分钟的任务可以让出那台电脑上的 Agent 进程(0 = 不让)。缺省时不让，
-   * 与没有连接池时一样。每次判断时读取，设置改了立即生效。
-   */
-  idleReleaseMinutes?(): number;
   logger: Logger;
 }
 
@@ -158,13 +155,17 @@ export function remoteAgentPollerFor(
 /** Maker 的 startDeviceAgentSession 实现。 */
 export function createDeviceAgentStarter(deps: DeviceAgentServiceDeps) {
   const log = deps.logger.child('remote-agent');
+  // Agent 统一流有突发限流；启动阶段日志必须完整落在 main 流，才能解释慢启动。
+  const startupLog = createLogger('remote-agent:startup');
   const pollerFor = (deviceId: string): RemoteAgentPoller => remoteAgentPollerFor(deviceId, deps.remoteInvoke, log);
-  // 每台运行 Agent 的电脑一个连接池：对方按这台设备计名额，池里算的是本机在那台上开着的连接。
+  // 每台运行 Agent 的电脑一个连接池：对方按这台设备计名额，池里算的是本机在那台上开着的连接；
+  // 闲置多久可以让出按那台主人设置的闲置收回时长(打开前与主动让出前从 caps 读)。
   const pools = new Map<string, RemoteConnectionPool>();
   const poolFor = (deviceId: string): RemoteConnectionPool => {
     let pool = pools.get(deviceId);
     if (!pool) {
-      pool = new RemoteConnectionPool({ idleMinutes: () => deps.idleReleaseMinutes?.() ?? 0, log });
+      const invoke = remoteAgentInvoker(deviceId, deps.remoteInvoke);
+      pool = new RemoteConnectionPool({ log, readCaps: () => RemoteAgentRunClient.caps(invoke) });
       pools.set(deviceId, pool);
     }
     return pool;
@@ -202,7 +203,8 @@ export function createDeviceAgentStarter(deps: DeviceAgentServiceDeps) {
       pool: poolFor(input.deviceId),
       rgPath: deps.rgPath(),
       codexPath: () => deps.codexPath?.(),
-      ...(sessionId && deps.isGroupAssigned?.(sessionId) ? { groupAssigned: true } : {}),
+      ...(opts[LOCAL_AGENT_CLIENT]?.groupAssigned || (sessionId && deps.isGroupAssigned?.(sessionId))
+        ? { groupAssigned: true } : {}),
       ...(groupSwitch && sessionId
         ? {
             groupSwitch: {
@@ -224,6 +226,11 @@ export function createDeviceAgentStarter(deps: DeviceAgentServiceDeps) {
           }
         : {}),
       prepareMcp: async ({ kind, opts: startOpts, vendorOptions }): Promise<PreparedRemoteMcp> => {
+        const client = startOpts[LOCAL_AGENT_CLIENT];
+        if (client) return {
+          servers: new Map([[client.mcpName ?? 'client', { url: client.url, headers: { authorization: `Bearer ${client.token}` } }]]),
+          dispose() {},
+        };
         const extra = await deps.prepareMcpBridge(deps.mcpProviders(), deps.logger, {
           agentKind: kind,
           sessionId: startOpts.sessionId,
@@ -242,6 +249,7 @@ export function createDeviceAgentStarter(deps: DeviceAgentServiceDeps) {
         };
       },
       capture: ({ kind, opts: startOpts }): ExecutorCaptureHooks | undefined => {
+        if (startOpts[LOCAL_AGENT_CLIENT]) return undefined;
         // Codex 自己报告每轮改动；Claude Code 与 Pi 的写入由执行器在写之前抓取。
         if (kind === 'codex' || !startOpts.sessionId) return undefined;
         const sessionId = startOpts.sessionId;
@@ -256,13 +264,19 @@ export function createDeviceAgentStarter(deps: DeviceAgentServiceDeps) {
       collectAncestorFiles: input.agentKind === 'codex'
         ? undefined
         : (workingDir) => collectAncestorInstructionFiles(workingDir, collect),
+      // Codex 建线程时沿上级目录逐级查找 .git 与插件清单：先把有没有报过去，对方不再逐个经设备互联来问。
+      ...(input.agentKind === 'codex' ? { collectAncestorMarkers } : {}),
       collectPersonal: (kind, projectFiles) => collectPersonalConfig(kind, projectFiles, collect),
       collectImports: (imports) => collectInstructionImports(imports, collect),
       isGitRepo,
       ...(deps.extractPdfText ? { extractPdfText: deps.extractPdfText } : {}),
       mapEvent: deps.mapEvent ?? remoteAgentEventMapper,
       newId: randomUUID,
-      log,
+      log: {
+        debug: (message, fields) => startupLog.debug(message, fields),
+        info: (message, fields) => log.info(message, fields),
+        warn: (message, fields) => log.warn(message, fields),
+      },
     });
   };
 }

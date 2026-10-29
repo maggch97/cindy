@@ -8,9 +8,10 @@
 import { promises as pluginFileFs } from 'node:fs';
 import { PLUGIN_MEMBER_UPLOAD_MAX_ARCHIVE_BYTES } from '@cindy/plugin-protocol';
 import { capturePluginOauthPeer } from '../plugin-oauth/runtime.js';
-import { openRemotePluginSettings, closeRemotePluginSettings, answerRemotePluginSettingsDirectory } from '../cindy-brain/remotePluginSettingsController.js';
-import { REMOTE_PLUGIN_SETTINGS_OPEN, REMOTE_PLUGIN_SETTINGS_CLOSE, REMOTE_PLUGIN_SETTINGS_DIRECTORY_ANSWER } from '../../shared/remotePluginSettings.js';
+import { openRemotePluginSettings, closeRemotePluginSettings, answerRemotePluginSettingsDirectory, answerRemotePluginSettingsModelPicker } from '../cindy-brain/remotePluginSettingsController.js';
+import { REMOTE_PLUGIN_SETTINGS_OPEN, REMOTE_PLUGIN_SETTINGS_CLOSE, REMOTE_PLUGIN_SETTINGS_DIRECTORY_ANSWER, REMOTE_PLUGIN_SETTINGS_MODEL_ANSWER } from '../../shared/remotePluginSettings.js';
 import {
+  decodeModelSpeedPayload,
   REMOTE_RESOURCE_MANIFEST_CHANNEL,
   REMOTE_RESOURCE_INVOKE_CHANNEL,
   REMOTE_RESOURCE_PROTOCOL_VERSION,
@@ -29,14 +30,15 @@ import { PLUGIN_OAUTH_CHANNEL, PLUGIN_OAUTH_LOCAL_CHANNEL, PLUGIN_SECRET_LOCAL_C
 import { handleAssistPluginOauth, handleSubmitPluginSecret, handleSubmitPluginConnection, handleSubmitInputHandoff, handleOpenInputHandoffPicture, handleAnswerInputHandoffPicture, type LocalOauthDeps } from '../plugin-oauth/localIpc.js';
 import { LocalDeviceCodeSessions } from '../plugin-oauth/deviceCodeSessions.js';
 import { PLUGIN_OAUTH_DEVICE_CODE_CHANNEL } from '../../shared/pluginOauthDeviceCode.js';
-import { getActiveAppSession, isAppSessionBoundaryPending } from '../appSessionState.js';
+import { getActiveAppSession, isAppSessionBoundaryPending, onAppSessionInvalidated } from '../appSessionState.js';
 import {
   DL_SESSION_REFERENCE_CAPABILITY_CHANNEL,
   DeviceLinkError,
   type InvokeResultPayload,
   type LinkAcceptPayload,
 } from '@cindy/device-link';
-import { serverApiFetch, ServerApiError } from '../serverApiClient';
+import { ServerApiError } from '../serverApiClient';
+import { deviceLinkApiFetch } from './deviceLinkApi.js';
 import { requireString, throwIpcError } from '../utils/ipcValidate';
 import { assertTrustedAppRendererEvent } from '../security/trustedAppRenderer';
 import { isIpcError, type IpcErrorCode } from '../../shared/ipc-errors';
@@ -66,7 +68,6 @@ import {
   revokeController,
   restoreController,
   broadcast,
-  deviceLinkApiBase,
   applyControllerDisplayNameListSnapshot,
   applyControllerPresenceListSnapshot,
   beginControllerDisplayNameDirectoryRefresh,
@@ -82,6 +83,7 @@ import { createSentImageRetainer } from './remoteMediaPersistentCache';
 import { withOutboundReviewConfirmation } from '../maker-ipc/reviewOutboundInput.js';
 import { confirmReviewArtifacts } from '../reviewer/confirmReviewArtifacts.js';
 import { tryUploadPeerAttachment } from './filePeer';
+import { withSourceFileAccessRecovery, releaseSourceFileAccessUploads } from './sourceFileAccessRecovery';
 import { parseSharedTaskPeer, scrubSharedProviderCatalog } from '@cindy/device-link';
 import { withSharedTaskMedia } from './sharedTaskMediaContext.js';
 import {
@@ -206,7 +208,8 @@ export function defaultDeps(): DeviceLinkIpcDeps {
     },
     setEnabled: setRemoteControlEnabled,
     setKeepAwake: setKeepAwakeEnabled,
-    apiFetch: (path, opts) => serverApiFetch(path, { ...opts, baseUrl: deviceLinkApiBase }),
+    // 官方中转或自建中转(凭证与 401 语义不同,见 deviceLinkApi.ts)。
+    apiFetch: (path, opts) => deviceLinkApiFetch(path, opts),
     openLink: (deviceId: string) => openRemoteLink(deviceId),
     closeLink: closeRemoteLink,
     invoke: (...args) => {
@@ -720,12 +723,13 @@ export async function handleInvoke(
       if (projectionUnavailable) {
         throwIpcError('DEVICE_LINK_CHANNEL_NOT_ALLOWED', 'Queued content editing is not supported by the target device');
       }
-      callArgs = await withPeerAttachmentUpload((source, mime) => peer ? Promise.resolve(null) : tryUploadPeerAttachment(normalizedDeviceId, source, mime, deps.invoke), () =>
+      callArgs = await withPeerAttachmentUpload((source, mime, signal) => peer ? Promise.resolve(null) : tryUploadPeerAttachment(normalizedDeviceId, source, mime, deps.invoke, undefined, signal), () =>
         withSharedTaskMedia(peer?.role === 'host' ? peer.sharedTaskId : undefined,
           () => existing ? deps.rewriteOutboundMedia!(channel, callArgs, existing) : deps.rewriteOutboundMedia!(channel, callArgs)),
         createSentImageRetainer(normalizedDeviceId));
      } catch (err) {
-       if (isIpcError(err) && err.code === 'DEVICE_LINK_CHANNEL_NOT_ALLOWED') {
+       if (isIpcError(err) && (err.code === 'DEVICE_LINK_CHANNEL_NOT_ALLOWED'
+         || err.code === 'DEVICE_LINK_MEDIA_ACCESS_DENIED')) {
          throw err;
        }
        // Review 走同一条出方向改写管线, 但它的授权/校验拒绝不是媒体传输失败:
@@ -759,7 +763,7 @@ export async function handleInvoke(
     rethrowDeviceLinkError(err);
   }
 
-  if (result.ok) return result.result;
+  if (result.ok) return decodeModelSpeedPayload(channel, result.result);
   // 被控端透传回来的错误:IPC_ERROR 的 message 已是 `[CODE] message` 形态,
   // 直接抛原样 Error 让 renderer extractIpcError 解码;其余隧道码走映射
   if (result.error.code === 'IPC_ERROR') {
@@ -1597,6 +1601,11 @@ export function registerDeviceLinkIpc(deps: DeviceLinkIpcDeps = defaultDeps()): 
     try { await answerRemotePluginSettingsDirectory(event.sender, raw); }
     catch { throwIpcError('PRECONDITION_FAILED', 'Remote plugin directory request unavailable'); }
   });
+  ipcMain.handle(REMOTE_PLUGIN_SETTINGS_MODEL_ANSWER, async (event, raw: unknown) => {
+    assertTrustedAppRendererEvent(event);
+    try { return await answerRemotePluginSettingsModelPicker(event.sender, raw); }
+    catch { throwIpcError('PRECONDITION_FAILED', 'Remote plugin model picker unavailable'); }
+  });
   const authorizationHandler = (mode: 'oauth' | 'secret' | 'connection' | 'input') => async (event: import('electron').IpcMainInvokeEvent, raw: unknown) => {
     assertTrustedAppRendererEvent(event);
     requireDeviceLinkCapability();
@@ -1687,6 +1696,62 @@ export function registerDeviceLinkIpc(deps: DeviceLinkIpcDeps = defaultDeps()): 
         (items) => confirmReviewArtifacts(e, items),
         () => handleInvoke(diagnostics.forWindow(deps, e.sender.id), p.deviceId, p.channel, p.args),
       );
+    }
+    const interactiveAttachmentSend = ['maker:send', 'maker:steer', 'maker:input:enqueue', 'maker:input:steer', 'maker:input:update-content'].includes(String(p.channel))
+      && !(p.scheduling && typeof p.scheduling === 'object' && 'background' in p.scheduling && p.scheduling.background === true);
+    if (interactiveAttachmentSend) {
+      assertTrustedAppRendererEvent(e);
+      const owner = getActiveAppSession();
+      const transfer = new AbortController();
+      const cancel = () => transfer.abort();
+      const frame = e.senderFrame;
+      const targetWindow = BrowserWindow.fromWebContents(e.sender);
+      const assertCurrent = () => {
+        const current = getActiveAppSession();
+        if (transfer.signal.aborted || isAppSessionBoundaryPending() || !owner.dataOwnerId
+          || current.dataOwnerId !== owner.dataOwnerId || current.generation !== owner.generation
+          || e.sender.isDestroyed() || !frame || frame.detached || e.sender.mainFrame !== frame
+          || !targetWindow || targetWindow.isDestroyed()) {
+          throwIpcError('PERMISSION_DENIED', 'Attachment confirmation is no longer current');
+        }
+        assertTrustedAppRendererEvent(e);
+      };
+      const scopedDeps = diagnostics.forWindow(deps, e.sender.id);
+      // This guard also runs immediately before final message dispatch, after all file awaits.
+      const guardedDeps: DeviceLinkIpcDeps = {
+        ...scopedDeps,
+        invoke: (...args) => {
+          assertCurrent();
+          if (args[1] === p.channel) releaseSourceFileAccessUploads();
+          return scopedDeps.invoke(...args);
+        },
+      };
+      const unsubscribe = onAppSessionInvalidated(cancel);
+      e.sender.on('destroyed', cancel);
+      const onNavigation = (_event: unknown, _url: string, _inPlace: boolean, isMainFrame: boolean) => {
+        if (isMainFrame) cancel();
+      };
+      e.sender.on('did-start-navigation', onNavigation);
+      return withSourceFileAccessRecovery({
+        assertCurrent,
+        signal: transfer.signal,
+        selectFile: async (source) => {
+          assertCurrent();
+          const selected = await dialog.showOpenDialog(targetWindow!, {
+            title: t('attachmentAccessConfirmation.title'),
+            message: t('attachmentAccessConfirmation.message'),
+            buttonLabel: t('attachmentAccessConfirmation.button'),
+            defaultPath: source,
+            properties: ['openFile'],
+          });
+          assertCurrent();
+          return selected.canceled || selected.filePaths.length !== 1 ? null : selected.filePaths[0];
+        },
+      }, () => handleInvoke(guardedDeps, p.deviceId, p.channel, p.args, p.scheduling)).finally(() => {
+        unsubscribe();
+        e.sender.removeListener('destroyed', cancel);
+        e.sender.removeListener('did-start-navigation', onNavigation);
+      });
     }
     return handleInvoke(diagnostics.forWindow(deps, e.sender.id), p.deviceId, p.channel, p.args, p.scheduling);
   });

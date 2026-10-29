@@ -62,10 +62,14 @@ import {
   type ThemeColors,
 } from "@/theme";
 import {
+  splitRichAnswer,
+  type RichValues,
   richVisualStyle,
   richColor,
   richVector,
   RichAnswerStream,
+  RichSubmissionController,
+  richSendText,
   RichInteractionMemory,
   richAction,
   richChart,
@@ -82,6 +86,8 @@ import {
   type RichPalette,
   type RichValue,
 } from "@cindy/maker-shared/rich-answer";
+import { useSessionQuickSend } from './SessionQuickSendContext';
+import type { ChatFilePathContextValue } from './chatFilePathContext';
 
 /** Answer colors are Cindy theme colors; the model only names a role. */
 const richPalette = (colors: ThemeColors): RichPalette => ({
@@ -117,6 +123,44 @@ const memory = new RichInteractionMemory({
     await AsyncStorage.setItem("cindy.richAnswer.viewState.v1", value);
   },
 });
+/** Click-time copy: an export never changes the conversation's local controls. */
+export function snapshotRichAnswerValues(
+  source: string,
+  scope: {
+    userId: string | undefined;
+    origin: Pick<ChatFilePathContextValue, 'deviceId' | 'sessionId'> | null;
+    messageKey: string;
+  },
+): Readonly<Record<number, RichValues>> {
+  const stateKey = `${scope.userId ?? 'signed-out'}:${scope.origin?.deviceId ?? ''}:${scope.origin?.sessionId ?? ''}:${scope.messageKey}`;
+  return Object.fromEntries(
+    splitRichAnswer(source)
+      .filter((part) => part.kind === "rich")
+      .map((part) => [part.key, { ...memory.get(`${stateKey}:${part.key}`) }]),
+  );
+}
+
+const submissions = new RichSubmissionController(memory);
+
+function RichSendAction({ node, text, receiptKey, ready, style, buttonTextStyle }: {
+  node: RichNode; text: string | undefined; receiptKey: string; ready: boolean;
+  style?: StyleProp<ViewStyle>; buttonTextStyle: TextStyle;
+}) {
+  const { t } = useTranslation();
+  const styles = useThemedStyles(makeStyles);
+  const sender = useSessionQuickSend();
+  const status = useSyncExternalStore(submissions.subscribe, () => submissions.status(receiptKey, text));
+  const disabled = !ready || !sender || !text || status === 'sending' || status === 'sent';
+  return <View style={[styles.stack, style]}>
+    {text ? <Text style={styles.caption}>{text}</Text> : null}
+    <Pressable accessibilityRole="button" accessibilityState={{ disabled, busy: status === 'sending' }} disabled={disabled}
+      style={styles.button}
+      onPress={() => { if (!disabled) void submissions.submit(receiptKey, text, sender); }}>
+      <Text style={buttonTextStyle}>{status === 'sending' ? t('message.richAnswer.sending') : status === 'sent' ? t('message.richAnswer.sent') : richString(node, 'label', richString(node, 'text')) || t('message.richAnswer.send')}</Text>
+    </Pressable>
+    {status === 'failed' ? <Text accessibilityRole="alert" style={styles.caption}>{t('message.richAnswer.sendFailed')}</Text> : null}
+  </View>;
+}
 type Props = {
   source: string;
   complete: boolean;
@@ -403,8 +447,12 @@ function RichDocumentView({
           </View>
         );
       case "button":
+        if (Object.prototype.hasOwnProperty.call(node.props, 'send'))
+          return <RichSendAction node={node} text={richSendText(node, values)} receiptKey={`${stateKey}:sent:${id}`} ready={complete && !doc.issues} buttonTextStyle={styles.buttonText} />;
         return button(label || richString(node, "text"), () => apply(node));
       case "form":
+        if (Object.prototype.hasOwnProperty.call(node.props, 'send'))
+          return <View style={styles.stack}>{children}<RichSendAction node={node} text={richSendText(node, values)} receiptKey={`${stateKey}:sent:${id}`} ready={complete && !doc.issues} buttonTextStyle={styles.buttonText} /></View>;
         return (
           <View style={styles.stack}>
             {children}
