@@ -1,3 +1,4 @@
+import { ErrorNotice } from '@/components/ui/error-notice';
 import { Button } from '@/components/ui/button';
 /**
  * DetailView — a single Subagent run, read as a conversation.
@@ -65,10 +66,13 @@ import {
   runTitle,
 } from './subagentFormat';
 
+import type { ErrorDiagnosisSource } from '@/lib/errorDiagnosisPrompt';
+
 export type SubagentControlIntent = 'steer' | 'follow_up' | 'resume';
 
 export interface SubagentDetailViewProps {
   detail: SubagentRunDetail | null;
+  onDiagnose?: (source: ErrorDiagnosisSource) => void;
   loading: boolean;
   workdir: string;
   allowPrivilegedLinks: boolean;
@@ -268,6 +272,7 @@ function PiDurableDetailView({
   onBack,
   onStop,
   onControl,
+  onDiagnose,
 }: SubagentDetailViewProps) {
   const { t } = useTranslation();
   const { preference: sendShortcutPreference } = useComposerSendShortcutPreference();
@@ -591,7 +596,15 @@ function PiDurableDetailView({
             </div>
           ) : null}
 
-          {rawError ? <SubagentErrorNotice rawError={rawError} /> : null}
+          {rawError ? (
+            <SubagentErrorNotice
+              rawError={rawError}
+              onDiagnose={onDiagnose ? (source) => onDiagnose({
+                ...source,
+                details: `subagentRunId: ${detail.id}\n${selectedChild ? `childId: ${selectedChild.id}\n` : ''}${source.details}`,
+              }) : undefined}
+            />
+          ) : null}
 
           {selectedOutputTruncated ? (
             <p className="text-11 text-[var(--text-tertiary)]">
@@ -718,9 +731,7 @@ function PiDurableDetailView({
               </Tip>
             </div>
             {controlError ? (
-              <p role="alert" className="px-2 text-11 text-[var(--error-fg)]">
-                {t('rightSidebar.subagents.controlFailed')}
-              </p>
+              <ErrorNotice role="alert" message={t('rightSidebar.subagents.controlFailed')} />
             ) : null}
           </div>
         </div>

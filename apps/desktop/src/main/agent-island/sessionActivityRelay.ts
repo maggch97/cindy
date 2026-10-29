@@ -62,7 +62,7 @@ export class SessionActivityRelay {
       if (!activity.sessionId) continue;
       activeSessionIds.add(activity.sessionId);
       const payload = toSessionActivityPayload(activity);
-      if (this.checkCompletion && payload.phase === 'completed' && payload.attention) {
+      if (this.checkCompletion && payload.phase === 'completed' && payload.attention && payload.completionNotification !== 'silent') {
         this.publishCompletion(activity, payload);
       } else {
         this.awaitingTerminal.delete(activity.sessionId);
@@ -159,7 +159,7 @@ export class SessionActivityRelay {
       if (!activity.sessionId) continue;
       seenSessionIds.add(activity.sessionId);
       const check = this.completionChecks.get(activity.sessionId);
-      const payload = activity.phase === 'completed' && activity.attention && check?.startedAtMs === activity.startedAtMs
+      const payload = activity.phase === 'completed' && activity.attention && activity.completionNotification !== 'silent' && check?.startedAtMs === activity.startedAtMs
         ? check.payload : toSessionActivityPayload(activity);
       emit(isPublishableActivity(payload) ? payload : toTerminalActivityPayload(activity.sessionId));
     }
@@ -301,10 +301,13 @@ export class SessionActivityRelay {
 
 function toSessionActivityPayload(activity: AgentIslandSessionActivity): SessionActivityPayload {
   return {
+    ...(activity.completionToken ? { completionToken: activity.completionToken } : {}),
+    ...(activity.completionNotification ? { completionNotification: activity.completionNotification } : {}),
     sessionId: activity.sessionId,
     phase: activity.phase,
     workingPhase: activity.workingPhase,
     compactDetail: activity.compactDetail,
+    ...(activity.summaryFormat ? { summaryFormat: activity.summaryFormat } : {}),
     interactionKind: activity.interactionKind,
     attention: activity.attention,
   };
@@ -333,9 +336,11 @@ function toTerminalActivityPayload(sessionId: string): SessionActivityPayload {
 
 function activitySignature(payload: SessionActivityPayload): string {
   return [
+    payload.completionToken ?? '',
     payload.phase,
     payload.completionNotification ?? '',
     payload.compactDetail,
+    payload.summaryFormat ?? '',
     payload.workingPhase,
     payload.interactionKind ?? '',
     payload.attention === true ? '1' : '0',

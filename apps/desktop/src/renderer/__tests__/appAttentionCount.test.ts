@@ -66,20 +66,29 @@ describe('app attention total', () => {
             session('local'),
             session('remote', { deviceLinkDeviceId: 'device-a' }),
             session('scheduler', { source: 'scheduler' }),
-            session('learn', { source: 'learn' }),
             session('legacy', { title: '[Schedule] nightly', source: 'desktop' }),
           ],
           attentionKinds: new Map([
             ['local', 'done'],
             ['remote', 'done'],
             ['scheduler', 'error'],
-            ['learn', 'awaiting'],
             ['legacy', 'done'],
           ]),
           localSchedules: new Map([
             ['remote', { hasUnreadRun: true, hasUnreadFailedRun: true }],
             ['scheduler', { hasUnreadRun: true, hasUnreadFailedRun: true }],
           ]),
+        }),
+      ),
+    ).toBe(1);
+  });
+
+  it('counts a local learn session that is awaiting review', () => {
+    expect(
+      countAppAttention(
+        input({
+          sessions: [session('learn', { source: 'learn' })],
+          attentionKinds: new Map([['learn', 'awaiting']]),
         }),
       ),
     ).toBe(1);
@@ -201,5 +210,37 @@ describe('app attention total', () => {
         }),
       ),
     ).toBe(0);
+  });
+
+  it('counts an Orca Lead once for its workers\' error / awaiting, matching the Lead row', () => {
+    const sessions = [
+      session('lead', { orcaRole: 'lead' }),
+      session('w1', { orcaRole: 'worker' }),
+      session('w2', { orcaRole: 'worker' }),
+    ];
+    const attentionKinds = new Map<string, 'done' | 'awaiting' | 'error'>([
+      ['w1', 'error'],
+      ['w2', 'awaiting'],
+    ]);
+    // 汇总表由 orcaLeadWorkerAttention 派生;两个 Worker 出问题,Lead 仍只算 1。
+    expect(
+      countAppAttention(input({
+        sessions,
+        attentionKinds,
+        orcaLeadWorkerAttention: new Map([['lead', 'error']]),
+      })),
+    ).toBe(1);
+    // Lead 运行中 + Worker 等待确认:等待确认盖过运行中,计入角标。
+    expect(
+      countAppAttention(input({
+        sessions,
+        attentionKinds,
+        runningSessionIds: new Set(['lead']),
+        localActivities: new Map([['lead', { phase: 'running', currentTurnActive: true }]]),
+        orcaLeadWorkerAttention: new Map([['lead', 'awaiting']]),
+      })),
+    ).toBe(1);
+    // 没有汇总时 Worker 自身不计入。
+    expect(countAppAttention(input({ sessions, attentionKinds }))).toBe(0);
   });
 });

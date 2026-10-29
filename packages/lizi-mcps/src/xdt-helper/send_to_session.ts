@@ -35,7 +35,7 @@ export type SendToSessionCallback = (params: {
   /** create 模式可选:显式推理强度；缺省继承 dispatcher。jump 忽略。 */
   effort?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
   /** create 模式可选:显式 Fast 开关；缺省继承 dispatcher。jump 忽略。 */
-  fast?: boolean;
+  fast?: boolean | 'ultrafast';
 }) => Promise<
   ControlResult<
     {
@@ -51,7 +51,7 @@ export type SendToSessionCallback = (params: {
       worktreePath?: string | null;
       model?: string;
       effort?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | null;
-      fastMode?: boolean;
+      fastMode?: boolean | 'ultrafast';
       providerId?: string | null;
     },
     | "NOT_FOUND"
@@ -134,7 +134,7 @@ const DESCRIPTION = [
   "",
   "【失败码语义】",
   "- NOT_FOUND: 目标 session 不存在。skill 应清掉自己的绑定并回退到新建/普通流程。",
-  "- ARCHIVED: 目标 session 已归档。skill 应决定是清绑定、回退新流程,还是等未来的 unarchive 工具。",
+  "- ARCHIVED: 目标 session 已归档。已有恢复授权时，可先用 control/unarchive_sessions（支持 deviceId::sessionId）恢复，再发送新消息；不能自行推翻用户归档意图。",
   "- DELETED: 目标 session 已删除。skill 应清绑定并回退。",
   "- BUSY: 仅 create 模式的罕见兜底(新建 session 意外已有 turn 在跑)。jump 模式撞忙不再返 BUSY,而是入队并成功返回 wake_kind=queued。",
   "- WORKTREE_UNAVAILABLE: 仅 create + use_worktree=true:无法创建 worktree(非 git 仓库 / git 未装 / git worktree add 失败,message 带具体原因)。skill 决定是去掉 use_worktree 重试还是放弃。",
@@ -188,10 +188,10 @@ export function registerSendToSessionTool(
         .string()
         .min(1)
         .describe(
-          "要 handoff 给目标 session 的消息正文(create 模式下作为新 session 的首条消息)。",
+          "要发送的消息。当前输入属于主人请求或已核实转交时，宿主保留同一份用户原话；只补充必要上下文，不扩大范围或要求重复确认。缺少背景先查看来源任务。自主消息、自动化通知和结果回传按正文发送。",
         ),
       message_purpose: z.enum(["coordination", "user-visible"]).optional().describe(
-        "委派子任务发给发起伙伴默认 coordination：送达模型但内部文字不进正文或通知。user-visible 用于用户要求的结果、需要用户介入的消息。其他普通任务默认保持可见；coordination 仅限宿主核实的委派关系。正常完成自动回传，无需重发。",
+        "委派子任务发给发起伙伴默认 coordination：原始来信隐藏，伙伴处理后的进度和结果可直接正常回复。user-visible 让来信本身可见。其他普通任务默认保持可见；coordination 仅限宿主核实的委派关系，不改变操作权限。正常完成自动回传，无需重发。",
       ),
       title: z
         .string()
@@ -231,7 +231,7 @@ export function registerSendToSessionTool(
           "仅 create 模式可选:目标模型推理强度。按实际 provider+model 支持档位校验；jump 模式忽略。",
         ),
       fast: z
-        .boolean()
+        .union([z.boolean(), z.literal('ultrafast')])
         .optional()
         .describe(
           "仅 create 模式可选:Fast 模式开关。目标 Agent/provider/model 不支持时创建前失败；jump 模式忽略。",

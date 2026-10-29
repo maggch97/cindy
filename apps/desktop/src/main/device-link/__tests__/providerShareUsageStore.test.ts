@@ -19,6 +19,64 @@ describe('provider share usage store', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  // Unit, real ledger entry: personal ratios must isolate identity/provider/date and exclude cache.
+  // Existing range tests do not cover midnight recovery or a failed ledger becoming a false 0%.
+  it('reconstructs only one member/provider over seven local dates and advances at midnight', async () => {
+    let now = new Date(2026, 9, 22, 10).getTime();
+    const file = path.join(dir, 'usage.json');
+    const store = createProviderShareUsageStore(file, { now: () => now });
+    const write = (share: string, member: string, provider: string, model: string, tokens: number) =>
+      store.record(share, member, { kind: 'codex', providerId: provider, memberKey: 'local', samples: [{ ...sample(model, tokens, 0), cacheReadTokens: 99999 }] });
+    write('s', 'alice', 'p', 'new-model', 60);
+    write('s', 'bob', 'p', 'new-model', 900);
+    write('s', 'alice', 'another-provider', 'new-model', 900);
+    write('another-share', 'alice', 'p', 'new-model', 900);
+    now = new Date(2026, 9, 28, 10).getTime();
+    write('s', 'alice', 'p', 'other-model', 40);
+    const current = store.memberTokenSnapshot(new Set(['s']), 'p', 'alice');
+    expect(current).toMatchObject({ available: true, windowStart: '2026-10-22', windowEnd: '2026-10-28',
+      models: [{ model: 'new-model', tokens: 60 }, { model: 'other-model', tokens: 40 }] });
+    now = current.nextWindowAt;
+    expect(store.memberTokenSnapshot(new Set(['s']), 'p', 'alice')).toMatchObject({ windowStart: '2026-10-23', models: [{ model: 'other-model', tokens: 40 }] });
+    await store.flush();
+    expect(createProviderShareUsageStore(file, { now: () => now }).memberTokenSnapshot(new Set(['s']), 'p', 'alice').models).toEqual([{ model: 'other-model', tokens: 40 }]);
+  });
+  it('marks corrupt usage unavailable across subsequent writes and reloads', async () => {
+    const file = path.join(dir, 'usage.json');
+    fs.writeFileSync(file, '{broken');
+    const store = createProviderShareUsageStore(file);
+    expect(store.memberTokenSnapshot(new Set(['s']), 'p', 'alice').available).toBe(false);
+    store.record('s', 'alice', { kind: 'codex', providerId: 'p', memberKey: 'local', samples: [sample('model', 1, 0)] });
+    await store.flush();
+    expect(createProviderShareUsageStore(file).memberTokenSnapshot(new Set(['s']), 'p', 'alice').available).toBe(false);
+  });
+
+  // Unit: production snapshot/flush/reload must stop pausing once missing data leaves the window.
+  // Regression #7666/r4398894972: the prior corrupt-file case only checked fail-closed, not recovery.
+  // Minimal input: one corruption marker, a complete new row, restart next day, then advance seven dates.
+  it.each(['corrupt-json', 'legacy-marker', 'dated-invalid-row'] as const)(
+    'recovers after incomplete data leaves seven local dates, including reloads (%s)', async (damage) => {
+      let now = new Date(2026, 9, 22, 12).getTime();
+      const file = path.join(dir, 'usage.json');
+      fs.writeFileSync(file, damage === 'corrupt-json' ? '{broken' : JSON.stringify({ version: 1,
+        rows: damage === 'dated-invalid-row' ? [{ day: '2026-10-21', inputTokens: -1 }] : [],
+        ...(damage === 'legacy-marker' ? { incomplete: true } : {}),
+      }));
+      let store = createProviderShareUsageStore(file, { now: () => now });
+      const snapshot = () => store.memberTokenSnapshot(new Set(['s']), 'p', 'alice');
+      expect(snapshot().available).toBe(false);
+      await store.flush();
+      now = new Date(2026, 9, 23, 12).getTime();
+      store = createProviderShareUsageStore(file, { now: () => now });
+      expect(snapshot().available).toBe(false);
+      store.record('s', 'alice', { kind: 'codex', providerId: 'p', memberKey: 'local', samples: [sample('model', 10, 5)] });
+      await store.flush();
+      now = new Date(2026, 9, damage === 'dated-invalid-row' ? 28 : 29, 12).getTime();
+      store = createProviderShareUsageStore(file, { now: () => now });
+      expect(snapshot()).toMatchObject({ available: true, models: [{ model: 'model', tokens: 15 }] });
+    },
+  );
+
   it('aggregates per member and model, filters by range and only returns requested shares', async () => {
     let now = new Date(2026, 9, 7, 12).getTime();
     const file = path.join(dir, 'usage.json');
@@ -73,6 +131,70 @@ describe('provider share usage store', () => {
     fs.writeFileSync(file, JSON.stringify(saved));
     const after = createProviderShareUsageStore(file, { now: () => now }).query(new Set(['s']), 'all')[0]!.models;
     expect(after.find((model) => model.memberKey === null)).toMatchObject({ turns: 5, inputTokens: 50 });
+  });
+
+  // 「用量」块按天筛选(provider-groups.md §7)：每天按组内电脑拆开，拆法与 query 相同。
+  it('lists daily usage per member split by computer, newest day first and only for requested shares', () => {
+    let now = new Date(2026, 9, 10, 12).getTime();
+    const file = path.join(dir, 'usage.json');
+    fs.writeFileSync(file, JSON.stringify({
+      version: 1,
+      rows: [{
+        day: '2026-10-09', shareId: 's', memberId: 'm', kind: 'claude-code', providerId: 'anthropic', model: 'opus',
+        turns: 3, inputTokens: 30, outputTokens: 3, cacheReadTokens: 0, cacheCreateTokens: 0, sdkCostUsd: 0, lastAt: 1,
+      }],
+    }));
+    const store = createProviderShareUsageStore(file, { now: () => now });
+    store.record('s', 'm', { kind: 'claude-code', providerId: 'anthropic', memberKey: 'local', samples: [sample('opus', 10, 1)] });
+    store.record('s', 'm', { kind: 'claude-code', providerId: 'anthropic', memberKey: 'device:studio:a2', samples: [sample('opus', 20, 2)] });
+    now = new Date(2026, 9, 11, 12).getTime();
+    store.record('s', 'm', { kind: 'claude-code', providerId: 'anthropic', memberKey: 'local', samples: [sample('opus', 5, 5)] });
+    store.record('other', 'x', { kind: 'codex', providerId: 'openai', memberKey: 'local', samples: [sample('gpt', 1, 1)] });
+
+    const history = store.history(new Set(['s']));
+    expect(history).toHaveLength(1);
+    expect(history[0]).toMatchObject({ shareId: 's', memberId: 'm', lastUsedAt: now });
+    expect(history[0]!.days.map((row) => [row.day, row.memberKey, row.inputTokens])).toEqual([
+      ['2026-10-11', 'local', 5],
+      ['2026-10-10', 'local', 10],
+      ['2026-10-10', 'device:studio:a2', 20],
+      // 加组内电脑之前记的：没有区分电脑。
+      ['2026-10-09', null, 30],
+    ]);
+  });
+
+  it('bounds daily expansion before splitting every stored computer distribution', () => {
+    let now = new Date(2026, 9, 12, 12).getTime();
+    const file = path.join(dir, 'bounded-history.json');
+    const store = createProviderShareUsageStore(file, { now: () => now });
+    store.record('s', 'm', { kind: 'claude-code', providerId: 'anthropic', memberKey: 'device:new', samples: [sample('new', 1, 1)] });
+    now = new Date(2026, 9, 11, 12).getTime();
+    store.record('s', 'm', { kind: 'claude-code', providerId: 'anthropic', memberKey: 'device:old', samples: [sample('old', 1, 1)] });
+    const history = store.history(new Set(['s']), { maxRows: 1 });
+    expect(history[0]).toMatchObject({ shareId: 's', memberId: 'm', lastUsedAt: new Date(2026, 9, 12, 12).getTime() });
+    expect(history[0]?.days).toHaveLength(1);
+    expect(history[0]?.days[0]).toMatchObject({ day: '2026-10-12', model: 'new', memberKey: 'device:new' });
+  });
+
+  it('applies the split-row budget across members after excluding removed members', () => {
+    let now = new Date(2026, 9, 10, 12).getTime();
+    const store = createProviderShareUsageStore(path.join(dir, 'split-history.json'), { now: () => now });
+    const record = (memberId: string, memberKey: string) => store.record('s', memberId, {
+      kind: 'claude-code', providerId: 'anthropic', memberKey, samples: [sample('opus', 1, 1)],
+    });
+    record('m', 'device:old');
+    now = new Date(2026, 9, 11, 12).getTime();
+    for (let index = 0; index < 512; index++) record('m', `device:d${index}`);
+    now = new Date(2026, 9, 12, 12).getTime();
+    record('removed', 'local');
+    const history = store.history(new Set(['s']), {
+      maxRows: 3, memberKeys: new Set([JSON.stringify(['s', 'm'])]),
+    });
+    expect(history).toHaveLength(1);
+    expect(history[0]?.days).toHaveLength(3);
+    expect(history[0]?.days.every((row) => row.day === '2026-10-11')).toBe(true);
+    expect(history[0]?.days.map((row) => row.memberKey)).toEqual(['device:d0', 'device:d1', 'device:d2']);
+    expect(history[0]?.lastUsedAt).toBe(new Date(2026, 9, 11, 12).getTime());
   });
 
   it('keeps existing computer distributions and all counters after exceeding the per-row capacity and restarting', async () => {

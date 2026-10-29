@@ -19,11 +19,47 @@ import type {
 import type { TelegramApiClient, TgFile, TgMediaFile, TgMessage, TgMessageEntity, TgUser } from './api.js';
 import { audioVideoMimeOf, classifyInboundAttachment } from '../inboundKind.js';
 import { encodeMessageId } from './codec.js';
+import { telegramMessageText, telegramReplyText } from './messageText.js';
 
 /** Bot API getFile 的官方下载上限(20MB), 超过标注 oversize 不下载。 */
 const MAX_INBOUND_FILE_BYTES = 20 * 1024 * 1024;
 /** 附件下载超时 — 与 Discord 通道同参数。 */
 const DOWNLOAD_TIMEOUT_MS = 30_000;
+
+export interface TelegramHistoryImageRef {
+  fileId: string;
+  name: string;
+  mimeType: string;
+  /** Official relay proof; personal bots use their own Bot API connection. */
+  downloadToken?: string;
+}
+
+export function historyImageRefsOf(m: TgMessage): TelegramHistoryImageRef[] {
+  if (m.has_protected_content === true) return [];
+  const refs: TelegramHistoryImageRef[] = [];
+  const best = m.photo?.reduce(
+    (a, b) => (b.width * b.height > a.width * a.height ? b : a),
+    m.photo[0],
+  );
+  if (best && (best.file_size ?? 0) <= MAX_INBOUND_FILE_BYTES) {
+    refs.push({
+      fileId: best.file_id,
+      name: 'photo.jpg',
+      mimeType: 'image/jpeg',
+    });
+  }
+  if (m.document && (m.document.file_size ?? 0) <= MAX_INBOUND_FILE_BYTES) {
+    const name = m.document.file_name ?? 'image';
+    const classified = classifyInboundAttachment(m.document.mime_type, name);
+    if (classified.kind === 'image')
+      refs.push({
+        fileId: m.document.file_id,
+        name: name.slice(0, 256),
+        mimeType: classified.mimeType,
+      });
+  }
+  return refs;
+}
 
 export interface TelegramGroupWindowEntry {
   /**
@@ -40,6 +76,7 @@ export interface TelegramGroupWindowEntry {
   author: { name: string; isBot?: boolean };
   text: string;
   fileNames?: string[];
+  imageRefs?: TelegramHistoryImageRef[];
   sentAt: number;
 }
 
@@ -74,7 +111,8 @@ export function groupWindowEntryOf(m: TgMessage): Omit<TelegramGroupWindowEntry,
       name: displayNameOf(m.from),
       ...(m.from?.is_bot ? { isBot: true } : {}),
     },
-    text: m.text ?? m.caption ?? '',
+    text: telegramMessageText(m),
+    imageRefs: historyImageRefsOf(m),
     ...(fileNames.length > 0 ? { fileNames } : {}),
     sentAt: m.date * 1000,
   };
@@ -121,9 +159,7 @@ export function detectGroupTrigger(
   }
   const repliedToBot = m.reply_to_message?.from?.id === botId;
   if (!mentioned && !repliedToBot) {
-    // 名字召唤(OpenClaw 习惯, Chris 2026-07-30 实测踩坑): 显示名不是
-    // username, 手打 "@Ivy" 或开头喊 "Ivy ..." 不构成 Telegram mention,
-    // 但用户预期就是在叫 bot — 按显示名匹配补上这类召唤。
+    // 兼容手打 @显示名；单纯聊到名字（即使在句首）不是召唤。
     const summoned = botName ? matchNameSummon(sourceText, botName) : null;
     if (summoned === null) return null;
     return { text: summoned };
@@ -138,26 +174,17 @@ export function detectGroupTrigger(
 /**
  * 显示名召唤匹配:
  *   - `@显示名` 任意位置(如 "@Ivy 你在?" — 大小写不敏感, 后面不能紧跟字母数字);
- *   - 裸显示名在**句首**且后跟分隔符/结尾(如 "Ivy 帮我看看" / "ivy?")。
- * 句中出现名字(如 "我问过 Ivy 了")不算召唤 — 只是聊到它, 避免误触发。
+ * 没有 @ 的显示名无论在句首、句中还是独占一条都不算召唤。
  * 命中后剥掉召唤 token；空正文由事件的 invoked 标记保留召唤事实。
  */
 function matchNameSummon(sourceText: string, botName: string): string | null {
   const name = botName.trim();
   if (name.length < 2) return null;
   const esc = escapeRegExp(name);
-  const SEP = '[\\s,，。:：、!！?？~〜]';
-  const atRe = new RegExp(`@${esc}(?![\\w])`, 'gi');
-  const leadRe = new RegExp(`^\\s*${esc}(?=$|${SEP})`, 'i');
-  let cleaned: string | null = null;
+  const atRe = new RegExp(`@${esc}(?![A-Za-z0-9_])`, 'gi');
   const atStripped = sourceText.replace(atRe, ' ');
-  if (atStripped !== sourceText) {
-    cleaned = atStripped;
-  } else if (leadRe.test(sourceText)) {
-    cleaned = sourceText.replace(leadRe, '').replace(new RegExp(`^${SEP}+`), '');
-  }
-  if (cleaned === null) return null;
-  const text = cleaned.replace(/[ \t]{2,}/g, ' ').trim();
+  if (atStripped === sourceText) return null;
+  const text = atStripped.replace(/[ \t]{2,}/g, ' ').trim();
   return text;
 }
 
@@ -216,23 +243,24 @@ export interface NormalizeContext {
  */
 export function replyContextOf(
   m: TgMessage,
-): { author: string; text: string; isBot?: boolean } | null {
+): { messageId: string; author: string; text: string; isBot?: boolean } | null {
   const replied = m.reply_to_message;
   if (!replied) return null;
   // 受保护群里被引用的原消息不进 prompt: 引用块会把原文原样带进模型上下文,
   // 那和把它写进本地池是同一次外传。与官方 bot「被引消息受保护则原文与附件
   // 都不外传」同一语义。触发轮次本身照常跑, 只是不带原文。
   if (replied.has_protected_content === true || m.has_protected_content === true) return null;
-  let text = replied.text ?? replied.caption ?? '';
+  let text = telegramReplyText(m);
   if (!text) {
     if (replied.photo && replied.photo.length > 0) text = '[图片]';
     else if (replied.document) text = `[文件: ${replied.document.file_name ?? 'document'}]`;
     else if (replied.voice) text = '[语音消息]';
     else if (replied.video) text = '[视频]';
     else if (replied.sticker) text = `[贴纸${replied.sticker.emoji ? ` ${replied.sticker.emoji}` : ''}]`;
-    else return null; // 服务消息等无内容形态, 不构造空引用
+    else text = '[引用消息的正文无法读取]';
   }
   return {
+    messageId: String(replied.message_id),
     author: displayNameOf(replied.from),
     text,
     ...(replied.from?.is_bot ? { isBot: true } : {}),
@@ -551,7 +579,10 @@ async function downloadTelegramFile(
 }
 
 /** getFile + 下载字节; 任一跳失败返回 null。 */
-async function fetchTelegramFileBytes(ctx: NormalizeContext, fileId: string): Promise<Buffer | null> {
+export async function fetchTelegramFileBytes(
+  ctx: NormalizeContext,
+  fileId: string,
+): Promise<Buffer | null> {
   try {
     // getFile 与下载 fetch 同在轮询循环的 await 链上 — 两跳都必须带超时,
     // 否则任一悬死连接(TCP 半开/代理黑洞)会卡住全部入站直到进程重启。
@@ -560,12 +591,20 @@ async function fetchTelegramFileBytes(ctx: NormalizeContext, fileId: string): Pr
       { file_id: fileId },
       AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
     );
-    if (!file.file_path) return null;
+    if (!file.file_path || (file.file_size ?? 0) > MAX_INBOUND_FILE_BYTES) return null;
     const res = await fetch(ctx.api.fileUrl(file.file_path), {
       signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
     });
     if (!res.ok) return null;
-    return Buffer.from(await res.arrayBuffer());
+    if (!res.body) return null;
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    for await (const chunk of res.body) {
+      size += chunk.byteLength;
+      if (size > MAX_INBOUND_FILE_BYTES) return null;
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks);
   } catch {
     return null;
   }

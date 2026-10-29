@@ -581,6 +581,25 @@ describe('findWindowsGitBash', () => {
 });
 
 describe('shared provider credentials', () => {
+  it('stops asking as soon as the share is set to skip credential confirmations, and asks again once it is switched back', () => {
+    const workspace = new ExecutorWorkspace({ workingDir: project });
+    let skip = false;
+    const gate = new ExecutorGate(workspace, 'full', Date.now, { confirmCredentials: () => !skip });
+    const action: ExecutorAction = { kind: 'read', path: path.join(project, '.env') };
+    expect(gate.needsCredentialConsent(action)).toBe(true);
+    expect(gate.authorize(action).ok).toBe(false);
+
+    skip = true;
+    expect(gate.needsCredentialConsent(action)).toBe(false);
+    expect(gate.authorize(action)).toEqual({ ok: true, elevated: true });
+    // 跳过期间的「本任务总是允许」不建立授权：切回来后仍要确认。
+    gate.allowCredentialsForSession();
+
+    skip = false;
+    expect(gate.needsCredentialConsent(action)).toBe(true);
+    expect(gate.authorize(action).ok).toBe(false);
+  });
+
   it('preserves same-account command approval while sharing checks nested credential reads', () => {
     const workspace = new ExecutorWorkspace({ workingDir: project });
     const sameAccount = new ExecutorGate(workspace, 'normal');
@@ -598,7 +617,7 @@ describe('shared provider credentials', () => {
 
   function sharedExecutor(
     mode: ReturnType<typeof executorGateModeFor>,
-    confirm?: (action: ExecutorAction) => Promise<ExecutorConfirmation>,
+    confirm?: RemoteExecutorOptions['confirm'],
     gitCredentials?: GitCredentialHistory,
     credentialGrant?: RemoteExecutorOptions['credentialGrant'],
   ) {
@@ -750,7 +769,7 @@ describe('shared provider credentials', () => {
     try {
       expect(gate.authorize(action).ok).toBe(false);
       expect(await executor.confirm(action)).toBe(false);
-      expect(asked).toHaveBeenCalledExactlyOnceWith(action);
+      expect(asked).toHaveBeenCalledExactlyOnceWith(action, expect.any(AbortSignal));
       expect(gate.authorize(action).ok).toBe(false);
     } finally {
       await executor.close();
@@ -775,7 +794,7 @@ describe('shared provider credentials', () => {
       const denied = await executor.callTool('Bash', { command: action.command });
       expect(denied.isError).toBe(true);
       expect(text(denied)).not.toContain('PRIVATE_FIXTURE=changed-target');
-      expect(asked).toHaveBeenCalledExactlyOnceWith(action);
+      expect(asked).toHaveBeenCalledExactlyOnceWith(action, expect.any(AbortSignal));
     } finally {
       await executor.close();
     }
@@ -801,7 +820,7 @@ describe('shared provider credentials', () => {
     gate.recordCredentialExemption(compound);
     try {
       expect(await executor.confirm(compound)).toBe(false);
-      expect(asked).toHaveBeenCalledExactlyOnceWith(compound);
+      expect(asked).toHaveBeenCalledExactlyOnceWith(compound, expect.any(AbortSignal));
       expect(gate.authorize(compound).ok).toBe(false);
       expect(gate.authorize(ordinary).ok).toBe(false);
     } finally {
@@ -961,7 +980,7 @@ describe('shared provider credentials', () => {
       else resolve(answer);
       expect(await Promise.all(pending)).toEqual([answer === true, false]);
       expect(confirm).toHaveBeenCalledTimes(2);
-      expect(confirm).toHaveBeenNthCalledWith(2, second);
+      expect(confirm).toHaveBeenNthCalledWith(2, second, expect.any(AbortSignal));
       expect(executor.check(first).ok).toBe(answer === true);
       expect(executor.check(first).ok).toBe(false);
       expect(executor.check(second).ok).toBe(false);
@@ -1017,7 +1036,7 @@ describe('shared provider credentials', () => {
       answers[0](true);
       expect(await pending[0]).toBe(true);
       await vi.waitFor(() => expect(confirm).toHaveBeenCalledTimes(2));
-      expect(confirm).toHaveBeenNthCalledWith(2, third);
+      expect(confirm).toHaveBeenNthCalledWith(2, third, expect.any(AbortSignal));
       answers[1](true);
       expect(await pending[2]).toBe(true);
     } finally {
@@ -1039,7 +1058,7 @@ describe('shared provider credentials', () => {
       expect(confirm).toHaveBeenCalledTimes(1);
       abort.abort();
       await vi.waitFor(() => expect(confirm).toHaveBeenCalledTimes(2));
-      expect(confirm).toHaveBeenNthCalledWith(2, second);
+      expect(confirm).toHaveBeenNthCalledWith(2, second, expect.any(AbortSignal));
       // 已取消请求的卡片之后再回答，不建立任务授权。
       answers[0]('session');
       expect(await pending[0]).toBe(false);
@@ -1127,24 +1146,34 @@ describe('shared provider credentials', () => {
     }
   });
 
-  it('does not grant credentials from a cancelled, closed or outdated confirmation', async () => {
-    for (const end of ['cancel', 'close', 'permission-change']) {
-      let answer!: (result: ExecutorConfirmation) => void;
-      const { executor, gate } = sharedExecutor('full', () => new Promise((resolve) => { answer = resolve; }));
-      const abort = new AbortController();
-      const action: ExecutorAction = { kind: 'read', path: path.join(project, '.env') };
-      const pending = executor.confirm(action, abort.signal);
+  // provider-sharing §9：旧用例只在迟到回答后检查授权；补上取消必须立即关闭卡片并结束等待的时序(unit)。
+  it.each(['cancel', 'close', 'permission-change'])('cancels the open confirmation before a late answer after %s', async (end) => {
+    let answer!: (result: ExecutorConfirmation) => void;
+    let confirmationSignal: AbortSignal | undefined;
+    const { executor, gate } = sharedExecutor('full', (_action, signal) => {
+      confirmationSignal = signal;
+      return new Promise((resolve) => { answer = resolve; });
+    });
+    const abort = new AbortController();
+    const action: ExecutorAction = { kind: 'read', path: path.join(project, '.env') };
+    const pending = executor.confirm(action, abort.signal);
+    try {
       if (end === 'cancel') abort.abort();
       else if (end === 'close') await executor.close();
       else {
         executor.setGateMode('normal');
         executor.setGateMode('full');
       }
-      answer('session');
+      expect(confirmationSignal?.aborted).toBe(true);
       expect(await pending).toBe(false);
+      answer('session');
+      await Promise.resolve();
       expect(gate.needsCredentialConsent(action)).toBe(true);
       expect(gate.authorize(action).ok).toBe(false);
+    } finally {
+      answer(false);
       await executor.close();
+      await pending;
     }
   });
 
@@ -1238,7 +1267,7 @@ describe('shared provider credentials', () => {
       // 旧卡还没回答：切换权限档后的新请求不必等它。
       fresh = executor.confirm(production);
       await vi.waitFor(() => expect(asked).toHaveBeenCalledTimes(2));
-      expect(asked).toHaveBeenNthCalledWith(2, production);
+      expect(asked).toHaveBeenNthCalledWith(2, production, expect.any(AbortSignal));
       // 旧卡之后再回答，不建立授权。
       answers[0]('session');
       expect(await stale).toBe(false);
@@ -1293,7 +1322,7 @@ describe('shared provider credentials', () => {
     try {
       expect(await executor.confirm(git)).toBe(true);
       expect(asked).toHaveBeenCalledTimes(1);
-      expect(asked).toHaveBeenCalledWith(env);
+      expect(asked).toHaveBeenCalledWith(env, expect.any(AbortSignal));
       answer(true);
       expect(await pending).toBe(true);
     } finally {

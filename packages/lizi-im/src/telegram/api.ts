@@ -148,6 +148,8 @@ export interface TgMessage {
    */
   has_protected_content?: boolean;
   reply_to_message?: TgMessage;
+  quote?: { text: string; position?: number };
+  rich_message?: { blocks?: unknown };
   text?: string;
   caption?: string;
   entities?: TgMessageEntity[];
@@ -175,10 +177,29 @@ export interface TgCallbackQuery {
   data?: string;
 }
 
+/** 机器人自身在某个 chat 里的成员状态变化(`my_chat_member` update)。 */
+export interface TgChatMemberUpdated {
+  chat: TgChat;
+  /** 做出这次变更的用户(拉 bot 进群 / 踢出 / 拉黑的人)。 */
+  from: TgUser;
+  date: number;
+  old_chat_member: { status: TgChatMemberStatus; user: TgUser };
+  new_chat_member: { status: TgChatMemberStatus; user: TgUser };
+}
+
+export type TgChatMemberStatus =
+  | 'creator'
+  | 'administrator'
+  | 'member'
+  | 'restricted'
+  | 'left'
+  | 'kicked';
+
 export interface TgUpdate {
   update_id: number;
   message?: TgMessage;
   callback_query?: TgCallbackQuery;
+  my_chat_member?: TgChatMemberUpdated;
 }
 
 export interface TgFile {

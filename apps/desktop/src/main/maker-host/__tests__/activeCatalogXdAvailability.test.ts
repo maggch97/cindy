@@ -820,6 +820,36 @@ describe('XD 网关权威模型清单重建', () => {
     expect(resolveXdPiGatewayApi('meta/muse-wonder-1.0')).toBe('openai-responses');
   });
 
+  // Regression: the temporary Argon Responses exception mislabeled Google's native API.
+  // A conflicting Gateway hint must not replace Cindy's verified Gemini protocol (unit tier).
+  it.each(['google/gemini-4-argon', 'gemini-4-argon'])(
+    'Gemini 4 Argon %s keeps Google native Pi routing despite a Responses Gateway hint',
+    (id) => {
+      setActiveCatalog(BUNDLED_CATALOG);
+      setXdGatewayModels([{
+        id,
+        agents: ['claude-code', 'codex', 'pi'],
+        perAgent: { pi: { wireProtocol: 'openai-responses' } },
+      }]);
+      for (const agent of ['claude-code', 'codex', 'pi'] as const) {
+        const model = xdModels(agent).find((m) => m.id === id);
+        expect(model, agent).toMatchObject({
+          name: 'Gemini 4 Argon',
+          group: 'google',
+          nativeApi: 'google-generative-ai',
+          contextWindow: 1_048_576,
+          supportsImageInput: true,
+          efforts: ['low', 'medium', 'high'],
+          defaultEffort: 'medium',
+        });
+        // Pi supports Gemini natively; other harnesses retain their compatibility opt-in.
+        if (agent === 'pi') expect(model?.defaultEnabled).not.toBe(false);
+        else expect(model?.defaultEnabled).toBe(false);
+      }
+      expect(resolveXdPiGatewayApi(id)).toBe('google-generative-ai');
+    },
+  );
+
   it('efforts 缺失时不合成档位，也不猜默认档', () => {
     setActiveCatalog(BUNDLED_CATALOG);
     setXdGatewayModels([

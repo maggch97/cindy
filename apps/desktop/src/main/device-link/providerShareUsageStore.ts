@@ -55,11 +55,32 @@ export interface ProviderShareMemberUsage {
   models: ProviderShareModelUsage[];
 }
 
-function localDay(at: number): string {
+/** 一个受邀者按天的用量：每天按(Agent、供应商、模型、组内电脑)分行。 */
+export interface ProviderShareMemberDailyUsage {
+  shareId: string;
+  memberId: string;
+  lastUsedAt: number | null;
+  days: Array<ProviderShareModelUsage & { day: string }>;
+}
+
+export interface ProviderShareUsageHistoryOptions {
+  /**
+   * 最多展开多少条按电脑拆分后的明细。按日期从新到旧遍历原始行，
+   * 防止一个长期账本在生成回包前膨胀成数百万条中间对象。
+   */
+  maxRows?: number;
+  /** 仅展开仍在当前分享里的成员；JSON 编码的 [shareId, memberId]。 */
+  memberKeys?: ReadonlySet<string>;
+}
+
+/** 账本用的本地日期(YYYY-MM-DD)。 */
+export function providerUsageLocalDay(at: number): string {
   const date = new Date(at);
   const pad = (value: number) => String(value).padStart(2, '0');
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
+
+const localDay = providerUsageLocalDay;
 
 /** 时间段的起始日期(含)；all 返回 null。 */
 export function providerShareUsageRangeStart(range: ProviderShareUsageRange, now = Date.now()): string | null {
@@ -93,6 +114,26 @@ function parseByMember(value: unknown): Record<string, Counters> | undefined {
   return out;
 }
 
+/**
+ * 一行按组内电脑拆开：各台的部分，加上合计比各台之和多出来、记为没区分电脑(null)的部分。各台之和不超过合计
+ * (降级期间旧版本只加合计；防止损坏的文件让某台超过合计)。没有用量的部分不返回。
+ */
+function splitByMember(row: ProviderShareUsageRow): Array<[string | null, Counters]> {
+  const parts: Array<[string | null, Counters]> = [];
+  const rest: Counters = Object.fromEntries(COUNTERS.map((field) => [field, row[field]])) as Counters;
+  for (const [key, counters] of Object.entries(row.byMember ?? {})) {
+    const capped = Object.fromEntries(
+      COUNTERS.map((field) => [field, Math.min(counters[field], rest[field])]),
+    ) as Counters;
+    for (const field of COUNTERS) rest[field] -= capped[field];
+    parts.push([key, capped]);
+  }
+  parts.push([null, rest]);
+  // 金额相减会留下浮点零头：只有轮次、token 或像样的金额才算有用量。
+  return parts.filter(([, counters]) =>
+    COUNTERS.some((field) => (field === 'sdkCostUsd' ? counters[field] > 1e-9 : counters[field] > 0)));
+}
+
 function parseRow(value: unknown): ProviderShareUsageRow | null {
   if (!value || typeof value !== 'object') return null;
   const row = value as Record<string, unknown>;
@@ -103,7 +144,9 @@ function parseRow(value: unknown): ProviderShareUsageRow | null {
     && [...COUNTERS, 'lastAt'].every((key) => isCount(row[key]));
   if (!valid) return null;
   const byMember = parseByMember(row.byMember);
-  const { byMember: _raw, ...rest } = row as unknown as ProviderShareUsageRow;
+  const { byMember: storedByMember, ...rest } = row as unknown as ProviderShareUsageRow;
+  // 先丢掉文件里的原始值，再写回经过校验的版本；旧行没有该字段。
+  void storedByMember;
   return byMember ? { ...rest, byMember } : rest;
 }
 
@@ -111,24 +154,46 @@ export function createProviderShareUsageStore(filePath: string, options: { now?:
   const now = options.now ?? Date.now;
   let rows: Map<string, ProviderShareUsageRow> | null = null;
   let timer: ReturnType<typeof setTimeout> | null = null;
+  // Missing data on/before this local date can affect a rolling snapshot until it ages out.
+  let incompleteThroughDay: string | null = null;
   let writing: Promise<void> = Promise.resolve();
 
   const keyOf = (row: Pick<ProviderShareUsageRow, 'day' | 'shareId' | 'memberId' | 'kind' | 'providerId' | 'model'>) =>
     JSON.stringify([row.day, row.shareId, row.memberId, row.kind, row.providerId, row.model]);
 
+  function markIncomplete(day?: unknown, persist = true): void {
+    const today = localDay(now());
+    let through = today;
+    if (typeof day === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(day) && day <= today) {
+      const [year, month, date] = day.split('-').map(Number);
+      if (localDay(new Date(year!, month! - 1, date!).getTime()) === day) through = day;
+    }
+    if (!incompleteThroughDay || through > incompleteThroughDay) {
+      incompleteThroughDay = through;
+      // Persist detection even without a new usage receipt; reopening must not move the boundary.
+      if (persist || through !== day) scheduleFlush();
+    }
+  }
+
   function load(): Map<string, ProviderShareUsageRow> {
     if (rows) return rows;
     rows = new Map();
     try {
-      const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8')) as { version?: unknown; rows?: unknown };
+      const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8')) as {
+        version?: unknown; rows?: unknown; incomplete?: unknown; incompleteThroughDay?: unknown;
+      };
+      if (parsed.incompleteThroughDay !== undefined) markIncomplete(parsed.incompleteThroughDay, false);
+      else if (parsed.incomplete === true) markIncomplete(); // Migrate the old undated marker once.
       if (parsed.version === FILE_VERSION && Array.isArray(parsed.rows)) {
         for (const raw of parsed.rows) {
           const row = parseRow(raw);
           if (row) rows.set(keyOf(row), row);
+          else markIncomplete((raw as { day?: unknown } | null)?.day);
         }
-      }
-    } catch {
-      // 没有文件或文件损坏：从空账本开始。
+      } else markIncomplete();
+    } catch (error) {
+      // A missing ledger is empty; unreadable/corrupt data must not become a measured 0%.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') markIncomplete();
     }
     return rows;
   }
@@ -144,7 +209,9 @@ export function createProviderShareUsageStore(filePath: string, options: { now?:
   async function writeNow(): Promise<void> {
     const map = load();
     prune(map);
-    const body = JSON.stringify({ version: FILE_VERSION, rows: [...map.values()] });
+    if (incompleteThroughDay && incompleteThroughDay < providerShareUsageRangeStart('7d', now())!) incompleteThroughDay = null;
+    const body = JSON.stringify({ version: FILE_VERSION, rows: [...map.values()],
+      ...(incompleteThroughDay ? { incomplete: true, incompleteThroughDay } : {}) });
     const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
     await fsp.mkdir(path.dirname(filePath), { recursive: true });
     try {
@@ -165,6 +232,21 @@ export function createProviderShareUsageStore(filePath: string, options: { now?:
   }
 
   return {
+    /** Same member/provider only, today's local calendar date plus six preceding dates. */
+    memberTokenSnapshot(shareIds: ReadonlySet<string>, providerId: string, memberId: string, at = now()) {
+      const start = providerShareUsageRangeStart('7d', at)!;
+      const end = localDay(at);
+      const date = new Date(at);
+      const totals = new Map<string, number>();
+      for (const row of load().values()) {
+        if (!shareIds.has(row.shareId) || row.memberId !== memberId || row.providerId !== providerId
+          || row.day < start || row.day > end) continue;
+        totals.set(row.model, (totals.get(row.model) ?? 0) + row.inputTokens + row.outputTokens);
+      }
+      return { available: !incompleteThroughDay || incompleteThroughDay < start, windowStart: start, windowEnd: end,
+        nextWindowAt: new Date(date.getFullYear(), date.getMonth(), date.getDate() + 1).getTime(),
+        models: [...totals].map(([model, tokens]) => ({ model, tokens })) };
+    },
     /** memberKey：这一轮在哪台组内电脑运行(本机为 `local`)。 */
     record(
       shareId: string,
@@ -210,17 +292,6 @@ export function createProviderShareUsageStore(filePath: string, options: { now?:
     query(shareIds: ReadonlySet<string>, range: ProviderShareUsageRange): ProviderShareMemberUsage[] {
       const start = providerShareUsageRangeStart(range, now());
       const members = new Map<string, ProviderShareMemberUsage>();
-      const add = (member: ProviderShareMemberUsage, row: ProviderShareUsageRow, memberKey: string | null, counters: Counters) => {
-        // 金额相减会留下浮点零头：只有轮次、token 或像样的金额才算有用量。
-        const used = COUNTERS.some((field) => (field === 'sdkCostUsd' ? counters[field] > 1e-9 : counters[field] > 0));
-        if (!used) return;
-        const model = member.models.find(
-          (item) => item.model === row.model && item.kind === row.kind && item.providerId === row.providerId
-            && item.memberKey === memberKey,
-        );
-        if (model) addCounters(model, counters);
-        else member.models.push({ kind: row.kind, providerId: row.providerId, memberKey, model: row.model, ...counters });
-      };
       for (const row of load().values()) {
         if (!shareIds.has(row.shareId)) continue;
         const memberKey = JSON.stringify([row.shareId, row.memberId]);
@@ -228,18 +299,64 @@ export function createProviderShareUsageStore(filePath: string, options: { now?:
         members.set(memberKey, member);
         member.lastUsedAt = Math.max(member.lastUsedAt ?? 0, row.lastAt);
         if (start && row.day < start) continue;
-        const rest: Counters = Object.fromEntries(COUNTERS.map((field) => [field, row[field]])) as Counters;
-        for (const [key, counters] of Object.entries(row.byMember ?? {})) {
-          // 各台之和不超过合计(降级期间旧版本只加合计；防止损坏的文件让某台超过合计)。
-          const capped = Object.fromEntries(
-            COUNTERS.map((field) => [field, Math.min(counters[field], rest[field])]),
-          ) as Counters;
-          for (const field of COUNTERS) rest[field] -= capped[field];
-          add(member, row, key, capped);
+        for (const [key, counters] of splitByMember(row)) {
+          const model = member.models.find(
+            (item) => item.model === row.model && item.kind === row.kind && item.providerId === row.providerId
+              && item.memberKey === key,
+          );
+          if (model) addCounters(model, counters);
+          else member.models.push({ kind: row.kind, providerId: row.providerId, memberKey: key, model: row.model, ...counters });
         }
-        add(member, row, null, rest);
       }
       for (const member of members.values()) member.models.sort((a, b) => b.turns - a.turns || a.model.localeCompare(b.model));
+      return [...members.values()];
+    },
+
+    /**
+     * 按受邀者、按天的明细(只含 shareIds 里的分享)：「用量」块在界面上按时间段、组内电脑筛选。
+     * 每天按(Agent、供应商、模型、组内电脑)分行，组内电脑的拆法与 query 相同；新的日子在前。
+     */
+    history(shareIds: ReadonlySet<string>, options: ProviderShareUsageHistoryOptions = {}): ProviderShareMemberDailyUsage[] {
+      const members = new Map<string, ProviderShareMemberDailyUsage>();
+      const maxRows = options.maxRows === undefined
+        ? Number.POSITIVE_INFINITY
+        : Number.isFinite(options.maxRows) ? Math.max(0, Math.floor(options.maxRows)) : 0;
+      let expandedRows = 0;
+      const sourceRows = [...load().values()]
+        .filter((row) => shareIds.has(row.shareId)
+          && (!options.memberKeys || options.memberKeys.has(JSON.stringify([row.shareId, row.memberId]))))
+        .sort((a, b) => b.day.localeCompare(a.day) || b.lastAt - a.lastAt);
+      const lastUsedAt = new Map<string, number>();
+      for (const row of sourceRows) {
+        const key = JSON.stringify([row.shareId, row.memberId]);
+        lastUsedAt.set(key, Math.max(lastUsedAt.get(key) ?? 0, row.lastAt));
+      }
+      for (const row of sourceRows) {
+        if (expandedRows >= maxRows) break;
+        const memberKey = JSON.stringify([row.shareId, row.memberId]);
+        const member = members.get(memberKey) ?? {
+          shareId: row.shareId,
+          memberId: row.memberId,
+          lastUsedAt: lastUsedAt.get(memberKey) ?? null,
+          days: [],
+        };
+        members.set(memberKey, member);
+        const parts = splitByMember(row);
+        for (const [key, counters] of parts) {
+          if (expandedRows >= maxRows) break;
+          member.days.push({ day: row.day, kind: row.kind, providerId: row.providerId, memberKey: key, model: row.model, ...counters });
+          expandedRows++;
+        }
+      }
+      // 保留只有较早记录、因预算未展开到的成员，供管理页显示其最近使用时间。
+      for (const [memberKey, latest] of lastUsedAt) {
+        if (members.has(memberKey)) continue;
+        const [shareId, memberId] = JSON.parse(memberKey) as [string, string];
+        members.set(memberKey, { shareId, memberId, lastUsedAt: latest, days: [] });
+      }
+      for (const member of members.values()) {
+        member.days.sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : b.turns - a.turns));
+      }
       return [...members.values()];
     },
 

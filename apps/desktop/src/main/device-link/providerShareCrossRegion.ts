@@ -53,9 +53,11 @@ const CREDENTIAL_REFRESH_MARGIN_MS = 60 * 60_000;
 const SESSION_REFRESH_MS = 12 * 60 * 60_000;
 const ONLINE_WAIT_MS = 8_000;
 const MARKER_FILE = 'provider-share-regions.json';
+const GROUP_RECOVERY_INTERVAL_MS = 30_000;
 
 export interface CrossRegionEvents {
   changed(): void;
+  catalogChanged?(agentDeviceId: string): void;
 }
 
 interface RegionState {
@@ -79,6 +81,8 @@ interface Runtime {
   account: string;
   regions: Map<Region, RegionState>;
   stopped: boolean;
+  groupRecovery: Promise<void> | null;
+  nextGroupRecoveryAt: number;
 }
 
 let runtime: Runtime | null = null;
@@ -212,10 +216,31 @@ export async function crossRegionOfIntent(intent: ProviderShareInvitationIntent,
   return region;
 }
 
+/** 服务端确认已是成员时，恢复本机尚未加载的分享；提示仍沿用「已在使用」。 */
+async function recoverExistingMembership(rt: Runtime | null, region: Region, error: unknown): Promise<void> {
+  if (!rt || !current(rt) || !error || typeof error !== 'object'
+    || !('code' in error) || error.code !== 'PROVIDER_SHARE_ALREADY_MEMBER') return;
+  const state = rt.regions.get(region);
+  if (state) {
+    // 成员确认比在途旧名单更新；旧空名单不能撤销本次恢复。
+    state.requestRevision += 1;
+    if (state.shares.length === 0) state.loaded = false;
+  }
+  // 已确认的往来先落盘：暂时断网或重启后仍可沿原退避路径恢复。
+  await writeMarker(rt.account, region, true, false, () => current(rt)).catch((error) =>
+    log.warn('cross-region marker write failed', { error: String(error) }));
+  if (current(rt)) await refreshRegion(rt, region);
+}
+
 export async function crossRegionPreview(region: Region, invitation: string): Promise<ProviderShareLinkPreview> {
+  const rt = runtime;
   const base = await peerApiBase(region);
   const identityCard = await fetchIdentityCard('share-request', sha256Hex(invitation));
-  return providerShareParsers.preview(await peerRequest(base, '/preview', { invitation, identityCard }));
+  const value = await peerRequest(base, '/preview', { invitation, identityCard }).catch(async (error: unknown) => {
+    await recoverExistingMembership(rt, region, error);
+    throw error;
+  });
+  return providerShareParsers.preview(value);
 }
 
 export interface CrossRegionRequest {
@@ -226,11 +251,14 @@ export interface CrossRegionRequest {
 export async function crossRegionSendRequest(region: Region, invitation: string): Promise<CrossRegionRequest> {
   const account = accountKey();
   if (!account) throwIpcError('DEVICE_LINK_NOT_CONNECTED', 'Not signed in');
+  const rt = runtime;
   const base = await peerApiBase(region);
   const identityCard = await fetchIdentityCard('share-request', sha256Hex(invitation));
-  const value = await peerRequest(base, '/requests', { invitation, identityCard });
+  const value = await peerRequest(base, '/requests', { invitation, identityCard }).catch(async (error: unknown) => {
+    await recoverExistingMembership(rt, region, error);
+    throw error;
+  });
   const result = { state: providerShareParsers.requestState(value), requestToken: providerShareParsers.secret(value.requestToken) };
-  const rt = runtime;
   if (rt && current(rt) && rt.account === account) {
     const state = rt.regions.get(region);
     if (state) {
@@ -286,6 +314,15 @@ function createClient(rt: Runtime, state: RegionState): DeviceLinkClient {
       error: (...args) => log.error(...args),
     },
     timing: { pingIntervalMs: 15_000 },
+  });
+  client.onFrame?.(frame => {
+    if (!current(rt) || frame.kind !== 'push' || !frame.src) return;
+    const peer = parseProviderSharePeer(frame.src);
+    const payload = frame.payload as { channel?: unknown };
+    if (peer?.role !== 'host' || payload?.channel !== 'maker:provider:changed') return;
+    if (state.shares.some(share => share.shareId === peer.shareId && share.hostDeviceId === peer.deviceId && share.status === 'active')) {
+      rt.events.catalogChanged?.(`share:${peer.shareId}`);
+    }
   });
   client.start();
   return client;
@@ -379,7 +416,7 @@ export function startProviderShareCrossRegion(events: CrossRegionEvents, options
   userDataDir = options.userDataDir;
   const account = accountKey();
   if (!account) return;
-  const rt: Runtime = { events, account, regions: new Map(), stopped: false };
+  const rt: Runtime = { events, account, regions: new Map(), stopped: false, groupRecovery: null, nextGroupRecoveryAt: 0 };
   runtime = rt;
   const activeRegions = readMarkers()[account] ?? [];
   // 清理失败或未完成就退出时，下次只恢复本地空名单，不向对方区域发送身份。
@@ -412,6 +449,43 @@ export function refreshProviderShareCrossRegion(region: Region): Promise<void> {
   return rt && current(rt) ? refreshRegion(rt, region) : Promise.resolve();
 }
 
+/**
+ * A verified same-account group references shares already accepted on another computer.
+ * Register this computer with the official peer region; its server still decides membership.
+ * Never call this for renderer hints, favorites or arbitrary missing share IDs.
+ */
+export function restoreCrossRegionReceivedForRemoteGroup(shareIds: readonly string[]): Promise<void> {
+  const rt = runtime;
+  if (!rt || !current(rt) || shareIds.length === 0) return Promise.resolve();
+  const region = peerRegion();
+  const state = rt.regions.get(region);
+  if (shareIds.every((id) => state?.shares.some((share) => share.shareId === id))) return Promise.resolve();
+  if (rt.groupRecovery) return rt.groupRecovery;
+  if (state?.refreshing) return state.refreshing;
+  if ((state?.failures && state.timer) || Date.now() < rt.nextGroupRecoveryAt) return Promise.resolve();
+  rt.nextGroupRecoveryAt = Date.now() + GROUP_RECOVERY_INTERVAL_MS;
+  // A previously confirmed empty list is stale once another computer reports membership.
+  if (state && state.shares.length === 0) state.loaded = false;
+  const run = (async () => {
+    await writeMarker(rt.account, region, true, false, () => current(rt)).catch((error) =>
+      log.warn('cross-region marker write failed', { error: String(error) }));
+    if (current(rt)) await refreshRegion(rt, region);
+  })().finally(() => { rt.groupRecovery = null; });
+  rt.groupRecovery = run;
+  return run;
+}
+
+/** Missing shares are not removed until an enabled region has answered successfully. */
+export async function waitForCrossRegionReceived(): Promise<boolean> {
+  const rt = runtime;
+  if (!rt) return true;
+  if (!current(rt)) return false;
+  await rt.groupRecovery;
+  const state = rt.regions.get(peerRegion());
+  await state?.refreshing;
+  return current(rt) && isCrossRegionReceivedReady() && !state?.failures;
+}
+
 export function getCrossRegionReceived(): ProviderShareReceived[] {
   return runtime ? [...runtime.regions.values()].flatMap((state) => state.shares) : [];
 }
@@ -426,10 +500,32 @@ export function ensureCrossRegionReceivedForFavorites(regions: readonly Region[]
   if (!state?.loaded && !state?.refreshing && !state?.timer) void refreshRegion(rt, region);
 }
 
+/**
+ * 对方区域里本账号可能有的分享都已确认：标记过的对方区域(本账号在那里申请或加入过分享)名单都已成功返回。
+ * 没有标记的区域本来就没有分享。运行时没起来或已换账号时为 false(说不准)。
+ */
+export function isCrossRegionReceivedComplete(): boolean {
+  const rt = runtime;
+  if (!rt || !current(rt)) return false;
+  const marked = (readMarkers()[rt.account] ?? []).filter((region) => region === peerRegion());
+  return marked.every((region) => rt.regions.get(region)?.loaded === true);
+}
+
 /** 只确认已成功返回名单的区域，失败区域不能阻塞其它区域的收藏。 */
 export function getConfirmedCrossRegionReceivedRegions(): Region[] {
   const rt = runtime;
   return rt && current(rt) ? [...rt.regions.values()].filter((state) => state.loaded).map((state) => state.region) : [];
+}
+
+/** 被启用的跨区标记对应的首次分享列表是否已完成。 */
+export function isCrossRegionReceivedReady(): boolean {
+  const rt = runtime;
+  // 未启动跨区 runtime 时，当前进程没有跨区分享需要等待。
+  if (!rt) return true;
+  if (!current(rt)) return false;
+  const region = peerRegion();
+  if (!readMarkers()[rt.account]?.includes(region)) return true;
+  return rt.regions.get(region)?.loaded === true;
 }
 
 function stateForShare(shareId: string): RegionState | null {

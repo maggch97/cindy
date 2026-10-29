@@ -34,8 +34,9 @@ Cindy 的新界面大量由非设计师贡献。本合同要达成的状态：
 - CINDY 皮肤族（`DESIGN.md §15`）：值经用户 2026-07-18 终签，**实现期零裁量**——
   仓内以主题文件、`cindyDecisionData.ts` 与冻结测试为权威编码，改值须回到用户裁决；
 - U2 二级信息色（`DESIGN.md §15.5`）：明示「never darken unilaterally」，改值须
-  **新的用户裁决**（2026-08 亮色调整即循此路径），冻结测试 `cindyThemes.test.ts` 组⑦
-  会在缺裁决时拦下基线变更；
+  **新的用户裁决**（2026-08 亮色调整即循此路径）。2026-10-22 用户裁决以 CINDY 文字墨水阶梯
+  取代 U2（`DESIGN.md §2` / `§15.16`），保护随之延续到整条阶梯：任一档透明度改值须新的
+  用户裁决，冻结测试 `cindyThemes.test.ts` 组⑦ 会在缺裁决或退回实色灰时拦下基线变更；
 - `annotation-accent`（`DESIGN.md §15.4`）：图片标注烧录墨色，exempt, do not change
   ——与烧进位图的笔迹恒一致，改它就是改已发布图片的外观合同。
 
@@ -258,7 +259,14 @@ commit 模式不覆盖未提交内容。正式 CI 比较事件 base 与当前候
 ## 9. 计数纪律
 
 文档中出现的任何统计数字（Token 数、主题数、违规数）都是**当日快照**，必须标注统计
-日期与可重复执行的生成命令，不作为长期人工维护数据。示例：
+日期与可重复执行的生成命令，不作为长期人工维护数据。
+
+设计台账中标记为 `GENERATED` 的源码事实区块是例外：它随源码提交维护，不写生成日期，
+保证同一源码树跨日重新生成字节一致；保留 `pnpm design:inventory` 与
+`pnpm check:design-inventory` 命令，事实变化时间以 Git 提交历史为准。人工区与其他文档中的
+快照统计仍须标注日期和生成命令。
+
+人工快照示例：
 
 ```bash
 # registerColor 总数（2026-08-29 快照：506）
@@ -315,7 +323,7 @@ DS-4/4b 尚有公开附件交接与完整设置页/部分状态证据缺口，DS
 | `docs/design-rules/token-decision-table.md` | 登录改版 token 决策记录（其自身已声明非现行清单） | 维持决策档案定位，非数值真相 |
 | `docs/design-rules/design-decision-log.md` | 全局设计决策史台账 | 维持只增不改；治理裁决（含 §10 待裁决项）关闭后在此归档 |
 | `DESIGN.md §10` Tier-1 slot 表 | DS-8 GENERATED 精确值摘要（用途与规则人工维护） | DS-8 同一 Terrazzo 流程生成，不再人工编辑表中数值 |
-| `DESIGN.md §16.1` 登录 token 表 | 登录域现行 token 清单（人工维护） | 同上 |
+| `DESIGN.md §16.1` 登录 token 表 | 登录域现行 token 清单（DS-8 起由 `packages/design-tokens` 生成，用途说明来自 `desktop-bindings.json`） | 同上，不再人工编辑表中数值；品牌保护项 `--login-brand-accent*` 在表外保留 |
 | UI 设计哨兵（插件仓） | SSR 抽取式扫描工具 | 仅用于发现组件、统计硬编码、定位代码与观察迁移进度；其样张不得充当视觉证据（§2 视觉真相行） |
 
 ## 12. 公开实施路线与目标验收

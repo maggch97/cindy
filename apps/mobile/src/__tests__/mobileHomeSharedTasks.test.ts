@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import ts from 'typescript';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { sharedTaskHostPeer } from '@cindy/device-link';
@@ -17,6 +18,20 @@ function session(id: string, deviceId: string, name: string): MobileHomeSessionL
 }
 
 describe('shared tasks in the mobile Home', () => {
+  // #7237 / unit: real Home and native scope-menu projections; existing shared
+  // filtering coverage had only one named computer, missing duplicate fallbacks.
+  it('distinguishes two unnamed computer scopes while preserving selection IDs', () => {
+    const home = buildMobileHomePresentation({ selectedDeviceId: 'host-b', devices: [
+      { deviceId: 'host-b', name: 'host-b', canOpen: true },
+      { deviceId: 'host-a', name: 'host-a', canOpen: true },
+    ], sessions: [] });
+    const scopes = home.deviceFilters.filter(item => item.deviceId !== null);
+    expect(scopes.find(item => item.deviceId === 'host-a')?.label).toMatch(/ \(1\)$/);
+    expect(scopes.find(item => item.deviceId === 'host-b')?.label).toMatch(/ \(2\)$/);
+    expect(scopes.find(item => item.selected)?.deviceId).toBe('host-b');
+    expect(buildHomeScopePullDownActions(scopes, 'All').map(item => item.title)).toEqual(scopes.map(item => item.label));
+  });
+
   it.each([undefined, peer])('keeps shared rows but excludes task peers from device scopes (selection %s)', (selectedDeviceId) => {
     const home = buildMobileHomePresentation({
       selectedDeviceId,
@@ -134,34 +149,20 @@ describe('shared Home group', () => {
   });
 });
 
-describe('shared role row wiring', () => {
-  const source = readFileSync(resolve(process.cwd(), 'src/session/HomeSurface.tsx'), 'utf8');
-
-  it('adds roles only to the existing shared group and still hides an empty group', () => {
-    expect(source).toContain('ListHeaderComponent={sharedRows.length > 0 ?');
-    expect(source.match(/sharedRole={row.role}/g)).toHaveLength(1);
-    expect(source).toContain('testID={`home.sharedRoleSlot.owned.${row.task.sessionId}`}');
-  });
-
-  it('uses a fixed title-side role slot and only renders a crown for owners', () => {
-    expect(source).toContain('const showPreviewLine = !textMode && (!!group || !!preview?.trim() || showSchedule || showPinned);');
-    const row = source.slice(source.indexOf('function HomeSessionRowInner('), source.indexOf('function AutomationGroupChildren('));
-    const roleSlot = row.indexOf('testID={`home.sharedRoleSlot.owned.${item.session.id}`}');
-    expect(roleSlot).toBeGreaterThan(row.indexOf('<SessionStatusMark'));
-    expect(roleSlot).toBeLessThan(row.indexOf('styles.sessionListContent'));
-    expect(row).toContain("{sharedRole === 'owned' ? (");
-    expect(row).not.toContain('{sharedRole ? (');
-    expect(row).not.toContain('accessibilityElementsHidden');
-    expect(row).not.toContain('importantForAccessibility');
-    expect(row).toContain("const accessibilityTitle = sharedRole === 'owned' ? item.title + ', ' + t('sharedTask.roleHost') : item.title;");
-    expect(row).toContain("t('devices.list.a11y.openAutomationLatest', { title: accessibilityTitle })");
-    expect(row).toContain("t('devices.list.a11y.automationTask', { title: accessibilityTitle })");
-    expect(row).toContain('accessibilityLabel={accessibilityLabel}');
-    expect(row).toContain('accessible={false}');
-    expect(row).not.toContain("accessibilityLabel={t('sharedTask.roleHost')}");
-    expect(row).not.toContain('sharedRoleBadge');
-    expect(row).toContain('color={colors.warningFg}');
-    expect(source).not.toContain('roleOwnedBadge');
-    expect(source).not.toContain('roleJoinedBadge');
+// Shared role identity and filtering run above through the production presentation.
+// Check the production row's accessibility projection rather than crown/layout strings.
+describe('shared role accessibility', () => {
+  it.each(['owned', 'joined', undefined] as const)('announces ownership only for role %s', (sharedRole) => {
+    const source = readFileSync(resolve(process.cwd(), 'src/session/HomeSurface.tsx'), 'utf8');
+    const tree = ts.createSourceFile('HomeSurface.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+    let initializer: ts.Expression | undefined;
+    function visit(node: ts.Node) {
+      if (ts.isVariableDeclaration(node) && node.name.getText(tree) === 'accessibilityTitle') initializer = node.initializer;
+      ts.forEachChild(node, visit);
+    }
+    visit(tree);
+    if (!initializer) throw new Error('Missing production row accessibility title');
+    const project = new Function('sharedRole', 'item', 't', 'return (' + initializer.getText(tree) + ');');
+    expect(project(sharedRole, { title: 'Task' }, (key: string) => key)).toBe(sharedRole === 'owned' ? 'Task, sharedTask.roleHost' : 'Task');
   });
 });

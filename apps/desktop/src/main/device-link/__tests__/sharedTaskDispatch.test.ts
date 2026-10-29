@@ -35,7 +35,7 @@ describe('sharedTask dispatch scope', () => {
     expect(() => assertSharedTaskInvoke(capture(), payload)).toThrow();
   });
   it('never inherits the full-device allowlist or wildcard subscriptions', () => {
-    for (const channel of ['maker:create-session', 'maker:set-permission-mode', 'device-link:voice:credential-sync', 'local-db:sessions:list', 'maker:remote-resources:list']) {
+    for (const channel of ['maker:usage:codex-reset-auto-use', 'maker:create-session', 'maker:set-permission-mode', 'device-link:voice:credential-sync', 'local-db:sessions:list', 'maker:remote-resources:list']) {
       expect(() => assertSharedTaskInvoke(capture(), { channel, args: ['task'] })).toThrow('PERMISSION_DENIED');
     }
     for (const topics of [['*'], ['sessions'], ['session:other'], ['session:task', 'session:other']]) {
@@ -102,7 +102,7 @@ describe('sharedTask dispatch scope', () => {
       args: ['permission-1', { kind: 'permission', behavior: 'allow', permissionUpdates: [permissionSuggestion] }],
     })).not.toThrow();
   });
-  it.each(['cindy.app.update', 'cindy.app.auto_update'])('keeps the owner-only %s card away from guests', (toolName) => {
+  it.each(['cindy.app.update', 'cindy.app.auto_update', 'ghost_contribution_submit', 'ghost_cancel_plugin_review'])('keeps the owner-only %s card away from guests', (toolName) => {
     setSharedTaskInteractionReader(() => ({ sessionId: 'task', kind: 'permission', toolName }));
     for (const behavior of ['allow', 'deny']) {
       const args = ['app-update-1', { kind: 'permission', behavior }];
@@ -169,11 +169,16 @@ describe('sharedTask dispatch scope', () => {
     expect(() => assertSharedTaskInvoke(noHistory, { channel, args: ['task', 'bash-1'] })).toThrow();
   });
   it('accepts media preparation and OSS fallback without granting the file-peer channel', () => {
-    for (const prepareOnly of [true, false]) {
-      expect(() => assertSharedTaskInvoke(capture(), {
-        channel: 'device-link:media:fetch', args: [{ url: 'xdt-image://task/a.png', prepareOnly }],
-      })).not.toThrow();
+    for (const options of [{ prepareOnly: true, metadataOnly: true }, { prepareOnly: true }, { prepareOnly: false }]) {
+      const request = { channel: 'device-link:media:fetch', args: [{ url: 'xdt-image://task/a.png', ...options }] };
+      for (const phase of ['invoke', 'result'] as const) {
+        expect(() => assertSharedTaskInvoke(capture(), request, undefined, phase)).not.toThrow();
+        expect(() => assertSharedTaskInvoke({ ...capture(), authorize: () => false }, request, undefined, phase)).toThrow('PERMISSION_DENIED');
+      }
     }
+    expect(() => assertSharedTaskInvoke(capture(), {
+      channel: 'device-link:media:fetch', args: [{ url: 'xdt-image://task/a.png', metadataOnly: 'true' }],
+    })).toThrow('PERMISSION_DENIED');
     expect(() => assertSharedTaskInvoke(capture(), {
       channel: 'device-link:media:fetch', args: [{ url: 'xdt-image://task/a.png', prepareOnly: true, sessionId: 'other' }],
     })).toThrow();

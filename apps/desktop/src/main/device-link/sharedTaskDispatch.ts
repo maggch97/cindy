@@ -170,7 +170,7 @@ function assertSharedTaskInteractionResolve(
   if (args.length !== 2 || typeof args[0] !== 'string' || !args[0]) deny();
   const interaction = phase === 'invoke' ? readInteractionSession?.(args[0]) : undefined;
   if (phase === 'invoke' && (!interaction || interaction.sessionId !== sessionId)) deny();
-  if (interaction?.toolName && OWNER_ONLY_HOST_CONFIRMATION_TOOL_NAMES.has(interaction.toolName)) deny();
+  if (interaction?.toolName && (OWNER_ONLY_HOST_CONFIRMATION_TOOL_NAMES.has(interaction.toolName) || ['ghost_contribution_submit', 'ghost_cancel_plugin_review'].includes(interaction.toolName))) deny();
   const decision = record(args[1]);
   if (!decision || typeof decision.kind !== 'string' || !interactionDecisionKinds.has(decision.kind)) deny();
   // Guests approve the host-displayed input, never substitute executable input.
@@ -255,7 +255,8 @@ export function assertSharedTaskInvoke(
   if (channel === 'device-link:media:fetch') {
     const request = record(args[0]);
     if (args.length !== 1 || !request || typeof request.url !== 'string' ||
-          Object.keys(request).some((key) => !['url', 'skipCache', 'thumbnail', 'prepareOnly'].includes(key)) ||
+          Object.keys(request).some((key) => !['url', 'skipCache', 'thumbnail', 'prepareOnly', 'metadataOnly'].includes(key)) ||
+        (request.metadataOnly !== undefined && typeof request.metadataOnly !== 'boolean') ||
         !capture.authorize('attachment.read')) deny();
     // The media handler validates ledger/workdir ownership before reading bytes.
     return;

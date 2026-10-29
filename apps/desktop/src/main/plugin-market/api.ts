@@ -9,11 +9,15 @@ import {
   type OrganizationPluginAccessError,
   type PluginRemovalNotice,
   type PluginDownloadResponse,
+  parsePluginUsageAck,
+  type PluginUsageEventInput,
+  type PluginUsageAck,
 } from '@cindy/plugin-protocol';
 
 import { getClientEndpoint } from '../clientEndpointsService.js';
 import { createLogger } from '../logger.js';
 import { serverApiFetch, type ApiFetchOptions } from '../serverApiClient.js';
+import { pluginObjectUrlOptions } from './objectUrlPolicy.js';
 
 const log = createLogger('plugin-market-api');
 const PLUGIN_MARKET_API_TIMEOUT_MS = 15_000;
@@ -70,7 +74,8 @@ export class PluginMarketApi {
   private requestOptions(): Omit<ApiFetchOptions, 'baseUrl'> {
     return {
       cache: 'no-store',
-      headers: { [CINDY_CLIENT_VERSION_HEADER]: this.getClientVersion() },
+      headers: { [CINDY_CLIENT_VERSION_HEADER]: this.getClientVersion(),
+        'x-cindy-plugin-migrations': 'simulator-id-v1' },
       timeoutMs: PLUGIN_MARKET_API_TIMEOUT_MS,
     };
   }
@@ -110,6 +115,7 @@ export class PluginMarketApi {
           `/api/plugins?${search.toString()}`,
           this.requestOptions(),
         ),
+        pluginObjectUrlOptions(),
       );
       for (const plugin of response.plugins) {
         if (seen.has(plugin.id)) continue;
@@ -179,6 +185,7 @@ export class PluginMarketApi {
         `/api/plugins/${encodeURIComponent(pluginId)}`,
         this.requestOptions(),
       ),
+      pluginObjectUrlOptions(),
     ).plugin;
   }
 
@@ -191,6 +198,32 @@ export class PluginMarketApi {
         `/api/plugins/${encodeURIComponent(pluginId)}/releases/${encodeURIComponent(releaseId)}/download`,
         this.requestOptions(),
       ),
+      pluginObjectUrlOptions(),
     );
+  }
+
+  async reportUsage(
+    pluginId: string,
+    events: PluginUsageEventInput[],
+    context: { token: string | null; assertCurrent(): void },
+  ): Promise<PluginUsageAck> {
+    context.assertCurrent();
+    const response = await this.fetcher<unknown>(
+      `/api/plugins/${encodeURIComponent(pluginId)}/usage-events`,
+      {
+        ...this.requestOptions(),
+        method: 'POST',
+        token: context.token,
+        timeoutMs: 5_000,
+        skipAutoRefresh: true,
+        skipSessionInvalidation: true,
+        bodyFactory: () => {
+          context.assertCurrent();
+          return { events };
+        },
+      },
+    );
+    context.assertCurrent();
+    return parsePluginUsageAck(response, events.map(event => event.eventId));
   }
 }

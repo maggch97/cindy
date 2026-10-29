@@ -12,6 +12,8 @@ import {
 } from 'lucide-react';
 import {
   REMOTE_DESKTOP_VIDEO_QUALITIES,
+  REMOTE_DESKTOP_IDLE_MINUTES,
+  REMOTE_DESKTOP_DEFAULT_IDLE_MINUTES,
   type RemoteDesktopDisplayMode,
   type RemoteDesktopVideoQuality,
 } from '@cindy/device-link';
@@ -31,6 +33,7 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { Switch } from '@/components/ui/switch';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { Tip } from '@/components/ui/tooltip';
+import { toast, ToastContainer } from '@/components/ui/toast';
 import {
   fittedChoices,
   ratioLabel,
@@ -87,6 +90,16 @@ export function RemoteDesktopViewerWindow() {
   const generation = useRef(-1);
   const latestState = useRef<ViewerSnapshot | null>(null);
   const activePanel = useRef(settings);
+  const safetyNotice = state?.safety.notice;
+  const clipboardNotice = safetyNotice?.startsWith('clipboardSync') ? safetyNotice : null;
+  const clipboardNoticeVersion = state?.safety.clipboardNoticeVersion;
+  const persistentSafetyNotice = clipboardNotice ? null : safetyNotice;
+  useEffect(() => {
+    if (!clipboardNotice) return;
+    // Same status from idle polls does not reopen or prolong a notification.
+    const id = toast.info(t(`remoteDesktop.${clipboardNotice}`), { duration: 4000 });
+    return () => toast.dismiss(id);
+  }, [clipboardNotice, clipboardNoticeVersion, t]);
   // Only the latest clipboard click reports; queued earlier transfers stay silent.
   const clipboardAttempt = useRef(0);
   activePanel.current = settings;
@@ -721,6 +734,37 @@ export function RemoteDesktopViewerWindow() {
           >
             {preference('privacyScreen')}
             {preference('lockOnExit')}
+            <FormField
+              label={t('remoteDesktop.idleLock')}
+              className="remote-viewer-field"
+              hint={
+                state?.caps && !state.caps.idleLock
+                  ? t('remoteDesktop.settingUnsupported')
+                  : undefined
+              }
+            >
+              {(field) => (
+                <Select
+                  {...field}
+                  label={t('remoteDesktop.idleLock')}
+                  value={String(
+                    state?.preferences.idleTimeoutMinutes ?? REMOTE_DESKTOP_DEFAULT_IDLE_MINUTES,
+                  )}
+                  disabled={!state?.ready || state.closing || !state.caps?.idleLock}
+                  options={REMOTE_DESKTOP_IDLE_MINUTES.map((minutes) => ({
+                    value: String(minutes),
+                    label:
+                      minutes === 0
+                        ? t('remoteDesktop.idleNever')
+                        : t('remoteDesktop.idleMinutes', { count: minutes }),
+                  }))}
+                  onValueChange={(value) =>
+                    void controller.current?.preference({ idleTimeoutMinutes: Number(value) })
+                  }
+                  onOpenChange={onSelectOpenChange}
+                />
+              )}
+            </FormField>
             <div className="remote-viewer-panel-section">
               {state && (
                 <>
@@ -861,10 +905,10 @@ export function RemoteDesktopViewerWindow() {
         <span className="sr-only" role="status">
           {state?.safety.privacyActive ? t('remoteDesktop.privacyActive') : ''}
         </span>
-        {(notice || state?.safety.notice) && (
+        {(notice || persistentSafetyNotice) && (
           <div className="remote-viewer-feedback" role="status">
-            <span>{notice ?? t(`remoteDesktop.${state?.safety.notice}`)}</span>
-            {state?.safety.notice && (
+            <span>{notice ?? t(`remoteDesktop.${persistentSafetyNotice}`)}</span>
+            {!notice && persistentSafetyNotice && (
               <Button
                 variant="secondary"
                 onClick={() => void controller.current?.refreshSafety(true)}
@@ -883,6 +927,7 @@ export function RemoteDesktopViewerWindow() {
           </div>
         )}
       </div>
+      <ToastContainer />
       <ConfirmDialog
         presentation="standard"
         open={closeGeneration !== null}
@@ -969,6 +1014,7 @@ function ZoomModeIcon({ actual = false }: { actual?: boolean }) {
       strokeLinecap="round"
       strokeLinejoin="round"
       aria-hidden="true"
+      data-ink-icon=""
     >
       <circle cx="11" cy="11" r="8" />
       <path d="m21 21-4.3-4.3" />

@@ -22,7 +22,13 @@ import {
   createFeishuIM,
   createTelegramIM,
   createWecomIM,
+  type DingTalkIM,
+  type DiscordIM,
+  type FeishuIM,
   type IMHost,
+  type TelegramBehaviorConfig,
+  type TelegramIM,
+  type WecomIM,
 } from '@cindy/im';
 import { TencentIlinkTransport } from '@cindy/wechat-ilink';
 
@@ -64,6 +70,7 @@ import {
 } from './wechat/compatibilityPolicy';
 import { fetchPublicImageBytes } from './publicImageFetch';
 import { buildPersonalBotCommandMenu } from './shared/botCommands';
+import { shouldAnnounceFeishuLifecycle } from './feishu/lifecycleAnnouncements';
 
 const log = createLogger('im/host');
 
@@ -191,7 +198,21 @@ const host: IMHost = {
   createLogger,
 };
 
-export const feishuIm = createFeishuIM(host);
+export const feishuIm = createFeishuIM(host, {
+  shouldAnnounceLifecycle: shouldAnnounceFeishuLifecycle,
+});
+/**
+ * 伙伴自有飞书 / Lark 连接的传输层实例: 凭证与 TOFU 主人按连接前缀隔离、不注册设置卡
+ * IPC、对外开放(非主人的私聊与群 @ 带非主人标记进业务层)。
+ */
+export function createBotFeishuIM(secretKeyPrefix: string): FeishuIM {
+  return createFeishuIM(host, {
+    secretKeyPrefix,
+    ipc: false,
+    guests: true,
+    shouldAnnounceLifecycle: shouldAnnounceFeishuLifecycle,
+  });
+}
 export const discordIm = createDiscordIM(host, {
   resolveImageUrl: resolveManagedImageAbsPath,
   expiredCardNotice: discordUiText.expiredCardNotice,
@@ -217,7 +238,53 @@ export const dingtalkIm = createDingTalkChannelIM(
   }),
   createDingTalkDwsIM(host, createDwsRunner()),
 );
+/**
+ * 伙伴自有 Telegram 连接的传输层实例: 与设置页那份同一套宿主能力, 但凭证按连接
+ * 前缀隔离、不注册设置卡 IPC、对外开放私聊(陌生人消息带非主人标记进业务层)。
+ * 行为配置由连接记录给(群参与模式按连接各一份, 表情 / 引用档位用默认值 —— 伙伴的
+ * 身份与分寸来自它的 SOUL, 不读设置页的人格); 命令菜单去掉交给伙伴后不在渠道里改的
+ * 模型 / 权限 / 工作目录三条。
+ */
+export function createBotTelegramIM(
+  secretKeyPrefix: string,
+  options: { behavior: () => TelegramBehaviorConfig },
+): TelegramIM {
+  return createTelegramIM(host, {
+    resolveImageUrl: resolveManagedImageAbsPath,
+    expiredCardNotice: telegramUiText.expiredCardNotice,
+    ownerNoticeText: (phase) => t(`settings.telegramBot.ownerNotice.${phase}`),
+    behavior: options.behavior,
+    commandMenu: buildPersonalBotCommandMenu((key) => t(key), { surface: 'companion' }),
+    secretKeyPrefix,
+    ipc: false,
+    guestDm: true,
+  });
+}
 export const wecomIm = createWecomIM(host);
+/**
+ * 伙伴自有企业微信 / 钉钉 / Discord 连接的传输层实例: 与设置页那份同一套宿主能力,
+ * 凭证按连接前缀隔离、不注册设置卡 IPC。三者的主人认定沿用各自传输层(企业微信 / 钉钉
+ * TOFU 首个私聊者, Discord 填主人 id), 群消息只有企业微信与钉钉有(钉钉 @ 触发)。
+ */
+export function createBotWecomIM(secretKeyPrefix: string): WecomIM {
+  return createWecomIM(host, { secretKeyPrefix, ipc: false });
+}
+export function createBotDingTalkIM(secretKeyPrefix: string): DingTalkIM {
+  return createDingTalkIM(host, {
+    fetcher: (input, init) => net.fetch(input instanceof URL ? input.toString() : input, init),
+    secretKeyPrefix,
+    ipc: false,
+  });
+}
+export function createBotDiscordIM(secretKeyPrefix: string): DiscordIM {
+  return createDiscordIM(host, {
+    resolveImageUrl: resolveManagedImageAbsPath,
+    expiredCardNotice: discordUiText.expiredCardNotice,
+    ownerNoticeText: (phase) => t(`settings.discordBot.ownerNotice.${phase}`),
+    secretKeyPrefix,
+    ipc: false,
+  });
+}
 /**
  * Telegram 个人 bot 的行为/人格/群参与配置 IPC(设置卡数据通道)。
  * 必须由 bootstrap 显式调用(与 im.registerIpc() 同期) — 不能放模块顶层:
