@@ -10,6 +10,7 @@ import { useDingTalkDws, type DingTalkTransportMode } from '@/hooks/useDingTalkD
 import { cn } from '@/lib/utils';
 import { DingTalkDwsPanel } from './DingTalkDwsPanel';
 import { DingTalkGuestAccessSetting } from './DingTalkGuestAccessSetting';
+import { DingTalkSteerSetting } from './DingTalkSteerSetting';
 import { DingTalkPersonaSettings } from './DingTalkPersonaSettings';
 import { ImChannelSettingsCard, useImChannelSettingsSummary } from './ImChannelSettingsCard';
 import { ImDefaultSettingsSection } from './ImDefaultSettingsSection';
@@ -124,6 +125,7 @@ export function DingTalkBotSection({
         <>
           <DingTalkDwsPanel dws={dws} />
           <DingTalkGuestAccessSetting />
+          <DingTalkSteerSetting />
         </>
       ) : (
         <>

@@ -126,7 +126,7 @@ describe('dingtalk adapter prepareAgentTurnText', () => {
   ) {
     return buildDingTalkAdapter(im as unknown as DingTalkChannelIM, CONFIG, {
       readPersona: () => persona,
-      readAccess: () => ({ guestFullAccess: false }),
+      readAccess: () => ({ guestFullAccess: false, steerWhileBusy: false }),
     });
   }
 
@@ -243,7 +243,7 @@ describe('dingtalk adapter full access in groups', () => {
     CONFIG,
     {
       readPersona: () => ({ botName: '', soul: '' }),
-      readAccess: () => ({ guestFullAccess }),
+      readAccess: () => ({ guestFullAccess, steerWhileBusy: false }),
     },
   );
   afterEach(() => {

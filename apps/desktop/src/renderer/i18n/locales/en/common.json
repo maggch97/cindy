@@ -4080,6 +4080,10 @@
           "cancel": "Cancel"
         }
       },
+      "steerWhileBusy": {
+        "label": "Steer new messages into a running task",
+        "description": "When on, new messages sent while a task is still running go straight into the current turn instead of waiting in the queue. Only applies when the task uses Full access (group members also need the option above); otherwise messages still queue."
+      },
       "persona": {
         "title": "Persona",
         "description": "Define who it is, how it talks, and what it should and should not do. Shared by both the bot app and DingTalk account connection methods, and applied to every reply.",

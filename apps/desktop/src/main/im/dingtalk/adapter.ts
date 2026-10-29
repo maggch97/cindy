@@ -105,6 +105,9 @@ export function buildDingTalkAdapter(
     },
     processingEmoji: '',
     silentQueue: true,
+    // 插话只给「钉钉账号」方式：Agent 能在一轮中途用 dws 回消息，插话才对得上；
+    // 机器人方式只在一轮结束时回复，仍按排队处理。
+    steerWhileBusy: () => dingtalkIm.getMode() === 'dws' && deps.readAccess().steerWhileBusy,
     buildVendorOptions: (userId) => ({ dingtalkChatId: userId, source: 'dingtalk' }),
     handleTextInteraction: (userId, request, options) =>
       handleDingTalkTextInteraction(dingtalkIm, userId, request, options),
