@@ -8,12 +8,13 @@ import { normalizeDingTalkAccess } from '../accessStore';
 
 describe('normalizeDingTalkAccess', () => {
   it('defaults to off for missing or malformed values', () => {
-    expect(normalizeDingTalkAccess(undefined)).toEqual({ guestFullAccess: false });
-    expect(normalizeDingTalkAccess({ guestFullAccess: 'true' })).toEqual({ guestFullAccess: false });
-    expect(normalizeDingTalkAccess({ guestFullAccess: 1 })).toEqual({ guestFullAccess: false });
+    expect(normalizeDingTalkAccess(undefined)).toEqual({ guestFullAccess: false, steerWhileBusy: false });
+    expect(normalizeDingTalkAccess({ guestFullAccess: 'true' })).toEqual({ guestFullAccess: false, steerWhileBusy: false });
+    expect(normalizeDingTalkAccess({ guestFullAccess: 1 })).toEqual({ guestFullAccess: false, steerWhileBusy: false });
   });
 
   it('only treats an explicit true as enabled', () => {
-    expect(normalizeDingTalkAccess({ guestFullAccess: true })).toEqual({ guestFullAccess: true });
+    expect(normalizeDingTalkAccess({ guestFullAccess: true })).toEqual({ guestFullAccess: true, steerWhileBusy: false });
+    expect(normalizeDingTalkAccess({ steerWhileBusy: true })).toEqual({ guestFullAccess: false, steerWhileBusy: true });
   });
 });

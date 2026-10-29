@@ -131,6 +131,9 @@ export function buildDingTalkAdapter(
     },
     processingEmoji: '',
     silentQueue: true,
+    // 插话只给「钉钉账号」方式：Agent 能在一轮中途用 dws 回消息，插话才对得上；
+    // 机器人方式只在一轮结束时回复，仍按排队处理。
+    steerWhileBusy: () => dingtalkIm.getMode() === 'dws' && deps.readAccess().steerWhileBusy,
     buildVendorOptions: (userId) => ({ dingtalkChatId: userId, source: 'dingtalk' }),
     // 伙伴自有连接: TOFU 认定的主人私聊进主任务(传输层已丢弃非主人私聊, 这里仍按 id
     // 判一次); 群会话按 conversation 一条专线。

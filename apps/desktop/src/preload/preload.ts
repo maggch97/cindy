@@ -2535,10 +2535,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
       soul?: string;
     }): Promise<{ botName: string; soul: string }> =>
       ipcRenderer.invoke('dingtalkBot:set-persona', payload),
-    // 「钉钉账号」方式：群任务完全访问时是否也放行群成员。
-    getAccess: (): Promise<{ guestFullAccess: boolean }> =>
+    // 「钉钉账号」方式：群任务完全访问时是否也放行群成员；任务忙时新消息是否插话。
+    getAccess: (): Promise<{ guestFullAccess: boolean; steerWhileBusy: boolean }> =>
       ipcRenderer.invoke('dingtalkBot:get-access'),
-    setAccess: (payload: { guestFullAccess: boolean }): Promise<{ guestFullAccess: boolean }> =>
+    setAccess: (payload: {
+      guestFullAccess?: boolean;
+      steerWhileBusy?: boolean;
+    }): Promise<{ guestFullAccess: boolean; steerWhileBusy: boolean }> =>
       ipcRenderer.invoke('dingtalkBot:set-access', payload),
   },
 
